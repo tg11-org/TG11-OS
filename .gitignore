@@ -53,3 +53,68 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+
+# Kernel / OS binaries
+kernel
+kernel.bin
+kernel.elf
+
+# Boot images
+*.iso
+*.img
+*.vmdk
+*.qcow2
+*.vdi
+*.vhd
+
+
+# ----------------------------
+# Build directories
+# ----------------------------
+build/
+dist/
+out/
+tmp/
+
+# ----------------------------
+# Linker / map files
+# ----------------------------
+*.map
+*.lst
+
+# ----------------------------
+# Logs
+# ----------------------------
+*.log
+
+# ----------------------------
+# QEMU temp files
+# ----------------------------
+*.pid
+*.lock
+
+# ----------------------------
+# Editor junk
+# ----------------------------
+*~
+*.swp
+*.swo
+*.tmp
+
+# VSCode
+.vscode/
+
+# JetBrains
+.idea/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# ----------------------------
+# Package / tool caches
+# ----------------------------
+.cache
