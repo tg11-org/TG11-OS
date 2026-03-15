@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Prerequisites
 *.d
 
@@ -122,3 +123,126 @@ Thumbs.db
 .git-credentials
 .WSL2
 .WSL2/*
+=======
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# debug information files
+*.dwo
+
+
+# Kernel / OS binaries
+kernel.bin
+kernel.elf
+
+# Boot images
+*.iso
+*.img
+*.vmdk
+*.qcow2
+*.vdi
+*.vhd
+
+
+# ----------------------------
+# Build directories
+# ----------------------------
+build/
+dist/
+out/
+tmp/
+
+# ----------------------------
+# Linker / map files
+# ----------------------------
+*.map
+*.lst
+
+# ----------------------------
+# Logs
+# ----------------------------
+*.log
+
+# ----------------------------
+# QEMU temp files
+# ----------------------------
+*.pid
+*.lock
+
+# ----------------------------
+# Editor junk
+# ----------------------------
+*~
+*.swp
+*.swo
+*.tmp
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# JetBrains
+.idea/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# ----------------------------
+# Package / tool caches
+# ----------------------------
+.cache
+.git-credentials
+>>>>>>> refs/remotes/origin/main
