@@ -104,6 +104,7 @@ tmp/
 
 # VSCode
 .vscode/
+*.code-workspace
 
 # JetBrains
 .idea/
