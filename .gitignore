@@ -56,7 +56,6 @@ dkms.conf
 
 
 # Kernel / OS binaries
-kernel
 kernel.bin
 kernel.elf
 
