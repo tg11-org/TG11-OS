@@ -122,3 +122,4 @@ Thumbs.db
 .git-credentials
 .WSL2
 .WSL2/*
+.WSL2/binutils-2.42.tar.xz
