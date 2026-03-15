@@ -120,3 +120,5 @@ Thumbs.db
 # ----------------------------
 .cache
 .git-credentials
+.WSL2
+.WSL2/*
