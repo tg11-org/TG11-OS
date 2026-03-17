@@ -80,9 +80,13 @@ $(ISO_NAME): $(ISO_DIR)/boot/kernel.elf iso/boot/grub/grub.cfg
 
 run: $(ISO_NAME)
 	rm -f QEMU.log
+	qemu-system-x86_64 -cdrom $(ISO_NAME) -d int,cpu_reset >> QEMU.log 2>&1
+
+run-debug: $(ISO_NAME)
+	rm -f QEMU.log
 	qemu-system-x86_64 -no-reboot -cdrom $(ISO_NAME) -d int,cpu_reset >> QEMU.log 2>&1
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_NAME) QEMU.log
 
-.PHONY: all run clean
+.PHONY: all run run-debug clean

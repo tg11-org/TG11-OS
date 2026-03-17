@@ -397,7 +397,22 @@ static void terminal_shutdown(void)
 
 static void do_reboot(void)
 {
-	terminal_write_line("Rebooting...");
+	volatile unsigned long delay;
+
+	terminal_write_line("[SYSTEM] Reboot requested...");
+	terminal_write_line("[SYSTEM] Triggering reset now.");
+
+	if (serial_ready)
+	{
+		serial_write("[SYSTEM] Reboot requested...\n");
+		serial_write("[SYSTEM] Triggering reset now.\n");
+	}
+
+	for (delay = 0; delay < 500000; delay++)
+	{
+		arch_io_wait();
+	}
+
 	arch_disable_interrupts();
 	arch_outb(0xCF9, 0x06); /* ACPI / PCH reset control register */
 	arch_outb(0x64, 0xFE);  /* Fallback: 8042 reset line          */
@@ -488,6 +503,16 @@ static void run_command(void)
 	terminal_prompt();
 }
 
+static void submit_current_line(void)
+{
+	sync_screen_pos();
+	terminal_putc('\n');
+	input_buffer[input_length] = '\0';
+	history_pos = -1;
+	history_push();
+	run_command();
+}
+
 /* ================================================================== */
 /* Scancode dispatcher                                                 */
 /* ================================================================== */
@@ -502,6 +527,8 @@ static void handle_scancode(unsigned char scancode)
 	if (extended_key)
 	{
 		extended_key = 0;
+		if (scancode == 0x1C) { submit_current_line(); return; } /* Keypad Enter */
+		if (scancode == 0x35) { c = '/'; goto insert_character; } /* Keypad / */
 		if (scancode == 0x48) { handle_arrow_up(); return; }
 		if (scancode == 0x50) { handle_arrow_down(); return; }
 		if (scancode == 0x4B && cursor_pos > 0)  /* Left */
@@ -525,17 +552,15 @@ static void handle_scancode(unsigned char scancode)
 
 	if (scancode == 0x1C)
 	{
-		sync_screen_pos();
-		terminal_putc('\n');
-		input_buffer[input_length] = '\0';
-		history_pos = -1;
-		history_push();
-		run_command();
+		submit_current_line();
 		return;
 	}
 
 	c = translate_scancode(scancode);
 	if (c == '\0' || input_length >= (INPUT_BUFFER_SIZE - 1)) return;
+
+insert_character:
+	if (input_length >= (INPUT_BUFFER_SIZE - 1)) return;
 
 	if (cursor_pos == input_length)
 	{
@@ -577,7 +602,7 @@ void terminal_init(unsigned long mb2_info_addr)
 	serial_ready = serial_init();
 	memmap_init(mb2_info_addr);
 	terminal_write_line("TG11 OS (64-bit)");
-	terminal_write_line("v0.0.2");
+	terminal_write_line("v0.0.3");
 	terminal_write_line("Type help to view available commands.");
 	terminal_prompt();
 }
