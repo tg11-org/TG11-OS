@@ -16,7 +16,7 @@
 TARGET := x86_64-elf
 CC := $(TARGET)-gcc
 
-CFLAGS := -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -fno-pic -fno-pie -fno-stack-protector
+CFLAGS := -Iinclude -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -fno-pic -fno-pie -fno-stack-protector
 LDFLAGS := -T linker.ld -ffreestanding -O2 -nostdlib -no-pie -Wl,-z,max-page-size=0x1000
 
 BUILD_DIR := build
@@ -26,20 +26,48 @@ ISO_NAME := TG11-OS.iso
 OBJS := \
 	$(BUILD_DIR)/boot32.o \
 	$(BUILD_DIR)/longmode64.o \
-	$(BUILD_DIR)/kernel.o
+	$(BUILD_DIR)/interrupts.o \
+	$(BUILD_DIR)/idt.o \
+	$(BUILD_DIR)/kernel.o \
+	$(BUILD_DIR)/terminal.o \
+	$(BUILD_DIR)/screen.o \
+	$(BUILD_DIR)/serial.o \
+	$(BUILD_DIR)/mouse.o \
+	$(BUILD_DIR)/memmap.o
 
 all: $(ISO_NAME)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/boot32.o: boot/boot32.s | $(BUILD_DIR)
+$(BUILD_DIR)/boot32.o: arch/x86_64/boot32.s Makefile | $(BUILD_DIR)
 	$(CC) -c $< -o $@
 
-$(BUILD_DIR)/longmode64.o: boot/longmode64.s | $(BUILD_DIR)
+$(BUILD_DIR)/longmode64.o: arch/x86_64/longmode64.s Makefile | $(BUILD_DIR)
 	$(CC) -c $< -o $@
 
-$(BUILD_DIR)/kernel.o: kernel/kernel.c | $(BUILD_DIR)
+$(BUILD_DIR)/interrupts.o: arch/x86_64/interrupts.s Makefile | $(BUILD_DIR)
+	$(CC) -c $< -o $@
+
+$(BUILD_DIR)/idt.o: arch/x86_64/idt.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kernel.o: kernel/kernel.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/terminal.o: kernel/terminal.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/screen.o: drivers/screen.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/serial.o: drivers/serial.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/mouse.o: drivers/mouse.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/memmap.o: kernel/memmap.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(ISO_DIR)/boot/kernel.elf: $(OBJS) linker.ld
@@ -51,9 +79,10 @@ $(ISO_NAME): $(ISO_DIR)/boot/kernel.elf iso/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(ISO_DIR)
 
 run: $(ISO_NAME)
-	qemu-system-x86_64 -cdrom $(ISO_NAME)
+	rm -f QEMU.log
+	qemu-system-x86_64 -no-reboot -cdrom $(ISO_NAME) -d int,cpu_reset >> QEMU.log 2>&1
 
 clean:
-	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_NAME)
+	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_NAME) QEMU.log
 
 .PHONY: all run clean

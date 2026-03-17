@@ -4,13 +4,11 @@ SECTIONS
 {
     . = 1M;
 
-    .multiboot ALIGN(8) :
-    {
-        *(.multiboot)
-    }
-
     .text ALIGN(4K) :
     {
+        /* Embed the multiboot2 header at the very start of .text so it
+           always lands within GRUB's 32 KiB scan window in the file. */
+        *(.multiboot)
         *(.text*)
     }
 

@@ -1,3 +1,9 @@
+#ifndef TG11_KERNEL_H
+#define TG11_KERNEL_H
+
+void kernel_main(unsigned long mb2_info_addr);
+
+#endif
 // Copyright (C) 2026 TG11
 // 
 // This program is free software: you can redistribute it and/or modify

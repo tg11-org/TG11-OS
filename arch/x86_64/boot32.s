@@ -48,6 +48,7 @@ _start:
     mov cr0, eax
 
     # Far jump into 64-bit code segment
+    mov [mb2_info_ptr], ebx
     jmp 0x08:long_mode_start
 
 hang32:
@@ -87,3 +88,7 @@ pd_table:
 stack_bottom32:
     .skip 16384
 stack_top32:
+
+.global mb2_info_ptr
+mb2_info_ptr:
+    .long 0
