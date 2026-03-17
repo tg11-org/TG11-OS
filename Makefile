@@ -22,6 +22,8 @@ LDFLAGS := -T linker.ld -ffreestanding -O2 -nostdlib -no-pie -Wl,-z,max-page-siz
 BUILD_DIR := build
 ISO_DIR := iso
 ISO_NAME := TG11-OS.iso
+BOOT_DISK_NAME := TG11-DISK.img
+DATA_DISK_NAME := TG11-DATA.img
 
 OBJS := \
 	$(BUILD_DIR)/boot32.o \
@@ -32,8 +34,13 @@ OBJS := \
 	$(BUILD_DIR)/terminal.o \
 	$(BUILD_DIR)/screen.o \
 	$(BUILD_DIR)/serial.o \
+	$(BUILD_DIR)/ata.o \
+	$(BUILD_DIR)/blockdev.o \
 	$(BUILD_DIR)/mouse.o \
-	$(BUILD_DIR)/memmap.o
+	$(BUILD_DIR)/memmap.o \
+	$(BUILD_DIR)/fs.o \
+	$(BUILD_DIR)/fat32.o \
+	$(BUILD_DIR)/basic.o
 
 all: $(ISO_NAME)
 
@@ -64,10 +71,25 @@ $(BUILD_DIR)/screen.o: drivers/screen.c Makefile | $(BUILD_DIR)
 $(BUILD_DIR)/serial.o: drivers/serial.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/ata.o: drivers/ata.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/blockdev.o: drivers/blockdev.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/mouse.o: drivers/mouse.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/memmap.o: kernel/memmap.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fs.o: kernel/fs.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/fat32.o: kernel/fat32.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/basic.o: kernel/basic.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(ISO_DIR)/boot/kernel.elf: $(OBJS) linker.ld
@@ -78,15 +100,36 @@ $(ISO_DIR)/boot/kernel.elf: $(OBJS) linker.ld
 $(ISO_NAME): $(ISO_DIR)/boot/kernel.elf iso/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(ISO_DIR)
 
-run: $(ISO_NAME)
-	rm -f QEMU.log
-	qemu-system-x86_64 -cdrom $(ISO_NAME) -d int,cpu_reset >> QEMU.log 2>&1
+$(BOOT_DISK_NAME): $(ISO_NAME)
+	cp $(ISO_NAME) $(BOOT_DISK_NAME)
 
-run-debug: $(ISO_NAME)
+prepare-data-disk:
+	@if [ ! -f $(DATA_DISK_NAME) ]; then truncate -s 64M $(DATA_DISK_NAME); fi
+	@if ! command -v mkfs.fat >/dev/null 2>&1; then echo "mkfs.fat not found (install dosfstools)"; exit 1; fi
+	@if ! file $(DATA_DISK_NAME) | grep -qi "FAT"; then mkfs.fat -F 32 $(DATA_DISK_NAME); fi
+
+format-data-disk:
+	@if [ ! -f $(DATA_DISK_NAME) ]; then truncate -s 64M $(DATA_DISK_NAME); fi
+	@if ! command -v mkfs.fat >/dev/null 2>&1; then echo "mkfs.fat not found (install dosfstools)"; exit 1; fi
+	mkfs.fat -F 32 $(DATA_DISK_NAME)
+
+run: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -no-reboot -cdrom $(ISO_NAME) -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+
+run-debug: $(ISO_NAME) prepare-data-disk
+	rm -f QEMU.log
+	qemu-system-x86_64 -no-reboot -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+
+run-disk: $(BOOT_DISK_NAME) prepare-data-disk
+	rm -f QEMU.log
+	qemu-system-x86_64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+
+run-disk-debug: $(BOOT_DISK_NAME) prepare-data-disk
+	rm -f QEMU.log
+	qemu-system-x86_64 -no-reboot -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
 
 clean:
-	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_NAME) QEMU.log
+	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_NAME) $(BOOT_DISK_NAME) $(DATA_DISK_NAME) QEMU.log
 
-.PHONY: all run run-debug clean
+.PHONY: all run run-debug run-disk run-disk-debug prepare-data-disk format-data-disk clean

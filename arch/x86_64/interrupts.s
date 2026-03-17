@@ -25,6 +25,13 @@ arch_inb:
     in al, dx
     ret
 
+.global arch_inw
+arch_inw:
+    xor eax, eax
+    mov dx, di
+    in ax, dx
+    ret
+
 .global arch_outb
 arch_outb:
     mov dx, di

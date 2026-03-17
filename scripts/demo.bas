@@ -1,0 +1,7 @@
+10 PRINT "TG11 Tiny BASIC demo"
+20 LET A = 0
+30 PRINT A
+40 ADD A 1
+50 IF A < 5 THEN 30
+60 PRINT "Done counting"
+70 END
