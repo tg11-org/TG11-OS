@@ -124,3 +124,9 @@ Thumbs.db
 .WSL2
 .WSL2/*
 .WSL2/binutils-2.42.tar.xz
+
+# Local toolchain/artifact archives
+build-tools/
+*.7z
+*.zip
+*.xz
