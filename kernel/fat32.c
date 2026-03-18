@@ -342,6 +342,21 @@ int fat32_is_mounted(void)
 	return fs.mounted;
 }
 
+void fat32_unmount(void)
+{
+	fs.mounted = 0;
+	fs.dev = (void *)0;
+	fs.start_lba = 0;
+	fs.bytes_per_sector = 0;
+	fs.sectors_per_cluster = 0;
+	fs.reserved_sectors = 0;
+	fs.fat_count = 0;
+	fs.sectors_per_fat = 0;
+	fs.root_cluster = 0;
+	fs.fat_start_lba = 0;
+	fs.data_start_lba = 0;
+}
+
 int fat32_ls_root(char names[][40], int max_entries, int *out_count)
 {
 	unsigned int cluster;

@@ -14,7 +14,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 TARGET := x86_64-elf
-CC := $(TARGET)-gcc
+CC ?= $(TARGET)-gcc
 
 CFLAGS := -Iinclude -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -fno-pic -fno-pie -fno-stack-protector
 LDFLAGS := -T linker.ld -ffreestanding -O2 -nostdlib -no-pie -Wl,-z,max-page-size=0x1000
@@ -29,6 +29,7 @@ OBJS := \
 	$(BUILD_DIR)/boot32.o \
 	$(BUILD_DIR)/longmode64.o \
 	$(BUILD_DIR)/interrupts.o \
+	$(BUILD_DIR)/gdt.o \
 	$(BUILD_DIR)/idt.o \
 	$(BUILD_DIR)/kernel.o \
 	$(BUILD_DIR)/terminal.o \
@@ -42,7 +43,11 @@ OBJS := \
 	$(BUILD_DIR)/fat32.o \
 	$(BUILD_DIR)/basic.o
 
-all: $(ISO_NAME)
+all: check-toolchain $(ISO_NAME)
+
+check-toolchain:
+	@command -v $(CC) >/dev/null 2>&1 || { echo "error: $(CC) not found in PATH"; exit 1; }
+	@cc_path=$$(command -v $(CC)); test -x "$$cc_path" || { echo "error: $(CC) is not executable: $$cc_path"; exit 1; }
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -55,6 +60,9 @@ $(BUILD_DIR)/longmode64.o: arch/x86_64/longmode64.s Makefile | $(BUILD_DIR)
 
 $(BUILD_DIR)/interrupts.o: arch/x86_64/interrupts.s Makefile | $(BUILD_DIR)
 	$(CC) -c $< -o $@
+
+$(BUILD_DIR)/gdt.o: arch/x86_64/gdt.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/idt.o: arch/x86_64/idt.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@

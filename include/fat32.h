@@ -5,6 +5,7 @@
 
 int fat32_mount(struct block_device *dev);
 int fat32_is_mounted(void);
+void fat32_unmount(void);
 
 int fat32_ls_root(char names[][40], int max_entries, int *out_count);
 int fat32_read_file_root(const char *name, unsigned char *out_data, unsigned long out_capacity, unsigned long *out_size);

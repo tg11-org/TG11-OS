@@ -9,6 +9,7 @@
 
 void kernel_main(unsigned long mb2_info_addr)
 {
+    gdt_init();
 	fs_init();
     blockdev_init();
     terminal_init(mb2_info_addr);

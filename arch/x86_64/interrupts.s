@@ -57,6 +57,11 @@ arch_lidt:
     lidt [rdi]
     ret
 
+.global arch_lgdt
+arch_lgdt:
+    lgdt [rdi]
+    ret
+
 .global exception_hang_stub
 exception_hang_stub:
     cli

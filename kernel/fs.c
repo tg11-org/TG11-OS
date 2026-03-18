@@ -267,7 +267,7 @@ int fs_touch(const char *path)
 	return -1;
 }
 
-int fs_write_text(const char *path, const char *text)
+int fs_write_file(const char *path, const unsigned char *data, unsigned long size)
 {
 	int node = resolve_path(path);
 	unsigned long n;
@@ -281,13 +281,35 @@ int fs_write_text(const char *path, const char *text)
 	}
 
 	if (nodes[node].is_dir) return -1;
+	if (data == (void *)0 && size != 0) return -1;
 
-	n = str_len(text);
+	n = size;
 	if (n >= FS_MAX_FILE_SIZE) n = FS_MAX_FILE_SIZE - 1;
-	for (i = 0; i < n; i++) nodes[node].data[i] = text[i];
+	for (i = 0; i < n; i++) nodes[node].data[i] = (char)data[i];
 	nodes[node].data[n] = '\0';
 	nodes[node].size = n;
 	return 0;
+}
+
+int fs_read_file(const char *path, unsigned char *out_data, unsigned long out_capacity, unsigned long *out_size)
+{
+	int node = resolve_path(path);
+	unsigned long i;
+	unsigned long n;
+	if (node < 0 || nodes[node].is_dir || out_size == (void *)0) return -1;
+	n = nodes[node].size;
+	if (out_data != (void *)0)
+	{
+		unsigned long copy_n = (n < out_capacity) ? n : out_capacity;
+		for (i = 0; i < copy_n; i++) out_data[i] = (unsigned char)nodes[node].data[i];
+	}
+	*out_size = (n < out_capacity) ? n : out_capacity;
+	return 0;
+}
+
+int fs_write_text(const char *path, const char *text)
+{
+	return fs_write_file(path, (const unsigned char *)text, str_len(text));
 }
 
 int fs_read_text(const char *path, const char **out_text)
@@ -323,10 +345,8 @@ int fs_cd(const char *path)
 int fs_cp(const char *src_path, const char *dst_path)
 {
 	int src = resolve_path(src_path);
-	const char *src_data;
 	if (src < 0 || nodes[src].is_dir) return -1;
-	src_data = nodes[src].data;
-	return fs_write_text(dst_path, src_data);
+	return fs_write_file(dst_path, (const unsigned char *)nodes[src].data, nodes[src].size);
 }
 
 int fs_mv(const char *src_path, const char *dst_path)

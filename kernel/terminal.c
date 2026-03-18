@@ -17,6 +17,14 @@
 #define QEMU_POWER_OFF      0x2000
 #define EDITOR_BUFFER_SIZE  4096
 #define VGA_TEXT_WIDTH      80
+#define EDITOR_TEXT_GUTTER  6
+#define EDITOR_HEX_BYTES_PER_ROW 16
+#define EDITOR_HEX_DATA_COL 6
+#define EDITOR_HEX_ASCII_COL 55
+#define SYSTEM_THEME_DIR "/themes"
+#define SYSTEM_THEME_CURRENT_PATH "/themes/current"
+#define EDITOR_THEME_DIR "/edit/themes"
+#define EDITOR_THEME_CURRENT_PATH "/edit/themes/current"
 
 /* ------------------------------------------------------------------ */
 /* Scancode ring buffer                                               */
@@ -58,12 +66,35 @@ static int  history_draft_len = 0;
 static int serial_ready = 0;
 static int vfs_prefer_fat_root = 0;
 static char fat_cwd[128] = "/";
+static unsigned char terminal_text_color = 0x0F;
+static unsigned char terminal_prompt_color = 0x0B;
+static unsigned char editor_header_color = 0x0F;
+static unsigned char editor_path_color = 0x0B;
+static unsigned char editor_rule_color = 0x08;
+static unsigned char editor_line_number_color = 0x08;
+static unsigned char editor_text_color = 0x0F;
+static unsigned char editor_sh_keyword_color = 0x0A;
+static unsigned char editor_sh_comment_color = 0x08;
+static unsigned char editor_sh_string_color = 0x0E;
+static unsigned char editor_basic_keyword_color = 0x0D;
+static unsigned char editor_basic_comment_color = 0x08;
+static unsigned char editor_basic_string_color = 0x0B;
 static int editor_active = 0;
 static int editor_use_fat = 0;
+static int editor_hex_mode = 0;
+static int editor_hex_nibble = 0;
+enum editor_lang
+{
+	EDITOR_LANG_PLAIN = 0,
+	EDITOR_LANG_SH,
+	EDITOR_LANG_BASIC
+};
+static enum editor_lang editor_language = EDITOR_LANG_PLAIN;
 static char editor_target_path[128];
 static char editor_buffer[EDITOR_BUFFER_SIZE];
 static unsigned long editor_length = 0;
 static unsigned long editor_cursor = 0;
+static unsigned long editor_view_top = 0;
 static unsigned short editor_vga_start = 0;
 static unsigned short editor_prev_end = 0;
 static int editor_dirty = 0;
@@ -84,11 +115,40 @@ static void run_command(void);
 static int eval_script_condition(const char *expr);
 static int execute_substitution_command(const char *raw_cmd, char *out, unsigned long out_size);
 static int expand_command_substitutions(const char *in, char *out, unsigned long out_size);
+static int expand_cp437_aliases(const char *in, char *out, unsigned long out_size);
 static void script_set_var(const char *name, const char *value);
 static void editor_render(void);
 static unsigned long editor_line_start(unsigned long index);
 static unsigned long editor_line_end(unsigned long index);
-static void editor_draw_header(void);
+static unsigned long editor_visible_rows(void);
+static unsigned long editor_text_width(void);
+static unsigned long editor_next_visual_row(unsigned long index);
+static unsigned long editor_prev_visual_row(unsigned long index);
+static unsigned long editor_cursor_row_from_top(unsigned long top, unsigned long cursor);
+static unsigned long editor_visual_row_start(unsigned long index);
+static unsigned long editor_visual_row_col(unsigned long index);
+static unsigned long editor_visual_row_length(unsigned long row_start);
+static unsigned long editor_move_visual_rows(unsigned long index, unsigned long rows, int down);
+static unsigned long editor_line_number_for_index(unsigned long index);
+static int editor_has_more_below(unsigned long top, unsigned long rows);
+static void editor_draw_header(int can_scroll_up, int can_scroll_down);
+static int editor_open_file(const char *path, int hex_mode);
+static int parse_color_token(const char *s, unsigned char *out);
+static int starts_with_word_ci(const char *s, const char *word, unsigned long *word_len_out);
+static int token_is_keyword_ci(const char *s, unsigned long len, const char *const *keywords, unsigned long keyword_count);
+static int editor_path_has_ext_ci(const char *path, const char *ext);
+static enum editor_lang editor_detect_language_from_path(const char *path);
+static int apply_system_theme_from_text(const char *name, const char *text);
+static int apply_system_theme_by_name(const char *name, int persist_current);
+static int apply_editor_theme_from_text(const char *name, const char *text);
+static int apply_editor_theme_by_name(const char *name, int persist_current);
+static void ensure_theme_files(void);
+static void load_current_system_theme(void);
+static void load_current_editor_theme(void);
+static void cmd_themes(const char *args);
+static void cmd_etheme(const char *args);
+static void cmd_ethemes(const char *args);
+static void cmd_ramfs(void);
 
 static void print_help_basic(void)
 {
@@ -96,6 +156,15 @@ static void print_help_basic(void)
 	terminal_write_line("  help [basic|fs|disk] - Show help pages");
 	terminal_write_line("  version              - Show OS version");
 	terminal_write_line("  echo <text>          - Print text");
+	terminal_write_line("  glyph <0xNN>         - Print one CP437 glyph byte");
+	terminal_write_line("  charmap              - Show CP437 alias escapes");
+	terminal_write_line("  color show           - Show current colors");
+	terminal_write_line("  color text <0xNN>    - Set text color attr byte");
+	terminal_write_line("  color prompt <0xNN>  - Set prompt color attr byte");
+	terminal_write_line("  theme <name>         - Apply system theme from /themes");
+	terminal_write_line("  themes [list]        - List system themes");
+	terminal_write_line("  etheme <name>        - Apply editor theme from /edit/themes");
+	terminal_write_line("  ethemes [list]       - List editor themes");
 	terminal_write_line("  clear                - Clear screen");
 	terminal_write_line("  reboot               - Reboot the system");
 	terminal_write_line("  shutdown/exit/quit   - Shut down");
@@ -116,11 +185,14 @@ static void print_help_fs(void)
 	terminal_write_line("  rm <path>            - Remove path");
 	terminal_write_line("  cp <src> <dst>       - Copy file");
 	terminal_write_line("  mv <src> <dst>       - Move/rename");
-	terminal_write_line("  edit <path>          - Edit file (F10 save, Esc cancel)");
+	terminal_write_line("  edit <path>          - Edit text file");
+	terminal_write_line("  hexedit <path>       - Edit raw bytes in hex");
 	terminal_write_line("  run [-x] <path>      - Run script (-x echoes lines)");
 	terminal_write_line("  basic <path>         - Run Tiny BASIC program");
 	terminal_write_line("  script: foreach i in a,b do echo $(i)");
 	terminal_write_line("  fatmount             - Mount FAT32 data disk");
+	terminal_write_line("  ramfs                - Switch generic fs commands to RAM FS");
+	terminal_write_line("  fatunmount           - Unmount FAT32 data disk");
 	terminal_write_line("  fatls                - List FAT32 cwd");
 	terminal_write_line("  fatcat <path>        - Read FAT32 file");
 	terminal_write_line("  fattouch <path>      - Create FAT32 file");
@@ -221,9 +293,9 @@ static void sync_screen_pos(void)
 
 static void terminal_prompt(void)
 {
-	screen_set_color(0x0B); /* bright cyan */
+	screen_set_color(terminal_prompt_color);
 	terminal_write("> ");
-	screen_set_color(0x0F); /* white */
+	screen_set_color(terminal_text_color);
 	prompt_vga_start = screen_get_pos();
 	cursor_pos = 0;
 	screen_set_hw_cursor(prompt_vga_start);
@@ -407,23 +479,613 @@ static const char *read_token(const char *s, char *out, unsigned long out_size)
 	return s;
 }
 
-static unsigned short editor_next_offset(unsigned short offset, char c)
+static int parse_color_token(const char *s, unsigned char *out)
 {
-	if (c == '\n')
-	{
-		unsigned short row = (unsigned short)(offset / VGA_TEXT_WIDTH);
-		return (unsigned short)((row + 1) * VGA_TEXT_WIDTH);
-	}
-	return (unsigned short)(offset + 1);
+	const char *end;
+	unsigned long v;
+	if (s == (void *)0 || out == (void *)0 || s[0] == '\0') return -1;
+	v = parse_hex(s, &end);
+	if (*end != '\0') return -1;
+	if (v > 0xFFUL) return -1;
+	*out = (unsigned char)v;
+	return 0;
 }
 
-static unsigned short editor_offset_for_index(unsigned long index)
+static char ascii_upper(char c)
 {
-	unsigned short offset = editor_vga_start;
+	if (c >= 'a' && c <= 'z') return (char)(c - ('a' - 'A'));
+	return c;
+}
+
+static int char_is_word(char c)
+{
+	if (c >= 'A' && c <= 'Z') return 1;
+	if (c >= 'a' && c <= 'z') return 1;
+	if (c >= '0' && c <= '9') return 1;
+	return c == '_';
+}
+
+static int starts_with_word_ci(const char *s, const char *word, unsigned long *word_len_out)
+{
+	unsigned long i = 0;
+	while (word[i] != '\0')
+	{
+		if (ascii_upper(s[i]) != ascii_upper(word[i])) return 0;
+		i++;
+	}
+	if (word_len_out != (void *)0) *word_len_out = i;
+	if (char_is_word(s[i])) return 0;
+	return 1;
+}
+
+static int token_is_keyword_ci(const char *s, unsigned long len, const char *const *keywords, unsigned long keyword_count)
+{
+	unsigned long k;
+	for (k = 0; k < keyword_count; k++)
+	{
+		const char *kw = keywords[k];
+		unsigned long i = 0;
+		while (kw[i] != '\0' && i < len)
+		{
+			if (ascii_upper(kw[i]) != ascii_upper(s[i])) break;
+			i++;
+		}
+		if (i == len && kw[i] == '\0') return 1;
+	}
+	return 0;
+}
+
+static int editor_path_has_ext_ci(const char *path, const char *ext)
+{
+	unsigned long path_len = string_length(path);
+	unsigned long ext_len = string_length(ext);
+	unsigned long i;
+	if (path_len < ext_len) return 0;
+	for (i = 0; i < ext_len; i++)
+	{
+		if (ascii_upper(path[path_len - ext_len + i]) != ascii_upper(ext[i])) return 0;
+	}
+	return 1;
+}
+
+static enum editor_lang editor_detect_language_from_path(const char *path)
+{
+	if (editor_path_has_ext_ci(path, ".sh")) return EDITOR_LANG_SH;
+	if (editor_path_has_ext_ci(path, ".bas") || editor_path_has_ext_ci(path, ".basic")) return EDITOR_LANG_BASIC;
+	return EDITOR_LANG_PLAIN;
+}
+
+static int apply_system_theme_from_text(const char *name, const char *text)
+{
+	unsigned char t_text = terminal_text_color;
+	unsigned char t_prompt = terminal_prompt_color;
+	const char *p = text;
+
+	while (p != (void *)0 && *p != '\0')
+	{
+		char line[96];
+		char key[32];
+		char val[32];
+		unsigned long i = 0;
+		unsigned long eq = 0;
+		unsigned char c;
+
+		while (*p == '\r' || *p == '\n') p++;
+		if (*p == '\0') break;
+		while (*p != '\0' && *p != '\n' && i + 1 < sizeof(line)) line[i++] = *p++;
+		line[i] = '\0';
+		while (*p == '\r' || *p == '\n') p++;
+		if (line[0] == '\0' || line[0] == '#') continue;
+
+		i = 0;
+		while (line[i] != '\0') { if (line[i] == '=') { eq = i; break; } i++; }
+		if (line[eq] != '=') continue;
+
+		i = 0;
+		while (i < eq && i + 1 < sizeof(key)) { key[i] = line[i]; i++; }
+		key[i] = '\0';
+
+		i = 0;
+		while (line[eq + 1 + i] != '\0' && i + 1 < sizeof(val)) { val[i] = line[eq + 1 + i]; i++; }
+		val[i] = '\0';
+
+		if (parse_color_token(val, &c) != 0) continue;
+		if (string_equals(key, "terminal_text")) t_text = c;
+		else if (string_equals(key, "terminal_prompt")) t_prompt = c;
+	}
+
+	terminal_text_color = t_text;
+	terminal_prompt_color = t_prompt;
+	if (!editor_active) screen_set_color(terminal_text_color);
+
+	if (name != (void *)0)
+	{
+		terminal_write("system theme: ");
+		terminal_write_line(name);
+	}
+
+	return 0;
+}
+
+static int apply_system_theme_by_name(const char *name, int persist_current)
+{
+	char theme_path[64];
+	const char *text;
+	unsigned long i = 0;
+	const char *prefix = SYSTEM_THEME_DIR "/";
+	if (name == (void *)0 || name[0] == '\0') return -1;
+
+	while (prefix[i] != '\0' && i + 1 < sizeof(theme_path)) { theme_path[i] = prefix[i]; i++; }
+	{
+		unsigned long j = 0;
+		while (name[j] != '\0' && i + 1 < sizeof(theme_path)) theme_path[i++] = name[j++];
+	}
+	if (i + 7 >= sizeof(theme_path)) return -1;
+	theme_path[i++] = '.';
+	theme_path[i++] = 't';
+	theme_path[i++] = 'h';
+	theme_path[i++] = 'e';
+	theme_path[i++] = 'm';
+	theme_path[i++] = 'e';
+	theme_path[i] = '\0';
+
+	if (fs_read_text(theme_path, &text) != 0) return -1;
+	if (apply_system_theme_from_text(name, text) != 0) return -1;
+	if (persist_current) fs_write_text(SYSTEM_THEME_CURRENT_PATH, name);
+	return 0;
+}
+
+static int apply_editor_theme_from_text(const char *name, const char *text)
+{
+	unsigned char e_header = editor_header_color;
+	unsigned char e_path = editor_path_color;
+	unsigned char e_rule = editor_rule_color;
+	unsigned char e_line = editor_line_number_color;
+	unsigned char e_text = editor_text_color;
+	unsigned char sh_kw = editor_sh_keyword_color;
+	unsigned char sh_comment = editor_sh_comment_color;
+	unsigned char sh_string = editor_sh_string_color;
+	unsigned char b_kw = editor_basic_keyword_color;
+	unsigned char b_comment = editor_basic_comment_color;
+	unsigned char b_string = editor_basic_string_color;
+	const char *p = text;
+
+	while (p != (void *)0 && *p != '\0')
+	{
+		char line[96];
+		char key[32];
+		char val[32];
+		unsigned long i = 0;
+		unsigned long eq = 0;
+		unsigned char c;
+
+		while (*p == '\r' || *p == '\n') p++;
+		if (*p == '\0') break;
+		while (*p != '\0' && *p != '\n' && i + 1 < sizeof(line)) line[i++] = *p++;
+		line[i] = '\0';
+		while (*p == '\r' || *p == '\n') p++;
+		if (line[0] == '\0' || line[0] == '#') continue;
+
+		i = 0;
+		while (line[i] != '\0') { if (line[i] == '=') { eq = i; break; } i++; }
+		if (line[eq] != '=') continue;
+
+		i = 0;
+		while (i < eq && i + 1 < sizeof(key)) { key[i] = line[i]; i++; }
+		key[i] = '\0';
+
+		i = 0;
+		while (line[eq + 1 + i] != '\0' && i + 1 < sizeof(val)) { val[i] = line[eq + 1 + i]; i++; }
+		val[i] = '\0';
+
+		if (parse_color_token(val, &c) != 0) continue;
+		if (string_equals(key, "editor_header")) e_header = c;
+		else if (string_equals(key, "editor_path")) e_path = c;
+		else if (string_equals(key, "editor_rule")) e_rule = c;
+		else if (string_equals(key, "editor_line")) e_line = c;
+		else if (string_equals(key, "editor_text")) e_text = c;
+		else if (string_equals(key, "sh_keyword")) sh_kw = c;
+		else if (string_equals(key, "sh_comment")) sh_comment = c;
+		else if (string_equals(key, "sh_string")) sh_string = c;
+		else if (string_equals(key, "basic_keyword")) b_kw = c;
+		else if (string_equals(key, "basic_comment")) b_comment = c;
+		else if (string_equals(key, "basic_string")) b_string = c;
+	}
+
+	editor_header_color = e_header;
+	editor_path_color = e_path;
+	editor_rule_color = e_rule;
+	editor_line_number_color = e_line;
+	editor_text_color = e_text;
+	editor_sh_keyword_color = sh_kw;
+	editor_sh_comment_color = sh_comment;
+	editor_sh_string_color = sh_string;
+	editor_basic_keyword_color = b_kw;
+	editor_basic_comment_color = b_comment;
+	editor_basic_string_color = b_string;
+	if (editor_active) screen_set_color(editor_text_color);
+
+	if (name != (void *)0)
+	{
+		terminal_write("editor theme: ");
+		terminal_write_line(name);
+	}
+
+	return 0;
+}
+
+static int apply_editor_theme_by_name(const char *name, int persist_current)
+{
+	char theme_path[64];
+	const char *text;
+	unsigned long i = 0;
+	const char *prefix = EDITOR_THEME_DIR "/";
+	if (name == (void *)0 || name[0] == '\0') return -1;
+
+	while (prefix[i] != '\0' && i + 1 < sizeof(theme_path)) { theme_path[i] = prefix[i]; i++; }
+	{
+		unsigned long j = 0;
+		while (name[j] != '\0' && i + 1 < sizeof(theme_path)) theme_path[i++] = name[j++];
+	}
+	if (i + 7 >= sizeof(theme_path)) return -1;
+	theme_path[i++] = '.';
+	theme_path[i++] = 't';
+	theme_path[i++] = 'h';
+	theme_path[i++] = 'e';
+	theme_path[i++] = 'm';
+	theme_path[i++] = 'e';
+	theme_path[i] = '\0';
+
+	if (fs_read_text(theme_path, &text) != 0) return -1;
+	if (apply_editor_theme_from_text(name, text) != 0) return -1;
+	if (persist_current) fs_write_text(EDITOR_THEME_CURRENT_PATH, name);
+	return 0;
+}
+
+static void ensure_theme_files(void)
+{
+	const char *existing;
+	fs_mkdir(SYSTEM_THEME_DIR);
+	fs_mkdir("/edit");
+	fs_mkdir(EDITOR_THEME_DIR);
+
+	if (fs_read_text(SYSTEM_THEME_DIR "/default.theme", &existing) != 0)
+	{
+		fs_write_text(SYSTEM_THEME_DIR "/default.theme",
+			"# TG11 system theme file\n"
+			"terminal_text=0x0F\n"
+			"terminal_prompt=0x0B\n");
+	}
+	if (fs_read_text(SYSTEM_THEME_DIR "/c64.theme", &existing) != 0)
+	{
+		fs_write_text(SYSTEM_THEME_DIR "/c64.theme",
+			"# Commodore-ish system palette\n"
+			"terminal_text=0x19\n"
+			"terminal_prompt=0x1E\n");
+	}
+
+	if (fs_read_text(EDITOR_THEME_DIR "/default.theme", &existing) != 0)
+	{
+		fs_write_text(EDITOR_THEME_DIR "/default.theme",
+			"# TG11 editor theme file\n"
+			"editor_header=0x0F\n"
+			"editor_path=0x0B\n"
+			"editor_rule=0x08\n"
+			"editor_line=0x08\n"
+			"editor_text=0x0F\n"
+			"sh_keyword=0x0A\n"
+			"sh_comment=0x08\n"
+			"sh_string=0x0E\n"
+			"basic_keyword=0x0D\n"
+			"basic_comment=0x08\n"
+			"basic_string=0x0B\n");
+	}
+	if (fs_read_text(EDITOR_THEME_DIR "/c64.theme", &existing) != 0)
+	{
+		fs_write_text(EDITOR_THEME_DIR "/c64.theme",
+			"# Commodore-ish editor palette\n"
+			"editor_header=0x1F\n"
+			"editor_path=0x1E\n"
+			"editor_rule=0x11\n"
+			"editor_line=0x11\n"
+			"editor_text=0x19\n"
+			"sh_keyword=0x1A\n"
+			"sh_comment=0x13\n"
+			"sh_string=0x1E\n"
+			"basic_keyword=0x1D\n"
+			"basic_comment=0x13\n"
+			"basic_string=0x1E\n");
+	}
+
+	{
+		const char *current;
+		if (fs_read_text(SYSTEM_THEME_CURRENT_PATH, &current) != 0)
+		{
+			fs_write_text(SYSTEM_THEME_CURRENT_PATH, "default");
+		}
+		if (fs_read_text(EDITOR_THEME_CURRENT_PATH, &current) != 0)
+		{
+			fs_write_text(EDITOR_THEME_CURRENT_PATH, "default");
+		}
+	}
+}
+
+static void load_current_system_theme(void)
+{
+	const char *current;
+	if (fs_read_text(SYSTEM_THEME_CURRENT_PATH, &current) == 0)
+	{
+		if (apply_system_theme_by_name(current, 0) == 0) return;
+	}
+	apply_system_theme_by_name("default", 0);
+}
+
+static void load_current_editor_theme(void)
+{
+	const char *current;
+	if (fs_read_text(EDITOR_THEME_CURRENT_PATH, &current) == 0)
+	{
+		if (apply_editor_theme_by_name(current, 0) == 0) return;
+	}
+	apply_editor_theme_by_name("default", 0);
+}
+
+static int hex_nibble(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+static int expand_cp437_aliases(const char *in, char *out, unsigned long out_size)
+{
+	struct alias_item { const char *name; unsigned char v; };
+	static const struct alias_item aliases[] = {
+		{"boxh", 0xC4}, {"boxv", 0xB3}, {"boxul", 0xDA}, {"boxur", 0xBF},
+		{"boxll", 0xC0}, {"boxlr", 0xD9}, {"boxt", 0xC2}, {"boxb", 0xC1},
+		{"boxl", 0xC3}, {"boxr", 0xB4}, {"boxx", 0xC5},
+		{"blkup", 0xDF}, {"blkdn", 0xDC}, {"blk", 0xDB},
+		{"shade1", 0xB0}, {"shade2", 0xB1}, {"shade3", 0xB2},
+		{"tri", 0x1E}, {"arru", 0x18}, {"arrd", 0x19}, {"arrl", 0x1B}, {"arrr", 0x1A}
+	};
+	unsigned long i = 0;
+	unsigned long o = 0;
+
+	if (in == (void *)0 || out == (void *)0 || out_size == 0) return -1;
+
+	while (in[i] != '\0')
+	{
+		if (in[i] == '\\')
+		{
+			if (in[i + 1] == '\\')
+			{
+				if (o + 1 >= out_size) return -1;
+				out[o++] = '\\';
+				i += 2;
+				continue;
+			}
+			if (in[i + 1] == 'x')
+			{
+				int h1 = hex_nibble(in[i + 2]);
+				int h2 = hex_nibble(in[i + 3]);
+				if (h1 >= 0 && h2 >= 0)
+				{
+					if (o + 1 >= out_size) return -1;
+					out[o++] = (char)((h1 << 4) | h2);
+					i += 4;
+					continue;
+				}
+			}
+			{
+				unsigned long a;
+				for (a = 0; a < sizeof(aliases) / sizeof(aliases[0]); a++)
+				{
+					unsigned long n = string_length(aliases[a].name);
+					unsigned long j;
+					int match = 1;
+					for (j = 0; j < n; j++)
+					{
+						if (in[i + 1 + j] != aliases[a].name[j]) { match = 0; break; }
+					}
+					if (match)
+					{
+						if (o + 1 >= out_size) return -1;
+						out[o++] = (char)aliases[a].v;
+						i += 1 + n;
+						goto alias_done;
+					}
+				}
+			}
+		}
+
+		if (o + 1 >= out_size) return -1;
+		out[o++] = in[i++];
+		continue;
+
+	alias_done:
+		continue;
+	}
+
+	out[o] = '\0';
+	return 0;
+}
+
+static unsigned long editor_visible_rows(void)
+{
+	unsigned long start_row = (unsigned long)(editor_vga_start / VGA_TEXT_WIDTH);
+	if (start_row >= 25) return 1;
+	return 25 - start_row;
+}
+
+static unsigned long editor_text_width(void)
+{
+	if (VGA_TEXT_WIDTH <= EDITOR_TEXT_GUTTER) return 1;
+	return VGA_TEXT_WIDTH - EDITOR_TEXT_GUTTER;
+}
+
+static char editor_hex_digit(unsigned char v)
+{
+	static const char digits[] = "0123456789ABCDEF";
+	return digits[v & 0x0F];
+}
+
+static int editor_hex_value(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	return -1;
+}
+
+static void editor_write_uint_right(unsigned short offset, unsigned long value, unsigned long width)
+{
+	unsigned long i;
+	for (i = 0; i < width; i++) screen_write_char_at((unsigned short)(offset + i), ' ');
+	if (width == 0) return;
+	i = width;
+	do
+	{
+		i--;
+		screen_write_char_at((unsigned short)(offset + i), (char)('0' + (value % 10UL)));
+		value /= 10UL;
+	} while (i > 0 && value > 0);
+}
+
+static unsigned long editor_next_visual_row(unsigned long index)
+{
+	unsigned long col = 0;
+	unsigned long width = editor_text_width();
+	if (index >= editor_length) return editor_length;
+	while (index < editor_length)
+	{
+		char c = editor_buffer[index++];
+		if (c == '\n') return index;
+		col++;
+		if (col >= width) return index;
+	}
+	return editor_length;
+}
+
+static unsigned long editor_prev_visual_row(unsigned long index)
+{
+	unsigned long prev = 0;
+	unsigned long next = 0;
+	if (index == 0) return 0;
+	if (index > editor_length) index = editor_length;
+	while (next < index)
+	{
+		prev = next;
+		next = editor_next_visual_row(next);
+		if (next >= index) return prev;
+	}
+	return prev;
+}
+
+static unsigned long editor_visual_row_start(unsigned long index)
+{
+	unsigned long row_start = 0;
+	unsigned long next;
+	if (index > editor_length) index = editor_length;
+	while (row_start < index)
+	{
+		next = editor_next_visual_row(row_start);
+		if (next > index) break;
+		row_start = next;
+	}
+	return row_start;
+}
+
+static unsigned long editor_visual_row_col(unsigned long index)
+{
+	unsigned long row_start;
+	if (index > editor_length) index = editor_length;
+	row_start = editor_visual_row_start(index);
+	return index - row_start;
+}
+
+static unsigned long editor_visual_row_length(unsigned long row_start)
+{
+	unsigned long row_end;
+	if (row_start >= editor_length) return 0;
+	row_end = editor_next_visual_row(row_start);
+	if (row_end > row_start && editor_buffer[row_end - 1] == '\n') return row_end - row_start - 1;
+	return row_end - row_start;
+}
+
+static unsigned long editor_move_visual_rows(unsigned long index, unsigned long rows, int down)
+{
+	unsigned long col;
+	unsigned long row_start;
+	unsigned long row_len;
+	unsigned long i;
+
+	if (index > editor_length) index = editor_length;
+	col = editor_visual_row_col(index);
+	row_start = editor_visual_row_start(index);
+
+	for (i = 0; i < rows; i++)
+	{
+		unsigned long next_start = down ? editor_next_visual_row(row_start) : editor_prev_visual_row(row_start);
+		if (next_start == row_start) break;
+		row_start = next_start;
+	}
+
+	row_len = editor_visual_row_length(row_start);
+	if (col > row_len) col = row_len;
+	return row_start + col;
+}
+
+static unsigned long editor_cursor_row_from_top(unsigned long top, unsigned long cursor)
+{
+	unsigned long row = 0;
+	unsigned long col = 0;
+	unsigned long i = top;
+	unsigned long width = editor_text_width();
+	if (cursor > editor_length) cursor = editor_length;
+	if (top > editor_length) top = editor_length;
+	while (i < cursor)
+	{
+		char c = editor_buffer[i++];
+		if (c == '\n')
+		{
+			row++;
+			col = 0;
+			continue;
+		}
+		col++;
+		if (col >= width)
+		{
+			row++;
+			col = 0;
+		}
+	}
+	return row;
+}
+
+static unsigned long editor_line_number_for_index(unsigned long index)
+{
+	unsigned long line = 1;
 	unsigned long i;
 	if (index > editor_length) index = editor_length;
-	for (i = 0; i < index; i++) offset = editor_next_offset(offset, editor_buffer[i]);
-	return offset;
+	for (i = 0; i < index; i++)
+	{
+		if (editor_buffer[i] == '\n') line++;
+	}
+	return line;
+}
+
+static int editor_has_more_below(unsigned long top, unsigned long rows)
+{
+	unsigned long idx = top;
+	unsigned long r = 0;
+	if (top >= editor_length) return 0;
+	while (r < rows && idx < editor_length)
+	{
+		idx = editor_next_visual_row(idx);
+		r++;
+	}
+	return idx < editor_length;
 }
 
 static unsigned long editor_line_start(unsigned long index)
@@ -442,30 +1104,243 @@ static unsigned long editor_line_end(unsigned long index)
 
 static void editor_render(void)
 {
-	unsigned short offset = editor_vga_start;
 	unsigned short clear_off;
-	unsigned long i;
+	unsigned long rows;
+	int can_scroll_up;
+	int can_scroll_down;
 
-	for (clear_off = editor_vga_start; clear_off < (VGA_TEXT_WIDTH * 25); clear_off++)
-	{
-		screen_write_char_at(clear_off, ' ');
-	}
-
-	for (i = 0; i < editor_length; i++)
-	{
-		if (editor_buffer[i] == '\n')
-		{
-			offset = editor_next_offset(offset, '\n');
-			continue;
-		}
-		screen_write_char_at(offset, editor_buffer[i]);
-		offset = (unsigned short)(offset + 1);
-	}
-
-	editor_prev_end = offset;
 	if (editor_cursor > editor_length) editor_cursor = editor_length;
+	rows = editor_visible_rows();
+	if (rows == 0) return;
+
+	if (editor_hex_mode)
 	{
-		unsigned short cursor_off = editor_offset_for_index(editor_cursor);
+		unsigned long row;
+		unsigned long view_limit;
+		if (editor_view_top > editor_length) editor_view_top = (editor_length / EDITOR_HEX_BYTES_PER_ROW) * EDITOR_HEX_BYTES_PER_ROW;
+		rows = editor_visible_rows();
+		if (editor_cursor < editor_view_top) editor_view_top = (editor_cursor / EDITOR_HEX_BYTES_PER_ROW) * EDITOR_HEX_BYTES_PER_ROW;
+		view_limit = editor_view_top + rows * EDITOR_HEX_BYTES_PER_ROW;
+		while (editor_cursor >= view_limit && rows > 0)
+		{
+			editor_view_top += EDITOR_HEX_BYTES_PER_ROW;
+			view_limit = editor_view_top + rows * EDITOR_HEX_BYTES_PER_ROW;
+		}
+		can_scroll_up = (editor_view_top > 0);
+		can_scroll_down = (editor_view_top + rows * EDITOR_HEX_BYTES_PER_ROW < editor_length);
+		editor_draw_header(can_scroll_up, can_scroll_down);
+		rows = editor_visible_rows();
+		for (clear_off = editor_vga_start; clear_off < (VGA_TEXT_WIDTH * 25); clear_off++) screen_write_char_at(clear_off, ' ');
+		for (row = 0; row < rows; row++)
+		{
+			unsigned long row_start = editor_view_top + row * EDITOR_HEX_BYTES_PER_ROW;
+			unsigned short row_off = (unsigned short)(editor_vga_start + row * VGA_TEXT_WIDTH);
+			unsigned long b;
+			screen_write_char_at((unsigned short)(row_off + 0), editor_hex_digit((unsigned char)((row_start >> 12) & 0xF)));
+			screen_write_char_at((unsigned short)(row_off + 1), editor_hex_digit((unsigned char)((row_start >> 8) & 0xF)));
+			screen_write_char_at((unsigned short)(row_off + 2), editor_hex_digit((unsigned char)((row_start >> 4) & 0xF)));
+			screen_write_char_at((unsigned short)(row_off + 3), editor_hex_digit((unsigned char)(row_start & 0xF)));
+			screen_write_char_at((unsigned short)(row_off + 4), ':');
+			screen_write_char_at((unsigned short)(row_off + 5), ' ');
+			screen_write_char_at((unsigned short)(row_off + 54), '|');
+			screen_write_char_at((unsigned short)(row_off + 71), '|');
+			for (b = 0; b < EDITOR_HEX_BYTES_PER_ROW; b++)
+			{
+				unsigned short hex_off = (unsigned short)(row_off + EDITOR_HEX_DATA_COL + b * 3);
+				unsigned short ascii_off = (unsigned short)(row_off + EDITOR_HEX_ASCII_COL + b);
+				if (row_start + b < editor_length)
+				{
+					unsigned char byte = (unsigned char)editor_buffer[row_start + b];
+					screen_write_char_at(hex_off, editor_hex_digit((unsigned char)(byte >> 4)));
+					screen_write_char_at((unsigned short)(hex_off + 1), editor_hex_digit(byte));
+					screen_write_char_at((unsigned short)(hex_off + 2), ' ');
+					screen_write_char_at(ascii_off, (byte >= 0x20 && byte < 0x7F) ? (char)byte : '.');
+				}
+				else
+				{
+					screen_write_char_at(hex_off, ' ');
+					screen_write_char_at((unsigned short)(hex_off + 1), ' ');
+					screen_write_char_at((unsigned short)(hex_off + 2), ' ');
+					screen_write_char_at(ascii_off, ' ');
+				}
+			}
+		}
+		editor_prev_end = (unsigned short)(editor_vga_start + (rows - 1) * VGA_TEXT_WIDTH);
+		{
+			unsigned long r = (editor_cursor - editor_view_top) / EDITOR_HEX_BYTES_PER_ROW;
+			unsigned long c = (editor_cursor - editor_view_top) % EDITOR_HEX_BYTES_PER_ROW;
+			unsigned short cursor_off;
+			if (r >= rows) r = rows - 1;
+			if (c >= EDITOR_HEX_BYTES_PER_ROW) c = EDITOR_HEX_BYTES_PER_ROW - 1;
+			cursor_off = (unsigned short)(editor_vga_start + r * VGA_TEXT_WIDTH + EDITOR_HEX_DATA_COL + c * 3 + editor_hex_nibble);
+			if (cursor_off >= VGA_TEXT_WIDTH * 25) cursor_off = (unsigned short)(VGA_TEXT_WIDTH * 25 - 1);
+			screen_set_hw_cursor(cursor_off);
+			screen_set_pos(cursor_off);
+		}
+		return;
+	}
+
+	if (editor_view_top > editor_length) editor_view_top = editor_length;
+	rows = editor_visible_rows();
+	if (editor_cursor < editor_view_top) editor_view_top = editor_visual_row_start(editor_cursor);
+	while (editor_cursor_row_from_top(editor_view_top, editor_cursor) >= rows)
+	{
+		unsigned long next_top = editor_next_visual_row(editor_view_top);
+		if (next_top == editor_view_top) break;
+		editor_view_top = next_top;
+	}
+
+	can_scroll_up = (editor_view_top > 0);
+	can_scroll_down = editor_has_more_below(editor_view_top, rows);
+	editor_draw_header(can_scroll_up, can_scroll_down);
+	rows = editor_visible_rows();
+	for (clear_off = editor_vga_start; clear_off < (VGA_TEXT_WIDTH * 25); clear_off++) screen_write_char_at(clear_off, ' ');
+	{
+		unsigned long row = 0;
+		unsigned long row_start = editor_view_top;
+		unsigned long width = editor_text_width();
+		static const char *const sh_keywords[] = {
+			"if", "then", "else", "fi", "for", "do", "done", "while", "in", "case", "esac", "function", "echo", "exit", "cd", "ls"
+		};
+		static const char *const basic_keywords[] = {
+			"PRINT", "LET", "IF", "THEN", "GOTO", "GOSUB", "RETURN", "FOR", "TO", "STEP", "NEXT", "INPUT", "REM", "END", "STOP", "LIST", "RUN"
+		};
+		while (row < rows)
+		{
+			unsigned short row_off = (unsigned short)(editor_vga_start + row * VGA_TEXT_WIDTH);
+			unsigned long row_end = row_start;
+			unsigned long col = 0;
+			int in_comment = 0;
+			int in_string = 0;
+			unsigned long token_remaining = 0;
+			unsigned char token_color = editor_text_color;
+			if (row_start == 0 || (row_start <= editor_length && editor_buffer[row_start - 1] == '\n'))
+			{
+				screen_set_color(editor_line_number_color);
+				editor_write_uint_right(row_off, editor_line_number_for_index(row_start), EDITOR_TEXT_GUTTER - 2);
+			}
+			screen_set_color(editor_rule_color);
+			screen_write_char_at((unsigned short)(row_off + EDITOR_TEXT_GUTTER - 2), '|');
+			screen_write_char_at((unsigned short)(row_off + EDITOR_TEXT_GUTTER - 1), ' ');
+			while (row_end < editor_length && col < width)
+			{
+				char ch = editor_buffer[row_end];
+				unsigned char ch_color = editor_text_color;
+				if (ch == '\n')
+				{
+					row_end++;
+					break;
+				}
+
+				if (editor_language == EDITOR_LANG_SH)
+				{
+					if (in_comment)
+					{
+						ch_color = editor_sh_comment_color;
+					}
+					else if (in_string)
+					{
+						ch_color = editor_sh_string_color;
+						if (ch == '"') in_string = 0;
+					}
+					else if (token_remaining > 0)
+					{
+						ch_color = token_color;
+						token_remaining--;
+					}
+					else if (ch == '#')
+					{
+						in_comment = 1;
+						ch_color = editor_sh_comment_color;
+					}
+					else if (ch == '"')
+					{
+						in_string = 1;
+						ch_color = editor_sh_string_color;
+					}
+					else if ((row_end == row_start || !char_is_word(editor_buffer[row_end - 1])) && char_is_word(ch))
+					{
+						unsigned long tlen = 0;
+						while (row_end + tlen < editor_length && char_is_word(editor_buffer[row_end + tlen])) tlen++;
+						if (token_is_keyword_ci(&editor_buffer[row_end], tlen, sh_keywords, sizeof(sh_keywords) / sizeof(sh_keywords[0])))
+						{
+							ch_color = editor_sh_keyword_color;
+							token_color = editor_sh_keyword_color;
+							if (tlen > 0) token_remaining = tlen - 1;
+						}
+					}
+				}
+				else if (editor_language == EDITOR_LANG_BASIC)
+				{
+					if (in_comment)
+					{
+						ch_color = editor_basic_comment_color;
+					}
+					else if (in_string)
+					{
+						ch_color = editor_basic_string_color;
+						if (ch == '"') in_string = 0;
+					}
+					else if (token_remaining > 0)
+					{
+						ch_color = token_color;
+						token_remaining--;
+					}
+					else if (ch == '\'')
+					{
+						in_comment = 1;
+						ch_color = editor_basic_comment_color;
+					}
+					else if (ch == '"')
+					{
+						in_string = 1;
+						ch_color = editor_basic_string_color;
+					}
+					else if ((row_end == row_start || !char_is_word(editor_buffer[row_end - 1])) && char_is_word(ch))
+					{
+						unsigned long tlen = 0;
+						unsigned long rem_len = 0;
+						while (row_end + tlen < editor_length && char_is_word(editor_buffer[row_end + tlen])) tlen++;
+						if (starts_with_word_ci(&editor_buffer[row_end], "REM", &rem_len))
+						{
+							in_comment = 1;
+							ch_color = editor_basic_comment_color;
+							token_color = editor_basic_comment_color;
+							if (rem_len > 0) token_remaining = rem_len - 1;
+						}
+						else if (token_is_keyword_ci(&editor_buffer[row_end], tlen, basic_keywords, sizeof(basic_keywords) / sizeof(basic_keywords[0])))
+						{
+							ch_color = editor_basic_keyword_color;
+							token_color = editor_basic_keyword_color;
+							if (tlen > 0) token_remaining = tlen - 1;
+						}
+					}
+				}
+
+				screen_set_color(ch_color);
+				screen_write_char_at((unsigned short)(row_off + EDITOR_TEXT_GUTTER + col), ch);
+				row_end++;
+				col++;
+			}
+			if (row_end >= editor_length && row_start >= editor_length && row > 0) break;
+			if (row_end == row_start && row_start >= editor_length)
+			{
+				row++;
+				continue;
+			}
+			row_start = row_end;
+			row++;
+		}
+	}
+	editor_prev_end = (unsigned short)(editor_vga_start + (rows - 1) * VGA_TEXT_WIDTH);
+	{
+		unsigned long r = editor_cursor_row_from_top(editor_view_top, editor_cursor);
+		unsigned long c = editor_visual_row_col(editor_cursor);
+		unsigned short cursor_off;
+		if (r >= rows) r = rows - 1;
+		if (c >= editor_text_width()) c = editor_text_width() - 1;
+		cursor_off = (unsigned short)(editor_vga_start + r * VGA_TEXT_WIDTH + EDITOR_TEXT_GUTTER + c);
+		if (cursor_off >= VGA_TEXT_WIDTH * 25) cursor_off = (unsigned short)(VGA_TEXT_WIDTH * 25 - 1);
 		screen_set_hw_cursor(cursor_off);
 		screen_set_pos(cursor_off);
 	}
@@ -776,10 +1651,10 @@ static void handle_arrow_down(void)
 /* ================================================================== */
 
 static const char * const cmd_list[] = {
-	"help", "version", "echo", "clear", "reboot",
+	"help", "version", "echo", "glyph", "charmap", "color", "theme", "themes", "etheme", "ethemes", "clear", "reboot",
 	"quit", "exit", "shutdown",
-	"pwd", "ls", "cd", "mkdir", "touch", "write", "cat", "rm", "cp", "mv", "edit", "run", "basic",
-	"hexdump", "memmap", "ataid", "readsec", "writesec", "fatmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatrm", (void *)0
+	"pwd", "ls", "cd", "mkdir", "touch", "write", "cat", "rm", "cp", "mv", "edit", "hexedit", "run", "basic",
+	"hexdump", "memmap", "ataid", "readsec", "writesec", "fatmount", "ramfs", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatrm", (void *)0
 };
 
 static void handle_tab(void)
@@ -805,7 +1680,7 @@ static void handle_tab(void)
 		for (i = 0; cmd_list[i]; i++)
 			if (string_starts_with(cmd_list[i], input_buffer)) { terminal_write(cmd_list[i]); terminal_putc(' '); }
 		terminal_putc('\n');
-		screen_set_color(0x0B); terminal_write("> "); screen_set_color(0x0F);
+		screen_set_color(terminal_prompt_color); terminal_write("> "); screen_set_color(terminal_text_color);
 		prompt_vga_start = screen_get_pos();
 		for (j = 0; j < input_length; j++) screen_write_char_at((unsigned short)(prompt_vga_start + j), input_buffer[j]);
 		cursor_pos = input_length; sync_screen_pos();
@@ -1282,91 +2157,119 @@ static int editor_save(void)
 		return rc;
 	}
 
-	rc = fs_write_text(editor_target_path, editor_buffer);
+	rc = fs_write_file(editor_target_path, (const unsigned char *)editor_buffer, editor_length);
 	if (rc == 0) editor_dirty = 0;
 	return rc;
 }
 
-static void editor_draw_header(void)
+static void editor_draw_header(int can_scroll_up, int can_scroll_down)
 {
 	screen_set_pos(0);
 	screen_set_hw_cursor(0);
-	terminal_write("TG11 Editor");
+	screen_set_color(editor_header_color);
+	terminal_write("TG11 Editor ");
+	terminal_write(editor_hex_mode ? "[hex]" : "[text]");
+	terminal_write(" [");
+	terminal_putc(can_scroll_up ? '^' : ' ');
+	terminal_putc('/');
+	terminal_putc(can_scroll_down ? 'v' : ' ');
+	terminal_write("]");
 	if (editor_dirty) terminal_write(" [modified]");
 	terminal_putc('\n');
+	screen_set_color(editor_path_color);
 	terminal_write("Path: ");
 	terminal_write_line(editor_target_path);
-	terminal_write_line("Ctrl+S = save | F10 = save+exit | Esc = cancel");
+	screen_set_color(editor_header_color);
+	if (editor_hex_mode) terminal_write_line("Hex: 0-9/A-F edit | arrows PgUp PgDn Home End | Ctrl+Home/End");
+	else terminal_write_line("Ctrl+S save | F10 save+exit | Esc cancel | PgUp PgDn Home End");
+	screen_set_color(editor_rule_color);
 	terminal_write_line("--------------------------------");
+	screen_set_color(editor_text_color);
 	editor_vga_start = screen_get_pos();
 	editor_prev_end = editor_vga_start;
+}
+
+static int editor_open_file(const char *path, int hex_mode)
+{
+	unsigned long size = 0;
+	unsigned long i;
+	editor_use_fat = fat_mode_active();
+	editor_hex_mode = hex_mode;
+	editor_hex_nibble = 0;
+	editor_language = editor_detect_language_from_path(path);
+
+	if (editor_use_fat)
+	{
+		if (fat_resolve_path(path, editor_target_path, sizeof(editor_target_path)) != 0) return -1;
+	}
+	else
+	{
+		for (i = 0; path[i] != '\0' && i + 1 < sizeof(editor_target_path); i++) editor_target_path[i] = path[i];
+		editor_target_path[i] = '\0';
+	}
+
+	editor_length = 0;
+	editor_dirty = 0;
+	if (hex_mode)
+	{
+		if (editor_use_fat)
+		{
+			if (fat32_read_file_path(editor_target_path, (unsigned char *)editor_buffer, EDITOR_BUFFER_SIZE, &size) == 0) editor_length = size;
+		}
+		else
+		{
+			if (fs_read_file(editor_target_path, (unsigned char *)editor_buffer, EDITOR_BUFFER_SIZE, &size) == 0) editor_length = size;
+		}
+	}
+	else
+	{
+		if (editor_use_fat)
+		{
+			if (fat32_read_file_path(editor_target_path, (unsigned char *)editor_buffer, EDITOR_BUFFER_SIZE - 1, &size) == 0) editor_length = size;
+		}
+		else
+		{
+			if (fs_read_file(editor_target_path, (unsigned char *)editor_buffer, EDITOR_BUFFER_SIZE - 1, &size) == 0) editor_length = size;
+		}
+		editor_buffer[editor_length] = '\0';
+	}
+
+	screen_clear();
+	editor_cursor = editor_length;
+	editor_view_top = 0;
+	editor_render();
+	editor_active = 1;
+	return 0;
 }
 
 static void cmd_edit(const char *args)
 {
 	char path[128];
-	const char *text;
 	const char *p = read_token(args, path, sizeof(path));
-
 	if (p == (void *)0 || path[0] == '\0')
 	{
 		terminal_write_line("Usage: edit <path>");
 		return;
 	}
-
-	editor_use_fat = fat_mode_active();
-	if (editor_use_fat)
+	if (editor_open_file(path, 0) != 0)
 	{
-		if (fat_resolve_path(path, editor_target_path, sizeof(editor_target_path)) != 0)
-		{
-			terminal_write_line("edit: invalid FAT path");
-			return;
-		}
+		terminal_write_line(fat_mode_active() ? "edit: invalid FAT path" : "edit: failed");
 	}
-	else
-	{
-		unsigned long i = 0;
-		while (path[i] != '\0' && i + 1 < sizeof(editor_target_path))
-		{
-			editor_target_path[i] = path[i];
-			i++;
-		}
-		editor_target_path[i] = '\0';
-	}
+}
 
-	editor_length = 0;
-	editor_buffer[0] = '\0';
-	editor_dirty = 0;
-
-	if (editor_use_fat)
+static void cmd_hexedit(const char *args)
+{
+	char path[128];
+	const char *p = read_token(args, path, sizeof(path));
+	if (p == (void *)0 || path[0] == '\0')
 	{
-		unsigned long size = 0;
-		if (fat32_read_file_path(editor_target_path, (unsigned char *)editor_buffer, EDITOR_BUFFER_SIZE - 1, &size) == 0)
-		{
-			editor_length = size;
-			editor_buffer[editor_length] = '\0';
-		}
+		terminal_write_line("Usage: hexedit <path>");
+		return;
 	}
-	else
+	if (editor_open_file(path, 1) != 0)
 	{
-		if (fs_read_text(editor_target_path, &text) == 0)
-		{
-			unsigned long i = 0;
-			while (text[i] != '\0' && i + 1 < EDITOR_BUFFER_SIZE)
-			{
-				editor_buffer[i] = text[i];
-				i++;
-			}
-			editor_length = i;
-			editor_buffer[editor_length] = '\0';
-		}
+		terminal_write_line(fat_mode_active() ? "hexedit: invalid FAT path" : "hexedit: failed");
 	}
-
-	screen_clear();
-	editor_draw_header();
-	editor_cursor = editor_length;
-	editor_render();
-	editor_active = 1;
 }
 
 static void editor_status_line(const char *msg)
@@ -1375,7 +2278,6 @@ static void editor_status_line(const char *msg)
 	screen_set_hw_cursor(editor_prev_end);
 	terminal_putc('\n');
 	terminal_write_line(msg);
-	editor_draw_header();
 	editor_render();
 }
 
@@ -2012,6 +2914,218 @@ static void cmd_fatmount(void)
 	terminal_write_line("fatmount: mounted (generic fs commands now use FAT)");
 }
 
+static void cmd_fatunmount(void)
+{
+	if (!fat32_is_mounted())
+	{
+		terminal_write_line("fatunmount: not mounted");
+		return;
+	}
+
+	fat32_unmount();
+	vfs_prefer_fat_root = 0;
+	fat_cwd[0] = '/';
+	fat_cwd[1] = '\0';
+	terminal_write_line("fatunmount: done");
+}
+
+static void cmd_color(const char *args)
+{
+	char what[16];
+	char value[16];
+	unsigned char c;
+	const char *p = read_token(args, what, sizeof(what));
+
+	if (p == (void *)0 || what[0] == '\0' || string_equals(what, "show"))
+	{
+		terminal_write("color: text=");
+		terminal_write_hex8(terminal_text_color);
+		terminal_write(" prompt=");
+		terminal_write_hex8(terminal_prompt_color);
+		terminal_putc('\n');
+		return;
+	}
+
+	p = read_token(p, value, sizeof(value));
+	if (p == (void *)0 || value[0] == '\0' || parse_color_token(value, &c) != 0)
+	{
+		terminal_write_line("Usage: color [show|text <0xNN>|prompt <0xNN>]");
+		return;
+	}
+
+	if (string_equals(what, "text"))
+	{
+		terminal_text_color = c;
+		screen_set_color(terminal_text_color);
+		terminal_write_line("color: text updated");
+		return;
+	}
+	if (string_equals(what, "prompt"))
+	{
+		terminal_prompt_color = c;
+		terminal_write_line("color: prompt updated");
+		return;
+	}
+
+	terminal_write_line("Usage: color [show|text <0xNN>|prompt <0xNN>]");
+}
+
+static void cmd_theme(const char *args)
+{
+	char name[24];
+	const char *p = read_token(args, name, sizeof(name));
+	if (p == (void *)0 || name[0] == '\0')
+	{
+		terminal_write_line("Usage: theme <name>");
+		terminal_write_line("Hint: run 'themes' to list available themes");
+		return;
+	}
+	if (apply_system_theme_by_name(name, 1) != 0)
+	{
+		terminal_write("system theme not found: ");
+		terminal_write_line(name);
+	}
+}
+
+static void cmd_themes(const char *args)
+{
+	char op[16];
+	char names[FS_MAX_LIST][FS_NAME_MAX + 2];
+	int types[FS_MAX_LIST];
+	int count = 0;
+	int i;
+	const char *current = (void *)0;
+	const char *p = read_token(args, op, sizeof(op));
+
+	if (p != (void *)0 && op[0] != '\0' && !string_equals(op, "list"))
+	{
+		terminal_write_line("Usage: themes [list]");
+		return;
+	}
+
+	if (fs_read_text(SYSTEM_THEME_CURRENT_PATH, &current) == 0)
+	{
+		terminal_write("system themes: current=");
+		terminal_write_line(current);
+	}
+	else
+	{
+		terminal_write_line("system themes: current=(unknown)");
+	}
+
+	if (fs_ls(SYSTEM_THEME_DIR, names, types, FS_MAX_LIST, &count) != 0)
+	{
+		terminal_write_line("themes: failed to list /themes");
+		return;
+	}
+
+	for (i = 0; i < count; i++)
+	{
+		if (types[i] == 1) continue;
+		if (string_equals(names[i], "current")) continue;
+		terminal_write("  ");
+		terminal_write_line(names[i]);
+	}
+}
+
+static void cmd_etheme(const char *args)
+{
+	char name[24];
+	const char *p = read_token(args, name, sizeof(name));
+	if (p == (void *)0 || name[0] == '\0')
+	{
+		terminal_write_line("Usage: etheme <name>");
+		terminal_write_line("Hint: run 'ethemes' to list available editor themes");
+		return;
+	}
+	if (apply_editor_theme_by_name(name, 1) != 0)
+	{
+		terminal_write("editor theme not found: ");
+		terminal_write_line(name);
+	}
+}
+
+static void cmd_ethemes(const char *args)
+{
+	char op[16];
+	char names[FS_MAX_LIST][FS_NAME_MAX + 2];
+	int types[FS_MAX_LIST];
+	int count = 0;
+	int i;
+	const char *current = (void *)0;
+	const char *p = read_token(args, op, sizeof(op));
+
+	if (p != (void *)0 && op[0] != '\0' && !string_equals(op, "list"))
+	{
+		terminal_write_line("Usage: ethemes [list]");
+		return;
+	}
+
+	if (fs_read_text(EDITOR_THEME_CURRENT_PATH, &current) == 0)
+	{
+		terminal_write("editor themes: current=");
+		terminal_write_line(current);
+	}
+	else
+	{
+		terminal_write_line("editor themes: current=(unknown)");
+	}
+
+	if (fs_ls(EDITOR_THEME_DIR, names, types, FS_MAX_LIST, &count) != 0)
+	{
+		terminal_write_line("ethemes: failed to list /edit/themes");
+		return;
+	}
+
+	for (i = 0; i < count; i++)
+	{
+		if (types[i] == 1) continue;
+		if (string_equals(names[i], "current")) continue;
+		terminal_write("  ");
+		terminal_write_line(names[i]);
+	}
+}
+
+static void cmd_ramfs(void)
+{
+	vfs_prefer_fat_root = 0;
+	terminal_write_line("ramfs: active (generic fs commands now use RAM FS)");
+}
+
+static void cmd_glyph(const char *args)
+{
+	char tok[16];
+	const char *end;
+	unsigned long v;
+	char out[2];
+	const char *p = read_token(args, tok, sizeof(tok));
+	if (p == (void *)0 || tok[0] == '\0')
+	{
+		terminal_write_line("Usage: glyph <0xNN>");
+		return;
+	}
+	v = parse_hex(tok, &end);
+	if (*end != '\0' || v > 0xFFUL)
+	{
+		terminal_write_line("Usage: glyph <0xNN>");
+		return;
+	}
+	out[0] = (char)v;
+	out[1] = '\0';
+	terminal_write(out);
+	terminal_putc('\n');
+}
+
+static void cmd_charmap(void)
+{
+	terminal_write_line("CP437 aliases (use in commands/scripts):");
+	terminal_write_line("  \\boxh \\boxv \\boxul \\boxur \\boxll \\boxlr");
+	terminal_write_line("  \\boxt \\boxb \\boxl \\boxr \\boxx");
+	terminal_write_line("  \\blk \\blkup \\blkdn \\shade1 \\shade2 \\shade3");
+	terminal_write_line("  \\arru \\arrd \\arrl \\arrr \\tri");
+	terminal_write_line("  \\xNN for raw byte (hex), example: echo \\xDB\\xDB\\xDB");
+}
+
 static void cmd_fatls(void)
 {
 	char names[64][40];
@@ -2152,6 +3266,7 @@ static void cmd_fatrm(const char *args)
 static void run_command(void)
 {
 	char expanded[INPUT_BUFFER_SIZE];
+	char expanded_glyphs[INPUT_BUFFER_SIZE];
 	unsigned long i;
 
 	if (input_length == 0) { terminal_prompt(); return; }
@@ -2164,11 +3279,19 @@ static void run_command(void)
 		if (!editor_active && !script_mode_active) terminal_prompt();
 		return;
 	}
+	if (expand_cp437_aliases(expanded, expanded_glyphs, sizeof(expanded_glyphs)) != 0)
+	{
+		terminal_write_line("glyph escape: bad alias or overflow");
+		input_length = 0;
+		input_buffer[0] = '\0';
+		if (!editor_active && !script_mode_active) terminal_prompt();
+		return;
+	}
 
 	i = 0;
-	while (expanded[i] != '\0' && i + 1 < sizeof(input_buffer))
+	while (expanded_glyphs[i] != '\0' && i + 1 < sizeof(input_buffer))
 	{
-		input_buffer[i] = expanded[i];
+		input_buffer[i] = expanded_glyphs[i];
 		i++;
 	}
 	input_buffer[i] = '\0';
@@ -2245,6 +3368,11 @@ static void run_command(void)
 		if (input_buffer[4] == ' ') cmd_edit(input_buffer + 5);
 		else terminal_write_line("Usage: edit <path>");
 	}
+	else if (string_starts_with(input_buffer, "hexedit"))
+	{
+		if (input_buffer[7] == ' ') cmd_hexedit(input_buffer + 8);
+		else terminal_write_line("Usage: hexedit <path>");
+	}
 	else if (string_starts_with(input_buffer, "run"))
 	{
 		if (input_buffer[3] == ' ') cmd_run(input_buffer + 4);
@@ -2288,6 +3416,10 @@ static void run_command(void)
 	{
 		cmd_fatmount();
 	}
+	else if (string_equals(input_buffer, "fatunmount"))
+	{
+		cmd_fatunmount();
+	}
 	else if (string_equals(input_buffer, "fatls"))
 	{
 		cmd_fatls();
@@ -2317,6 +3449,47 @@ static void run_command(void)
 		if      (input_buffer[4] == '\0') terminal_putc('\n');
 		else if (input_buffer[4] == ' ')  terminal_write_line(&input_buffer[5]);
 		else    terminal_write_line("Unknown command. Type help for a list.");
+	}
+	else if (string_starts_with(input_buffer, "glyph"))
+	{
+		if (input_buffer[5] == ' ') cmd_glyph(input_buffer + 6);
+		else terminal_write_line("Usage: glyph <0xNN>");
+	}
+	else if (string_equals(input_buffer, "charmap"))
+	{
+		cmd_charmap();
+	}
+	else if (string_starts_with(input_buffer, "color"))
+	{
+		if (input_buffer[5] == '\0') cmd_color("show");
+		else if (input_buffer[5] == ' ') cmd_color(input_buffer + 6);
+		else terminal_write_line("Usage: color [show|text <0xNN>|prompt <0xNN>]");
+	}
+	else if (string_starts_with(input_buffer, "theme"))
+	{
+		if (input_buffer[5] == ' ') cmd_theme(input_buffer + 6);
+		else terminal_write_line("Usage: theme <name>");
+	}
+	else if (string_starts_with(input_buffer, "themes"))
+	{
+		if (input_buffer[6] == '\0') cmd_themes("list");
+		else if (input_buffer[6] == ' ') cmd_themes(input_buffer + 7);
+		else terminal_write_line("Usage: themes [list]");
+	}
+	else if (string_starts_with(input_buffer, "etheme"))
+	{
+		if (input_buffer[6] == ' ') cmd_etheme(input_buffer + 7);
+		else terminal_write_line("Usage: etheme <name>");
+	}
+	else if (string_starts_with(input_buffer, "ethemes"))
+	{
+		if (input_buffer[7] == '\0') cmd_ethemes("list");
+		else if (input_buffer[7] == ' ') cmd_ethemes(input_buffer + 8);
+		else terminal_write_line("Usage: ethemes [list]");
+	}
+	else if (string_equals(input_buffer, "ramfs"))
+	{
+		cmd_ramfs();
 	}
 	else if (string_equals(input_buffer, "reboot"))
 	{
@@ -2361,9 +3534,92 @@ static void editor_handle_scancode(unsigned char scancode)
 		unsigned long col;
 		unsigned long line_start;
 		unsigned long line_end;
+		unsigned long rows;
 		extended_key = 0;
 		if (scancode == 0x1D) { ctrl_held = 1; return; }
 		if (scancode == 0x9D) { ctrl_held = 0; return; }
+		if (editor_hex_mode)
+		{
+			unsigned long row_start = (editor_cursor / EDITOR_HEX_BYTES_PER_ROW) * EDITOR_HEX_BYTES_PER_ROW;
+			if (scancode == 0x53)
+			{
+				if (editor_cursor < editor_length)
+				{
+					for (i = editor_cursor; i + 1 < editor_length; i++) editor_buffer[i] = editor_buffer[i + 1];
+					editor_length--;
+					editor_dirty = 1;
+					editor_hex_nibble = 0;
+					editor_render();
+				}
+				return;
+			}
+			if (scancode == 0x4B)
+			{
+				if (editor_cursor > 0) editor_cursor--;
+				editor_hex_nibble = 0;
+				editor_render();
+				return;
+			}
+			if (scancode == 0x4D)
+			{
+				if (editor_cursor < editor_length) editor_cursor++;
+				editor_hex_nibble = 0;
+				editor_render();
+				return;
+			}
+			if (scancode == 0x47)
+			{
+				editor_cursor = ctrl_held ? 0 : row_start;
+				editor_hex_nibble = 0;
+				editor_render();
+				return;
+			}
+			if (scancode == 0x4F)
+			{
+				unsigned long row_end = row_start + (EDITOR_HEX_BYTES_PER_ROW - 1);
+				if (row_end > editor_length) row_end = editor_length;
+				editor_cursor = ctrl_held ? editor_length : row_end;
+				editor_hex_nibble = 0;
+				editor_render();
+				return;
+			}
+			if (scancode == 0x49)
+			{
+				rows = editor_visible_rows();
+				if (rows > 1) rows--;
+				if (editor_cursor >= rows * EDITOR_HEX_BYTES_PER_ROW) editor_cursor -= rows * EDITOR_HEX_BYTES_PER_ROW;
+				else editor_cursor = 0;
+				editor_hex_nibble = 0;
+				editor_render();
+				return;
+			}
+			if (scancode == 0x51)
+			{
+				rows = editor_visible_rows();
+				if (rows > 1) rows--;
+				editor_cursor += rows * EDITOR_HEX_BYTES_PER_ROW;
+				if (editor_cursor > editor_length) editor_cursor = editor_length;
+				editor_hex_nibble = 0;
+				editor_render();
+				return;
+			}
+			if (scancode == 0x48)
+			{
+				if (editor_cursor >= EDITOR_HEX_BYTES_PER_ROW) editor_cursor -= EDITOR_HEX_BYTES_PER_ROW;
+				editor_hex_nibble = 0;
+				editor_render();
+				return;
+			}
+			if (scancode == 0x50)
+			{
+				editor_cursor += EDITOR_HEX_BYTES_PER_ROW;
+				if (editor_cursor > editor_length) editor_cursor = editor_length;
+				editor_hex_nibble = 0;
+				editor_render();
+				return;
+			}
+			return;
+		}
 		if (scancode == 0x4B)
 		{
 			if (editor_cursor > 0) editor_cursor--;
@@ -2378,13 +3634,31 @@ static void editor_handle_scancode(unsigned char scancode)
 		}
 		if (scancode == 0x47)
 		{
-			editor_cursor = editor_line_start(editor_cursor);
+			if (ctrl_held) editor_cursor = 0;
+			else editor_cursor = editor_line_start(editor_cursor);
 			editor_render();
 			return;
 		}
 		if (scancode == 0x4F)
 		{
-			editor_cursor = editor_line_end(editor_cursor);
+			if (ctrl_held) editor_cursor = editor_length;
+			else editor_cursor = editor_line_end(editor_cursor);
+			editor_render();
+			return;
+		}
+		if (scancode == 0x49)
+		{
+			rows = editor_visible_rows();
+			if (rows > 1) rows--;
+			editor_cursor = editor_move_visual_rows(editor_cursor, rows, 0);
+			editor_render();
+			return;
+		}
+		if (scancode == 0x51)
+		{
+			rows = editor_visible_rows();
+			if (rows > 1) rows--;
+			editor_cursor = editor_move_visual_rows(editor_cursor, rows, 1);
 			editor_render();
 			return;
 		}
@@ -2435,7 +3709,7 @@ static void editor_handle_scancode(unsigned char scancode)
 	if (scancode == 0x3A) { caps_lock_on = !caps_lock_on; return; }
 	if (scancode & 0x80) return;
 
-	if (scancode == 0x44) /* F10 */
+	if (scancode == 0x44)
 	{
 		screen_set_pos(editor_prev_end);
 		screen_set_hw_cursor(editor_prev_end);
@@ -2450,14 +3724,14 @@ static void editor_handle_scancode(unsigned char scancode)
 		return;
 	}
 
-	if (scancode == 0x1F && ctrl_held) /* Ctrl+S */
+	if (scancode == 0x1F && ctrl_held)
 	{
 		if (editor_save() == 0) editor_status_line("[editor] saved");
 		else editor_status_line("[editor] save failed");
 		return;
 	}
 
-	if (scancode == 0x01) /* Esc */
+	if (scancode == 0x01)
 	{
 		screen_set_pos(editor_prev_end);
 		screen_set_hw_cursor(editor_prev_end);
@@ -2471,19 +3745,65 @@ static void editor_handle_scancode(unsigned char scancode)
 		return;
 	}
 
+	if (editor_hex_mode)
+	{
+		int hv;
+		c = translate_scancode(scancode);
+		hv = editor_hex_value(c);
+		if (scancode == 0x0E)
+		{
+			if (editor_cursor > 0)
+			{
+				editor_cursor--;
+				for (i = editor_cursor; i + 1 < editor_length; i++) editor_buffer[i] = editor_buffer[i + 1];
+				editor_length--;
+				editor_dirty = 1;
+				editor_hex_nibble = 0;
+				editor_render();
+			}
+			return;
+		}
+		if (hv < 0) return;
+		if (editor_cursor >= EDITOR_BUFFER_SIZE)
+		{
+			editor_status_line("[editor] buffer full");
+			return;
+		}
+		if (editor_cursor == editor_length)
+		{
+			editor_buffer[editor_length] = 0;
+			editor_length++;
+		}
+		{
+			unsigned char byte = (unsigned char)editor_buffer[editor_cursor];
+			if (editor_hex_nibble == 0)
+			{
+				byte = (unsigned char)((byte & 0x0F) | ((unsigned char)hv << 4));
+				editor_buffer[editor_cursor] = (char)byte;
+				editor_hex_nibble = 1;
+			}
+			else
+			{
+				byte = (unsigned char)((byte & 0xF0) | (unsigned char)hv);
+				editor_buffer[editor_cursor] = (char)byte;
+				editor_hex_nibble = 0;
+				if (editor_cursor < editor_length) editor_cursor++;
+			}
+		}
+		editor_dirty = 1;
+		editor_render();
+		return;
+	}
+
 	if (scancode == 0x0E)
 	{
 		if (editor_cursor > 0)
 		{
-			for (i = editor_cursor - 1; i < editor_length - 1; i++)
-			{
-				editor_buffer[i] = editor_buffer[i + 1];
-			}
+			for (i = editor_cursor - 1; i < editor_length - 1; i++) editor_buffer[i] = editor_buffer[i + 1];
 			editor_cursor--;
 			editor_length--;
 			editor_buffer[editor_length] = '\0';
 			editor_dirty = 1;
-			editor_draw_header();
 			editor_render();
 		}
 		return;
@@ -2498,7 +3818,6 @@ static void editor_handle_scancode(unsigned char scancode)
 			editor_length++;
 			editor_buffer[editor_length] = '\0';
 			editor_dirty = 1;
-			editor_draw_header();
 			editor_render();
 		}
 		return;
@@ -2507,25 +3826,16 @@ static void editor_handle_scancode(unsigned char scancode)
 	if (scancode == 0x0F) c = '\t';
 	else c = translate_scancode(scancode);
 	if (c == '\0') return;
-
 	if (editor_length + 1 >= EDITOR_BUFFER_SIZE)
 	{
-		screen_set_pos(editor_prev_end);
-		screen_set_hw_cursor(editor_prev_end);
-		terminal_putc('\n');
-		terminal_write_line("[editor] buffer full");
-		editor_vga_start = screen_get_pos();
-		editor_prev_end = editor_vga_start;
-		editor_render();
+		editor_status_line("[editor] buffer full");
 		return;
 	}
-
 	for (i = editor_length; i > editor_cursor; i--) editor_buffer[i] = editor_buffer[i - 1];
 	editor_buffer[editor_cursor++] = c;
 	editor_length++;
 	editor_buffer[editor_length] = '\0';
 	editor_dirty = 1;
-	editor_draw_header();
 	editor_render();
 }
 
@@ -2624,7 +3934,11 @@ void terminal_enqueue_scancode(unsigned char scancode)
 
 void terminal_init(unsigned long mb2_info_addr)
 {
+	ensure_theme_files();
+	load_current_system_theme();
+	load_current_editor_theme();
 	screen_clear();
+	screen_set_color(terminal_text_color);
 	serial_ready = serial_init();
 	memmap_init(mb2_info_addr);
 	terminal_write_line("TG11 OS (64-bit)");

@@ -10,5 +10,7 @@ void arch_outb(unsigned short port, unsigned char value);
 void arch_outw(unsigned short port, unsigned short value);
 void arch_io_wait(void);
 void arch_lidt(const void *idtr);
+void arch_lgdt(const void *gdtr);
+void gdt_init(void);
 
 #endif
