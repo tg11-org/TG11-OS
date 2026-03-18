@@ -164,6 +164,7 @@ static void print_help_basic(void)
 	terminal_write_line("  theme <name>         - Apply system theme from /themes");
 	terminal_write_line("  themes [list]        - List system themes");
 	terminal_write_line("  etheme <name>        - Apply editor theme from /edit/themes");
+	terminal_write_line("  etheme edit <name>   - Edit /edit/themes/<name>.theme");
 	terminal_write_line("  ethemes [list]       - List editor themes");
 	terminal_write_line("  clear                - Clear screen");
 	terminal_write_line("  reboot               - Reboot the system");
@@ -1651,7 +1652,7 @@ static void handle_arrow_down(void)
 /* ================================================================== */
 
 static const char * const cmd_list[] = {
-	"help", "version", "echo", "glyph", "charmap", "color", "theme", "themes", "etheme", "ethemes", "clear", "reboot",
+	"help", "version", "echo", "glyph", "charmap", "color", "themes", "theme", "ethemes", "etheme", "clear", "reboot",
 	"quit", "exit", "shutdown",
 	"pwd", "ls", "cd", "mkdir", "touch", "write", "cat", "rm", "cp", "mv", "edit", "hexedit", "run", "basic",
 	"hexdump", "memmap", "ataid", "readsec", "writesec", "fatmount", "ramfs", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatrm", (void *)0
@@ -3030,18 +3031,57 @@ static void cmd_themes(const char *args)
 
 static void cmd_etheme(const char *args)
 {
+	char first[24];
 	char name[24];
-	const char *p = read_token(args, name, sizeof(name));
-	if (p == (void *)0 || name[0] == '\0')
+	char theme_path[96];
+	const char *p = read_token(args, first, sizeof(first));
+	if (p == (void *)0 || first[0] == '\0')
 	{
-		terminal_write_line("Usage: etheme <name>");
+		terminal_write_line("Usage: etheme <name>|edit <name>");
 		terminal_write_line("Hint: run 'ethemes' to list available editor themes");
 		return;
 	}
-	if (apply_editor_theme_by_name(name, 1) != 0)
+
+	if (string_equals(first, "edit"))
+	{
+		unsigned long i = 0;
+		unsigned long j = 0;
+		int prev_vfs_fat = vfs_prefer_fat_root;
+		p = read_token(p, name, sizeof(name));
+		if (p == (void *)0 || name[0] == '\0')
+		{
+			terminal_write_line("Usage: etheme edit <name>");
+			return;
+		}
+
+		while ("/edit/themes/"[i] != '\0' && i + 1 < sizeof(theme_path)) { theme_path[i] = "/edit/themes/"[i]; i++; }
+		while (name[j] != '\0' && i + 1 < sizeof(theme_path)) theme_path[i++] = name[j++];
+		if (i + 7 >= sizeof(theme_path))
+		{
+			terminal_write_line("etheme: name too long");
+			return;
+		}
+		theme_path[i++] = '.';
+		theme_path[i++] = 't';
+		theme_path[i++] = 'h';
+		theme_path[i++] = 'e';
+		theme_path[i++] = 'm';
+		theme_path[i++] = 'e';
+		theme_path[i] = '\0';
+
+		vfs_prefer_fat_root = 0;
+		if (editor_open_file(theme_path, 0) != 0)
+		{
+			terminal_write_line("etheme edit: failed");
+		}
+		vfs_prefer_fat_root = prev_vfs_fat;
+		return;
+	}
+
+	if (apply_editor_theme_by_name(first, 1) != 0)
 	{
 		terminal_write("editor theme not found: ");
-		terminal_write_line(name);
+		terminal_write_line(first);
 	}
 }
 
@@ -3465,27 +3505,27 @@ static void run_command(void)
 		else if (input_buffer[5] == ' ') cmd_color(input_buffer + 6);
 		else terminal_write_line("Usage: color [show|text <0xNN>|prompt <0xNN>]");
 	}
-	else if (string_starts_with(input_buffer, "theme"))
-	{
-		if (input_buffer[5] == ' ') cmd_theme(input_buffer + 6);
-		else terminal_write_line("Usage: theme <name>");
-	}
 	else if (string_starts_with(input_buffer, "themes"))
 	{
 		if (input_buffer[6] == '\0') cmd_themes("list");
 		else if (input_buffer[6] == ' ') cmd_themes(input_buffer + 7);
 		else terminal_write_line("Usage: themes [list]");
 	}
-	else if (string_starts_with(input_buffer, "etheme"))
+	else if (string_starts_with(input_buffer, "theme"))
 	{
-		if (input_buffer[6] == ' ') cmd_etheme(input_buffer + 7);
-		else terminal_write_line("Usage: etheme <name>");
+		if (input_buffer[5] == ' ') cmd_theme(input_buffer + 6);
+		else terminal_write_line("Usage: theme <name>");
 	}
 	else if (string_starts_with(input_buffer, "ethemes"))
 	{
 		if (input_buffer[7] == '\0') cmd_ethemes("list");
 		else if (input_buffer[7] == ' ') cmd_ethemes(input_buffer + 8);
 		else terminal_write_line("Usage: ethemes [list]");
+	}
+	else if (string_starts_with(input_buffer, "etheme"))
+	{
+		if (input_buffer[6] == ' ') cmd_etheme(input_buffer + 7);
+		else terminal_write_line("Usage: etheme <name>|edit <name>");
 	}
 	else if (string_equals(input_buffer, "ramfs"))
 	{
