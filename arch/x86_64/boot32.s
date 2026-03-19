@@ -8,6 +8,14 @@ mb2_header:
     .long mb2_header_end - mb2_header   # header length
     .long -(0xE85250D6 + 0 + (mb2_header_end - mb2_header)) # checksum
 
+    # framebuffer tag (type=5): request 1024x768x32 from bootloader
+    .short 5
+    .short 0
+    .long 20
+    .long 1024
+    .long 768
+    .long 32
+
     # end tag
     .short 0
     .short 0

@@ -1225,3 +1225,52 @@ int fat32_remove_path(const char *path)
 	if (fs.dev->write_sector(entry_lba, sec) != 0) return -1;
 	return 0;
 }
+
+int fat32_get_attr_path(const char *path, unsigned char *out_attr)
+{
+	unsigned int parent;
+	unsigned char name83[11];
+	unsigned char entry[32];
+
+	if (!fs.mounted || path == (void *)0 || out_attr == (void *)0) return -1;
+	if (fat32_resolve_parent_and_leaf(path, &parent, name83) != 0) return -1;
+	if (fat32_find_entry_in_dir(parent, name83, (void *)0, (void *)0, entry) != 0) return -1;
+
+	*out_attr = entry[11];
+	return 0;
+}
+
+int fat32_set_attr_path(const char *path, unsigned char set_mask, unsigned char clear_mask, unsigned char *out_attr)
+{
+	unsigned int parent;
+	unsigned char name83[11];
+	unsigned int entry_lba;
+	unsigned int entry_off;
+	unsigned char entry[32];
+	unsigned char sec[512];
+	unsigned char old_attr;
+	unsigned char new_attr;
+
+	if (!fs.mounted || path == (void *)0) return -1;
+	if (fat32_resolve_parent_and_leaf(path, &parent, name83) != 0) return -1;
+	if (fat32_find_entry_in_dir(parent, name83, &entry_lba, &entry_off, entry) != 0) return -1;
+
+	old_attr = entry[11];
+	new_attr = old_attr;
+	new_attr |= set_mask;
+	new_attr &= (unsigned char)~clear_mask;
+
+	/* Keep immutable kind bits unchanged: directory / volume-label */
+	new_attr = (unsigned char)((new_attr & (unsigned char)~(FAT32_ATTR_DIRECTORY | 0x08)) |
+		(old_attr & (FAT32_ATTR_DIRECTORY | 0x08)));
+
+	/* Do not allow synthesizing an LFN entry attribute. */
+	if ((new_attr & 0x0F) == FAT32_ATTR_LFN) return -1;
+
+	if (fs.dev->read_sector(entry_lba, sec) != 0) return -1;
+	sec[entry_off + 11] = new_attr;
+	if (fs.dev->write_sector(entry_lba, sec) != 0) return -1;
+
+	if (out_attr) *out_attr = new_attr;
+	return 0;
+}

@@ -28,8 +28,8 @@
 #define ATA_SR_DRQ  0x08
 #define ATA_SR_ERR  0x01
 
-static int ata_present = 0;
-static unsigned int ata_sector_count_low = 0;
+static int ata_drive_present[2] = {0, 0};
+static unsigned int ata_drive_sectors[2] = {0, 0};
 
 static unsigned char ata_status(void)
 {
@@ -71,68 +71,101 @@ static int ata_wait_drq_or_err(unsigned int spin)
 	return -1;
 }
 
-static void ata_select_drive_lba(unsigned int lba)
+static void ata_select(int drive, unsigned int lba)
 {
-	arch_outb(ATA_IO_BASE + ATA_REG_HDDEVSEL, (unsigned char)(0xE0 | ((lba >> 24) & 0x0F)));
+	unsigned char sel = (drive == 0)
+		? (unsigned char)(0xE0 | ((lba >> 24) & 0x0F))
+		: (unsigned char)(0xF0 | ((lba >> 24) & 0x0F));
+	arch_outb(ATA_IO_BASE + ATA_REG_HDDEVSEL, sel);
 	ata_400ns_delay();
 }
 
-int ata_init(void)
+int ata_init_drive(int drive)
 {
 	unsigned int i;
 	unsigned short w;
+	unsigned char st;
 
-	ata_present = 0;
-	ata_sector_count_low = 0;
+	if (drive < 0 || drive > 1) return -1;
+	ata_drive_present[drive] = 0;
+	ata_drive_sectors[drive] = 0;
 
-	arch_outb(ATA_CTRL_BASE + ATA_REG_CONTROL, 0x04);
-	ata_400ns_delay();
-	arch_outb(ATA_CTRL_BASE + ATA_REG_CONTROL, 0x00);
+	/* Soft reset resets the whole channel; only do it when probing master */
+	if (drive == 0)
+	{
+		arch_outb(ATA_CTRL_BASE + ATA_REG_CONTROL, 0x04);
+		ata_400ns_delay();
+		arch_outb(ATA_CTRL_BASE + ATA_REG_CONTROL, 0x00);
+	}
 
 	if (ata_wait_not_bsy(1000000) != 0) return -1;
 
-	ata_select_drive_lba(0);
+	ata_select(drive, 0);
+
+	/* A floating bus reads 0xFF; a missing slave often gives 0x00 */
+	st = ata_status();
+	if (st == 0xFF || st == 0x00) return -1;
+
 	arch_outb(ATA_IO_BASE + ATA_REG_SECCOUNT0, 0);
 	arch_outb(ATA_IO_BASE + ATA_REG_LBA0, 0);
 	arch_outb(ATA_IO_BASE + ATA_REG_LBA1, 0);
 	arch_outb(ATA_IO_BASE + ATA_REG_LBA2, 0);
 	arch_outb(ATA_IO_BASE + ATA_REG_COMMAND, ATA_CMD_IDENTIFY);
 
-	if (ata_status() == 0) return -1;
+	st = ata_status();
+	if (st == 0) return -1;
 	if (ata_wait_drq_or_err(1000000) != 0) return -1;
 
 	for (i = 0; i < 256; i++)
 	{
 		w = arch_inw(ATA_IO_BASE + ATA_REG_DATA);
-		if (i == 60) ata_sector_count_low = w;
-		if (i == 61) ata_sector_count_low |= ((unsigned int)w << 16);
+		if (i == 60) ata_drive_sectors[drive] = w;
+		if (i == 61) ata_drive_sectors[drive] |= ((unsigned int)w << 16);
 	}
 
-	ata_present = 1;
+	ata_drive_present[drive] = 1;
 	return 0;
+}
+
+int ata_init(void)
+{
+	return ata_init_drive(0);
+}
+
+int ata_is_present_drive(int drive)
+{
+	if (drive < 0 || drive > 1) return 0;
+	return ata_drive_present[drive];
 }
 
 int ata_is_present(void)
 {
-	return ata_present;
+	return ata_is_present_drive(0);
+}
+
+unsigned int ata_get_sector_count_drive(int drive)
+{
+	if (drive < 0 || drive > 1) return 0;
+	return ata_drive_sectors[drive];
 }
 
 unsigned int ata_get_sector_count_low(void)
 {
-	return ata_sector_count_low;
+	return ata_get_sector_count_drive(0);
 }
 
-int ata_read_sector28(unsigned int lba, unsigned char *buffer512)
+int ata_read_sector28_drive(int drive, unsigned int lba, unsigned char *buffer512)
 {
 	unsigned int i;
 	unsigned short w;
 
-	if (!ata_present) return -1;
+	if (drive < 0 || drive > 1) return -1;
+	if (!ata_drive_present[drive]) return -1;
 	if (lba > 0x0FFFFFFF) return -1;
 
 	if (ata_wait_not_bsy(1000000) != 0) return -1;
 
-	ata_select_drive_lba(lba);
+	ata_select(drive, lba);
 	arch_outb(ATA_IO_BASE + ATA_REG_SECCOUNT0, 1);
 	arch_outb(ATA_IO_BASE + ATA_REG_LBA0, (unsigned char)(lba & 0xFF));
 	arch_outb(ATA_IO_BASE + ATA_REG_LBA1, (unsigned char)((lba >> 8) & 0xFF));
@@ -152,17 +185,23 @@ int ata_read_sector28(unsigned int lba, unsigned char *buffer512)
 	return 0;
 }
 
-int ata_write_sector28(unsigned int lba, const unsigned char *buffer512)
+int ata_read_sector28(unsigned int lba, unsigned char *buffer512)
+{
+	return ata_read_sector28_drive(0, lba, buffer512);
+}
+
+int ata_write_sector28_drive(int drive, unsigned int lba, const unsigned char *buffer512)
 {
 	unsigned int i;
 	unsigned short w;
 
-	if (!ata_present) return -1;
+	if (drive < 0 || drive > 1) return -1;
+	if (!ata_drive_present[drive]) return -1;
 	if (lba > 0x0FFFFFFF) return -1;
 
 	if (ata_wait_not_bsy(1000000) != 0) return -1;
 
-	ata_select_drive_lba(lba);
+	ata_select(drive, lba);
 	arch_outb(ATA_IO_BASE + ATA_REG_SECCOUNT0, 1);
 	arch_outb(ATA_IO_BASE + ATA_REG_LBA0, (unsigned char)(lba & 0xFF));
 	arch_outb(ATA_IO_BASE + ATA_REG_LBA1, (unsigned char)((lba >> 8) & 0xFF));
@@ -180,4 +219,9 @@ int ata_write_sector28(unsigned int lba, const unsigned char *buffer512)
 	arch_outb(ATA_IO_BASE + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
 	if (ata_wait_not_bsy(1000000) != 0) return -1;
 	return 0;
+}
+
+int ata_write_sector28(unsigned int lba, const unsigned char *buffer512)
+{
+	return ata_write_sector28_drive(0, lba, buffer512);
 }

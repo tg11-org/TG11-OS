@@ -19,6 +19,19 @@ static int serial_is_transmit_empty(void)
 	return (inb(COM1_PORT + 5) & 0x20) != 0;
 }
 
+int serial_can_read(void)
+{
+	return (inb(COM1_PORT + 5) & 0x01) != 0;
+}
+
+int serial_try_read(char *out_char)
+{
+	if (out_char == (void *)0) return 0;
+	if (!serial_can_read()) return 0;
+	*out_char = (char)inb(COM1_PORT + 0);
+	return 1;
+}
+
 int serial_init(void)
 {
 	outb(COM1_PORT + 1, 0x00);

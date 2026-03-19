@@ -19,5 +19,7 @@ int fat32_touch_file_path(const char *path);
 int fat32_write_file_path(const char *path, const unsigned char *data, unsigned long size);
 int fat32_mkdir_path(const char *path);
 int fat32_remove_path(const char *path);
+int fat32_get_attr_path(const char *path, unsigned char *out_attr);
+int fat32_set_attr_path(const char *path, unsigned char set_mask, unsigned char clear_mask, unsigned char *out_attr);
 
 #endif

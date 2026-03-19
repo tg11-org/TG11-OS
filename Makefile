@@ -39,6 +39,7 @@ OBJS := \
 	$(BUILD_DIR)/blockdev.o \
 	$(BUILD_DIR)/mouse.o \
 	$(BUILD_DIR)/memmap.o \
+	$(BUILD_DIR)/framebuffer.o \
 	$(BUILD_DIR)/fs.o \
 	$(BUILD_DIR)/fat32.o \
 	$(BUILD_DIR)/basic.o
@@ -91,6 +92,9 @@ $(BUILD_DIR)/mouse.o: drivers/mouse.c Makefile | $(BUILD_DIR)
 $(BUILD_DIR)/memmap.o: kernel/memmap.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/framebuffer.o: kernel/framebuffer.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/fs.o: kernel/fs.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -125,6 +129,10 @@ run: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
 	qemu-system-x86_64 -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
 
+run-big: $(ISO_NAME) prepare-data-disk
+	rm -f QEMU.log
+	qemu-system-x86_64 -boot d -display gtk,zoom-to-fit=on -full-screen -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+
 run-debug: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
 	qemu-system-x86_64 -no-reboot -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
@@ -133,6 +141,10 @@ run-disk: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
 	qemu-system-x86_64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
 
+run-disk-big: $(BOOT_DISK_NAME) prepare-data-disk
+	rm -f QEMU.log
+	qemu-system-x86_64 -boot c -display gtk,zoom-to-fit=on -full-screen -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+
 run-disk-debug: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
 	qemu-system-x86_64 -no-reboot -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
@@ -140,4 +152,4 @@ run-disk-debug: $(BOOT_DISK_NAME) prepare-data-disk
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_NAME) $(BOOT_DISK_NAME) $(DATA_DISK_NAME) QEMU.log
 
-.PHONY: all run run-debug run-disk run-disk-debug prepare-data-disk format-data-disk clean
+.PHONY: all run run-big run-debug run-disk run-disk-big run-disk-debug prepare-data-disk format-data-disk clean

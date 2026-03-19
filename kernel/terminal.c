@@ -10,6 +10,7 @@
 #include "blockdev.h"
 #include "fat32.h"
 #include "basic.h"
+#include "framebuffer.h"
 
 #define INPUT_BUFFER_SIZE 128
 #define SCANCODE_QUEUE_SIZE 256
@@ -21,6 +22,8 @@
 #define EDITOR_HEX_BYTES_PER_ROW 16
 #define EDITOR_HEX_DATA_COL 6
 #define EDITOR_HEX_ASCII_COL 55
+#define EDITOR_THEME_KEYWORD_MAX 32
+#define EDITOR_THEME_KEYWORD_LEN 16
 #define SYSTEM_THEME_DIR "/themes"
 #define SYSTEM_THEME_CURRENT_PATH "/themes/current"
 #define EDITOR_THEME_DIR "/edit/themes"
@@ -64,6 +67,8 @@ static int  history_draft_len = 0;
 /* Misc                                                               */
 /* ------------------------------------------------------------------ */
 static int serial_ready = 0;
+static int serial_mirror_enabled = 1;
+static int display_mode = 0; /* 0=vga25, 1=vga50, 2=framebuffer(scaffold) */
 static int vfs_prefer_fat_root = 0;
 static char fat_cwd[128] = "/";
 static unsigned char terminal_text_color = 0x0F;
@@ -79,6 +84,14 @@ static unsigned char editor_sh_string_color = 0x0E;
 static unsigned char editor_basic_keyword_color = 0x0D;
 static unsigned char editor_basic_comment_color = 0x08;
 static unsigned char editor_basic_string_color = 0x0B;
+static char editor_sh_keywords[EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN] = {
+	"if", "then", "else", "fi", "for", "do", "done", "while", "in", "case", "esac", "function", "echo", "exit", "cd", "ls"
+};
+static unsigned long editor_sh_keyword_count = 16;
+static char editor_basic_keywords[EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN] = {
+	"PRINT", "LET", "IF", "THEN", "GOTO", "GOSUB", "RETURN", "FOR", "TO", "STEP", "NEXT", "INPUT", "REM", "END", "STOP", "LIST", "RUN"
+};
+static unsigned long editor_basic_keyword_count = 17;
 static int editor_active = 0;
 static int editor_use_fat = 0;
 static int editor_hex_mode = 0;
@@ -135,9 +148,11 @@ static void editor_draw_header(int can_scroll_up, int can_scroll_down);
 static int editor_open_file(const char *path, int hex_mode);
 static int parse_color_token(const char *s, unsigned char *out);
 static int starts_with_word_ci(const char *s, const char *word, unsigned long *word_len_out);
-static int token_is_keyword_ci(const char *s, unsigned long len, const char *const *keywords, unsigned long keyword_count);
+static int token_is_keyword_ci_table(const char *s, unsigned long len, char keywords[][EDITOR_THEME_KEYWORD_LEN], unsigned long keyword_count);
 static int editor_path_has_ext_ci(const char *path, const char *ext);
 static enum editor_lang editor_detect_language_from_path(const char *path);
+static void copy_keyword_table(char dst[][EDITOR_THEME_KEYWORD_LEN], unsigned long *dst_count, char src[][EDITOR_THEME_KEYWORD_LEN], unsigned long src_count);
+static int parse_keyword_list(const char *value, char out[][EDITOR_THEME_KEYWORD_LEN], unsigned long max_keywords, unsigned long *out_count);
 static int apply_system_theme_from_text(const char *name, const char *text);
 static int apply_system_theme_by_name(const char *name, int persist_current);
 static int apply_editor_theme_from_text(const char *name, const char *text);
@@ -149,6 +164,14 @@ static void cmd_themes(const char *args);
 static void cmd_etheme(const char *args);
 static void cmd_ethemes(const char *args);
 static void cmd_ramfs(void);
+static void cmd_ramfs2fat(const char *args);
+static void uint_to_dec(unsigned long v, char *buf, unsigned long buf_sz);
+static void cmd_drives(void);
+static void cmd_fatmount(const char *args);
+static void cmd_fatattr(const char *args);
+static void cmd_serial(const char *args);
+static void cmd_display(const char *args);
+static void print_help_commands(const char *args);
 
 static void print_help_basic(void)
 {
@@ -161,6 +184,8 @@ static void print_help_basic(void)
 	terminal_write_line("  color show           - Show current colors");
 	terminal_write_line("  color text <0xNN>    - Set text color attr byte");
 	terminal_write_line("  color prompt <0xNN>  - Set prompt color attr byte");
+	terminal_write_line("  serial [on|off|show] - Toggle COM1 mirror for terminal output");
+	terminal_write_line("  display [show|vga25|vga50|fb] - Switch terminal display mode");
 	terminal_write_line("  theme <name>         - Apply system theme from /themes");
 	terminal_write_line("  themes [list]        - List system themes");
 	terminal_write_line("  etheme <name>        - Apply editor theme from /edit/themes");
@@ -191,13 +216,16 @@ static void print_help_fs(void)
 	terminal_write_line("  run [-x] <path>      - Run script (-x echoes lines)");
 	terminal_write_line("  basic <path>         - Run Tiny BASIC program");
 	terminal_write_line("  script: foreach i in a,b do echo $(i)");
-	terminal_write_line("  fatmount             - Mount FAT32 data disk");
+	terminal_write_line("  fatmount [0|1]       - Mount FAT32 drive (0=master, 1=slave)");
+	terminal_write_line("  drives               - List detected ATA drives");
 	terminal_write_line("  ramfs                - Switch generic fs commands to RAM FS");
+	terminal_write_line("  ramfs2fat [map]      - Copy RAM FS tree to FAT (or show name map)");
 	terminal_write_line("  fatunmount           - Unmount FAT32 data disk");
 	terminal_write_line("  fatls                - List FAT32 cwd");
 	terminal_write_line("  fatcat <path>        - Read FAT32 file");
 	terminal_write_line("  fattouch <path>      - Create FAT32 file");
 	terminal_write_line("  fatwrite <p> <txt>   - Write FAT32 file");
+	terminal_write_line("  fatattr <p> [mods]   - Show/set FAT attrs (+r -h +s +a)");
 	terminal_write_line("  fatrm <path>         - Remove FAT32 path");
 }
 
@@ -216,7 +244,7 @@ static void cmd_help(const char *args)
 	if (p == (void *)0 || page[0] == '\0' || string_equals(page, "basic"))
 	{
 		print_help_basic();
-		terminal_write_line("Type 'help fs' or 'help disk' for more.");
+		terminal_write_line("Type 'help fs', 'help disk', or 'help commands'.");
 		return;
 	}
 	if (string_equals(page, "fs"))
@@ -229,14 +257,19 @@ static void cmd_help(const char *args)
 		print_help_disk();
 		return;
 	}
-	terminal_write_line("Usage: help [basic|fs|disk]");
+	if (string_equals(page, "commands") || string_equals(page, "cmds"))
+	{
+		print_help_commands(p);
+		return;
+	}
+	terminal_write_line("Usage: help [basic|fs|disk|commands [page]]");
 }
 
 static void terminal_putc(char c)
 {
 	screen_putchar(c);
 
-	if (serial_ready)
+	if (serial_ready && serial_mirror_enabled)
 	{
 		serial_putchar(c);
 	}
@@ -462,6 +495,7 @@ static unsigned long parse_hex(const char *s, const char **end)
 
 static const char *skip_spaces(const char *s)
 {
+	if (s == (void *)0) return "";
 	while (*s == ' ') s++;
 	return s;
 }
@@ -519,20 +553,62 @@ static int starts_with_word_ci(const char *s, const char *word, unsigned long *w
 	return 1;
 }
 
-static int token_is_keyword_ci(const char *s, unsigned long len, const char *const *keywords, unsigned long keyword_count)
+static int token_is_keyword_ci_table(const char *s, unsigned long len, char keywords[][EDITOR_THEME_KEYWORD_LEN], unsigned long keyword_count)
 {
 	unsigned long k;
 	for (k = 0; k < keyword_count; k++)
 	{
-		const char *kw = keywords[k];
 		unsigned long i = 0;
-		while (kw[i] != '\0' && i < len)
+		while (keywords[k][i] != '\0' && i < len)
 		{
-			if (ascii_upper(kw[i]) != ascii_upper(s[i])) break;
+			if (ascii_upper(keywords[k][i]) != ascii_upper(s[i])) break;
 			i++;
 		}
-		if (i == len && kw[i] == '\0') return 1;
+		if (i == len && keywords[k][i] == '\0') return 1;
 	}
+	return 0;
+}
+
+static void copy_keyword_table(char dst[][EDITOR_THEME_KEYWORD_LEN], unsigned long *dst_count, char src[][EDITOR_THEME_KEYWORD_LEN], unsigned long src_count)
+{
+	unsigned long i;
+	unsigned long j;
+	if (src_count > EDITOR_THEME_KEYWORD_MAX) src_count = EDITOR_THEME_KEYWORD_MAX;
+	for (i = 0; i < src_count; i++)
+	{
+		for (j = 0; j + 1 < EDITOR_THEME_KEYWORD_LEN && src[i][j] != '\0'; j++) dst[i][j] = src[i][j];
+		dst[i][j] = '\0';
+	}
+	*dst_count = src_count;
+}
+
+static int parse_keyword_list(const char *value, char out[][EDITOR_THEME_KEYWORD_LEN], unsigned long max_keywords, unsigned long *out_count)
+{
+	unsigned long count = 0;
+	unsigned long i = 0;
+	if (value == (void *)0 || out == (void *)0 || out_count == (void *)0 || max_keywords == 0) return -1;
+
+	while (value[i] != '\0')
+	{
+		unsigned long token_len = 0;
+		while (value[i] == ' ' || value[i] == '\t' || value[i] == ',') i++;
+		if (value[i] == '\0') break;
+		if (count >= max_keywords) break;
+
+		while (value[i] != '\0' && value[i] != ',')
+		{
+			if (token_len + 1 < EDITOR_THEME_KEYWORD_LEN) out[count][token_len++] = value[i];
+			i++;
+		}
+
+		while (token_len > 0 && (out[count][token_len - 1] == ' ' || out[count][token_len - 1] == '\t')) token_len--;
+		out[count][token_len] = '\0';
+		if (token_len > 0) count++;
+		if (value[i] == ',') i++;
+	}
+
+	if (count == 0) return -1;
+	*out_count = count;
 	return 0;
 }
 
@@ -649,7 +725,14 @@ static int apply_editor_theme_from_text(const char *name, const char *text)
 	unsigned char b_kw = editor_basic_keyword_color;
 	unsigned char b_comment = editor_basic_comment_color;
 	unsigned char b_string = editor_basic_string_color;
+	char sh_keywords[EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN];
+	unsigned long sh_keyword_count = 0;
+	char basic_keywords[EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN];
+	unsigned long basic_keyword_count = 0;
 	const char *p = text;
+
+	copy_keyword_table(sh_keywords, &sh_keyword_count, editor_sh_keywords, editor_sh_keyword_count);
+	copy_keyword_table(basic_keywords, &basic_keyword_count, editor_basic_keywords, editor_basic_keyword_count);
 
 	while (p != (void *)0 && *p != '\0')
 	{
@@ -691,6 +774,16 @@ static int apply_editor_theme_from_text(const char *name, const char *text)
 		else if (string_equals(key, "basic_keyword")) b_kw = c;
 		else if (string_equals(key, "basic_comment")) b_comment = c;
 		else if (string_equals(key, "basic_string")) b_string = c;
+		else if (string_equals(key, "sh_keywords"))
+		{
+			unsigned long parsed_count;
+			if (parse_keyword_list(val, sh_keywords, EDITOR_THEME_KEYWORD_MAX, &parsed_count) == 0) sh_keyword_count = parsed_count;
+		}
+		else if (string_equals(key, "basic_keywords"))
+		{
+			unsigned long parsed_count;
+			if (parse_keyword_list(val, basic_keywords, EDITOR_THEME_KEYWORD_MAX, &parsed_count) == 0) basic_keyword_count = parsed_count;
+		}
 	}
 
 	editor_header_color = e_header;
@@ -704,6 +797,8 @@ static int apply_editor_theme_from_text(const char *name, const char *text)
 	editor_basic_keyword_color = b_kw;
 	editor_basic_comment_color = b_comment;
 	editor_basic_string_color = b_string;
+	copy_keyword_table(editor_sh_keywords, &editor_sh_keyword_count, sh_keywords, sh_keyword_count);
+	copy_keyword_table(editor_basic_keywords, &editor_basic_keyword_count, basic_keywords, basic_keyword_count);
 	if (editor_active) screen_set_color(editor_text_color);
 
 	if (name != (void *)0)
@@ -777,9 +872,11 @@ static void ensure_theme_files(void)
 			"sh_keyword=0x0A\n"
 			"sh_comment=0x08\n"
 			"sh_string=0x0E\n"
+			"sh_keywords=if,then,else,fi,for,do,done,while,in,case,esac,function,echo,exit,cd,ls\n"
 			"basic_keyword=0x0D\n"
 			"basic_comment=0x08\n"
-			"basic_string=0x0B\n");
+			"basic_string=0x0B\n"
+			"basic_keywords=PRINT,LET,IF,THEN,GOTO,GOSUB,RETURN,FOR,TO,STEP,NEXT,INPUT,REM,END,STOP,LIST,RUN\n");
 	}
 	if (fs_read_text(EDITOR_THEME_DIR "/c64.theme", &existing) != 0)
 	{
@@ -793,9 +890,11 @@ static void ensure_theme_files(void)
 			"sh_keyword=0x1A\n"
 			"sh_comment=0x13\n"
 			"sh_string=0x1E\n"
+			"sh_keywords=if,then,else,fi,for,do,done,while,in,case,esac,function,echo,exit,cd,ls\n"
 			"basic_keyword=0x1D\n"
 			"basic_comment=0x13\n"
-			"basic_string=0x1E\n");
+			"basic_string=0x1E\n"
+			"basic_keywords=PRINT,LET,IF,THEN,GOTO,GOSUB,RETURN,FOR,TO,STEP,NEXT,INPUT,REM,END,STOP,LIST,RUN\n");
 	}
 
 	{
@@ -915,8 +1014,10 @@ static int expand_cp437_aliases(const char *in, char *out, unsigned long out_siz
 static unsigned long editor_visible_rows(void)
 {
 	unsigned long start_row = (unsigned long)(editor_vga_start / VGA_TEXT_WIDTH);
-	if (start_row >= 25) return 1;
-	return 25 - start_row;
+	unsigned long h = screen_get_height();
+	if (h == 0) h = 25;
+	if (start_row >= h) return 1;
+	return h - start_row;
 }
 
 static unsigned long editor_text_width(void)
@@ -1131,7 +1232,7 @@ static void editor_render(void)
 		can_scroll_down = (editor_view_top + rows * EDITOR_HEX_BYTES_PER_ROW < editor_length);
 		editor_draw_header(can_scroll_up, can_scroll_down);
 		rows = editor_visible_rows();
-		for (clear_off = editor_vga_start; clear_off < (VGA_TEXT_WIDTH * 25); clear_off++) screen_write_char_at(clear_off, ' ');
+		for (clear_off = editor_vga_start; clear_off < (VGA_TEXT_WIDTH * screen_get_height()); clear_off++) screen_write_char_at(clear_off, ' ');
 		for (row = 0; row < rows; row++)
 		{
 			unsigned long row_start = editor_view_top + row * EDITOR_HEX_BYTES_PER_ROW;
@@ -1174,7 +1275,7 @@ static void editor_render(void)
 			if (r >= rows) r = rows - 1;
 			if (c >= EDITOR_HEX_BYTES_PER_ROW) c = EDITOR_HEX_BYTES_PER_ROW - 1;
 			cursor_off = (unsigned short)(editor_vga_start + r * VGA_TEXT_WIDTH + EDITOR_HEX_DATA_COL + c * 3 + editor_hex_nibble);
-			if (cursor_off >= VGA_TEXT_WIDTH * 25) cursor_off = (unsigned short)(VGA_TEXT_WIDTH * 25 - 1);
+			if (cursor_off >= VGA_TEXT_WIDTH * screen_get_height()) cursor_off = (unsigned short)(VGA_TEXT_WIDTH * screen_get_height() - 1);
 			screen_set_hw_cursor(cursor_off);
 			screen_set_pos(cursor_off);
 		}
@@ -1195,17 +1296,11 @@ static void editor_render(void)
 	can_scroll_down = editor_has_more_below(editor_view_top, rows);
 	editor_draw_header(can_scroll_up, can_scroll_down);
 	rows = editor_visible_rows();
-	for (clear_off = editor_vga_start; clear_off < (VGA_TEXT_WIDTH * 25); clear_off++) screen_write_char_at(clear_off, ' ');
+	for (clear_off = editor_vga_start; clear_off < (VGA_TEXT_WIDTH * screen_get_height()); clear_off++) screen_write_char_at(clear_off, ' ');
 	{
 		unsigned long row = 0;
 		unsigned long row_start = editor_view_top;
 		unsigned long width = editor_text_width();
-		static const char *const sh_keywords[] = {
-			"if", "then", "else", "fi", "for", "do", "done", "while", "in", "case", "esac", "function", "echo", "exit", "cd", "ls"
-		};
-		static const char *const basic_keywords[] = {
-			"PRINT", "LET", "IF", "THEN", "GOTO", "GOSUB", "RETURN", "FOR", "TO", "STEP", "NEXT", "INPUT", "REM", "END", "STOP", "LIST", "RUN"
-		};
 		while (row < rows)
 		{
 			unsigned short row_off = (unsigned short)(editor_vga_start + row * VGA_TEXT_WIDTH);
@@ -1263,7 +1358,7 @@ static void editor_render(void)
 					{
 						unsigned long tlen = 0;
 						while (row_end + tlen < editor_length && char_is_word(editor_buffer[row_end + tlen])) tlen++;
-						if (token_is_keyword_ci(&editor_buffer[row_end], tlen, sh_keywords, sizeof(sh_keywords) / sizeof(sh_keywords[0])))
+						if (token_is_keyword_ci_table(&editor_buffer[row_end], tlen, editor_sh_keywords, editor_sh_keyword_count))
 						{
 							ch_color = editor_sh_keyword_color;
 							token_color = editor_sh_keyword_color;
@@ -1309,7 +1404,7 @@ static void editor_render(void)
 							token_color = editor_basic_comment_color;
 							if (rem_len > 0) token_remaining = rem_len - 1;
 						}
-						else if (token_is_keyword_ci(&editor_buffer[row_end], tlen, basic_keywords, sizeof(basic_keywords) / sizeof(basic_keywords[0])))
+						else if (token_is_keyword_ci_table(&editor_buffer[row_end], tlen, editor_basic_keywords, editor_basic_keyword_count))
 						{
 							ch_color = editor_basic_keyword_color;
 							token_color = editor_basic_keyword_color;
@@ -1341,7 +1436,7 @@ static void editor_render(void)
 		if (r >= rows) r = rows - 1;
 		if (c >= editor_text_width()) c = editor_text_width() - 1;
 		cursor_off = (unsigned short)(editor_vga_start + r * VGA_TEXT_WIDTH + EDITOR_TEXT_GUTTER + c);
-		if (cursor_off >= VGA_TEXT_WIDTH * 25) cursor_off = (unsigned short)(VGA_TEXT_WIDTH * 25 - 1);
+		if (cursor_off >= VGA_TEXT_WIDTH * screen_get_height()) cursor_off = (unsigned short)(VGA_TEXT_WIDTH * screen_get_height() - 1);
 		screen_set_hw_cursor(cursor_off);
 		screen_set_pos(cursor_off);
 	}
@@ -1652,11 +1747,74 @@ static void handle_arrow_down(void)
 /* ================================================================== */
 
 static const char * const cmd_list[] = {
-	"help", "version", "echo", "glyph", "charmap", "color", "themes", "theme", "ethemes", "etheme", "clear", "reboot",
+	"help", "version", "echo", "glyph", "charmap", "color", "serial", "display", "themes", "theme", "ethemes", "etheme", "clear", "reboot",
 	"quit", "exit", "shutdown",
 	"pwd", "ls", "cd", "mkdir", "touch", "write", "cat", "rm", "cp", "mv", "edit", "hexedit", "run", "basic",
-	"hexdump", "memmap", "ataid", "readsec", "writesec", "fatmount", "ramfs", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatrm", (void *)0
+	"hexdump", "memmap", "ataid", "readsec", "writesec", "drives", "fatmount", "ramfs", "ramfs2fat", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatattr", "fatrm", (void *)0
 };
+
+static int parse_dec_u32(const char *s, unsigned int *out)
+{
+	unsigned long v = 0;
+	unsigned long i = 0;
+	if (s == (void *)0 || s[0] == '\0' || out == (void *)0) return -1;
+	while (s[i] != '\0')
+	{
+		if (s[i] < '0' || s[i] > '9') return -1;
+		v = v * 10 + (unsigned long)(s[i] - '0');
+		if (v > 0xFFFFFFFFUL) return -1;
+		i++;
+	}
+	*out = (unsigned int)v;
+	return 0;
+}
+
+static void print_help_commands(const char *args)
+{
+	unsigned int page = 1;
+	unsigned int total = 0;
+	unsigned int pages;
+	unsigned int per_page = 12;
+	unsigned int start;
+	unsigned int end;
+	unsigned int i;
+	char tok[16];
+	char num[16];
+	const char *p = read_token(args, tok, sizeof(tok));
+
+	if (p != (void *)0 && tok[0] != '\0')
+	{
+		if (parse_dec_u32(tok, &page) != 0 || page == 0)
+		{
+			terminal_write_line("Usage: help commands [page]");
+			return;
+		}
+	}
+
+	while (cmd_list[total] != (void *)0) total++;
+	pages = (total + per_page - 1) / per_page;
+	if (pages == 0) pages = 1;
+	if (page > pages) page = pages;
+
+	start = (page - 1) * per_page;
+	end = start + per_page;
+	if (end > total) end = total;
+
+	terminal_write("Commands page ");
+	uint_to_dec((unsigned long)page, num, sizeof(num));
+	terminal_write(num);
+	terminal_write("/");
+	uint_to_dec((unsigned long)pages, num, sizeof(num));
+	terminal_write_line(num);
+
+	for (i = start; i < end; i++)
+	{
+		terminal_write("  ");
+		terminal_write_line(cmd_list[i]);
+	}
+
+	terminal_write_line("Use: help commands <page>");
+}
 
 static void handle_tab(void)
 {
@@ -1773,7 +1931,7 @@ static void handle_backspace(void)
 	screen_write_char_at((unsigned short)(prompt_vga_start + input_length), ' ');
 	sync_screen_pos();
 	screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-	if (serial_ready) serial_write("\b \b");
+	if (serial_ready && serial_mirror_enabled) serial_write("\b \b");
 }
 
 /* ================================================================== */
@@ -2798,15 +2956,23 @@ static void cmd_basic(const char *args)
 
 static void cmd_ataid(void)
 {
-	if (!ata_is_present())
+	int i;
+	int any = 0;
+	for (i = 0; i < 2; i++)
 	{
-		terminal_write_line("ATA: no device");
-		return;
+		if (ata_is_present_drive(i))
+		{
+			terminal_write("ATA drive ");
+			terminal_putc((char)('0' + i));
+			terminal_write(" (");
+			terminal_write(i == 0 ? "primary master" : "primary slave ");
+			terminal_write("): sectors=");
+			terminal_write_hex64((unsigned long)ata_get_sector_count_drive(i));
+			terminal_putc('\n');
+			any = 1;
+		}
 	}
-
-	terminal_write("ATA: present, sectors=");
-	terminal_write_hex64((unsigned long)ata_get_sector_count_low());
-	terminal_putc('\n');
+	if (!any) terminal_write_line("ATA: no devices detected");
 }
 
 static void cmd_readsec(const char *args)
@@ -2893,18 +3059,28 @@ static void cmd_writesec(const char *args)
 	terminal_write_line("writesec: done");
 }
 
-static void cmd_fatmount(void)
+static void cmd_fatmount(const char *args)
 {
-	struct block_device *dev = blockdev_get_primary();
+	int drive_index = 0;
+	struct block_device *dev;
+
+	/* Optional argument: "0" = master, "1" = slave */
+	if (args != (void *)0 && args[0] == '1') drive_index = 1;
+
+	dev = blockdev_get(drive_index);
 	if (dev == (void *)0 || !dev->present)
 	{
-		terminal_write_line("fatmount: no block device");
+		terminal_write("fatmount: drive ");
+		terminal_putc((char)('0' + drive_index));
+		terminal_write_line(" not present");
 		return;
 	}
 
 	if (fat32_mount(dev) != 0)
 	{
-		terminal_write_line("fatmount: mount failed");
+		terminal_write("fatmount: drive ");
+		terminal_putc((char)('0' + drive_index));
+		terminal_write_line(" mount failed (not FAT32?)");
 		return;
 	}
 
@@ -2912,7 +3088,34 @@ static void cmd_fatmount(void)
 	fat_cwd[0] = '/';
 	fat_cwd[1] = '\0';
 
-	terminal_write_line("fatmount: mounted (generic fs commands now use FAT)");
+	terminal_write("fatmount: drive ");
+	terminal_putc((char)('0' + drive_index));
+	terminal_write_line(" mounted (generic fs commands now use FAT)");
+}
+
+static void cmd_drives(void)
+{
+	int i;
+	char num[16];
+	for (i = 0; i < 2; i++)
+	{
+		struct block_device *dev = blockdev_get(i);
+		terminal_write("  drive ");
+		terminal_putc((char)('0' + i));
+		terminal_write(" (");
+		terminal_write(i == 0 ? "primary master" : "primary slave ");
+		terminal_write("): ");
+		if (dev != (void *)0 && dev->present)
+		{
+			uint_to_dec((unsigned long)dev->sector_count, num, sizeof(num));
+			terminal_write(num);
+			terminal_write_line(" sectors");
+		}
+		else
+		{
+			terminal_write_line("not detected");
+		}
+	}
 }
 
 static void cmd_fatunmount(void)
@@ -2969,6 +3172,102 @@ static void cmd_color(const char *args)
 	}
 
 	terminal_write_line("Usage: color [show|text <0xNN>|prompt <0xNN>]");
+}
+
+static void cmd_serial(const char *args)
+{
+	char op[16];
+	const char *p = read_token(args, op, sizeof(op));
+
+	if (!serial_ready)
+	{
+		terminal_write_line("serial: COM1 not available");
+		return;
+	}
+
+	if (p == (void *)0 || op[0] == '\0' || string_equals(op, "show"))
+	{
+		terminal_write("serial: mirror=");
+		terminal_write_line(serial_mirror_enabled ? "on" : "off");
+		return;
+	}
+
+	if (string_equals(op, "on"))
+	{
+		serial_mirror_enabled = 1;
+		terminal_write_line("serial: mirror enabled");
+		return;
+	}
+	if (string_equals(op, "off"))
+	{
+		serial_mirror_enabled = 0;
+		terminal_write_line("serial: mirror disabled");
+		return;
+	}
+
+	terminal_write_line("Usage: serial [on|off|show]");
+}
+
+static void cmd_display(const char *args)
+{
+	char op[16];
+	const char *p = read_token(args, op, sizeof(op));
+
+	if (p == (void *)0 || op[0] == '\0' || string_equals(op, "show"))
+	{
+		terminal_write("display: mode=");
+		if (display_mode == 0) terminal_write("vga25");
+		else if (display_mode == 1) terminal_write("vga50");
+		else terminal_write("fb");
+		terminal_write(" vga=");
+		terminal_write("80x");
+		if (screen_get_height() == 50) terminal_write("50");
+		else terminal_write("25");
+		if (framebuffer_available())
+		{
+			char n[16];
+			terminal_write(" fb=");
+			uint_to_dec((unsigned long)framebuffer_width(), n, sizeof(n)); terminal_write(n);
+			terminal_write("x");
+			uint_to_dec((unsigned long)framebuffer_height(), n, sizeof(n)); terminal_write(n);
+			terminal_write("x");
+			uint_to_dec((unsigned long)framebuffer_bpp(), n, sizeof(n)); terminal_write(n);
+		}
+		else
+		{
+			terminal_write(" fb=none");
+		}
+		terminal_putc('\n');
+		return;
+	}
+
+	if (string_equals(op, "vga25"))
+	{
+		screen_set_text_mode_80x25();
+		display_mode = 0;
+		terminal_write_line("display: switched to VGA text 80x25");
+		return;
+	}
+	if (string_equals(op, "vga50"))
+	{
+		screen_set_text_mode_80x50();
+		display_mode = 1;
+		terminal_write_line("display: switched to VGA text 80x50");
+		return;
+	}
+	if (string_equals(op, "fb"))
+	{
+		if (!framebuffer_available())
+		{
+			terminal_write_line("display: framebuffer not available from bootloader");
+			return;
+		}
+		display_mode = 2;
+		terminal_write_line("display: framebuffer scaffold enabled (renderer WIP), keeping VGA output");
+		return;
+	}
+
+	terminal_write_line("Usage: display [show|vga25|vga50|fb]");
 }
 
 static void cmd_theme(const char *args)
@@ -3132,6 +3431,341 @@ static void cmd_ramfs(void)
 	terminal_write_line("ramfs: active (generic fs commands now use RAM FS)");
 }
 
+/* ------------------------------------------------------------------ */
+/* ramfs2fat: recursively copy the entire RAM FS tree to FAT           */
+/* ------------------------------------------------------------------ */
+
+static void uint_to_dec(unsigned long v, char *buf, unsigned long buf_sz)
+{
+	char tmp[20];
+	unsigned long i = 0;
+	unsigned long j;
+	if (buf_sz == 0) return;
+	if (v == 0) { if (buf_sz > 1) { buf[0] = '0'; buf[1] = '\0'; } return; }
+	while (v > 0 && i < sizeof(tmp) - 1)
+	{
+		tmp[i++] = (char)('0' + (int)(v % 10));
+		v /= 10;
+	}
+	for (j = 0; j < i && j + 1 < buf_sz; j++)
+		buf[j] = tmp[i - 1 - j];
+	buf[j] = '\0';
+}
+
+static char fat83_safe_upper(char c)
+{
+	if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
+	if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
+	if (c == '_' || c == '-' || c == '$' || c == '~') return c;
+	return '_';
+}
+
+static int string_equals_ci(const char *a, const char *b)
+{
+	unsigned long i = 0;
+	while (a[i] != '\0' && b[i] != '\0')
+	{
+		if (fat83_safe_upper(a[i]) != fat83_safe_upper(b[i])) return 0;
+		i++;
+	}
+	return a[i] == '\0' && b[i] == '\0';
+}
+
+static void ramfs_name_to_fat83_parts(const char *name, char *base, unsigned long base_sz, char *ext, unsigned long ext_sz)
+{
+	unsigned long bi = 0;
+	unsigned long ei = 0;
+	unsigned long i = 0;
+	int in_ext = 0;
+
+	if (base_sz > 0) base[0] = '\0';
+	if (ext_sz > 0) ext[0] = '\0';
+
+	while (name[i] != '\0')
+	{
+		char c = name[i++];
+		if (c == '.')
+		{
+			if (!in_ext) in_ext = 1;
+			continue;
+		}
+
+		if (!in_ext)
+		{
+			if (bi + 1 < base_sz && bi < 8) base[bi++] = fat83_safe_upper(c);
+		}
+		else
+		{
+			if (ei + 1 < ext_sz && ei < 3) ext[ei++] = fat83_safe_upper(c);
+		}
+	}
+
+	if (bi == 0 && base_sz >= 5)
+	{
+		base[0] = 'F';
+		base[1] = 'I';
+		base[2] = 'L';
+		base[3] = 'E';
+		bi = 4;
+	}
+	if (base_sz > 0) base[bi] = '\0';
+	if (ext_sz > 0) ext[ei] = '\0';
+}
+
+static void ramfs_build_fat83_name(const char *base, const char *ext, unsigned int suffix, char *out, unsigned long out_sz)
+{
+	char suffix_dec[12];
+	unsigned long base_len = string_length(base);
+	unsigned long ext_len = string_length(ext);
+	unsigned long k = 0;
+	unsigned long i;
+
+	if (out_sz == 0) return;
+	out[0] = '\0';
+
+	if (suffix == 0)
+	{
+		for (i = 0; i < base_len && k + 1 < out_sz; i++) out[k++] = base[i];
+	}
+	else
+	{
+		unsigned long dec_len;
+		unsigned long keep;
+		uint_to_dec((unsigned long)suffix, suffix_dec, sizeof(suffix_dec));
+		dec_len = string_length(suffix_dec);
+		keep = (8 > (1 + dec_len)) ? (8 - (1 + dec_len)) : 1;
+		if (base_len < keep) keep = base_len;
+		for (i = 0; i < keep && k + 1 < out_sz; i++) out[k++] = base[i];
+		if (k + 1 < out_sz) out[k++] = '~';
+		for (i = 0; i < dec_len && k + 1 < out_sz; i++) out[k++] = suffix_dec[i];
+	}
+
+	if (ext_len > 0 && k + 2 < out_sz)
+	{
+		out[k++] = '.';
+		for (i = 0; i < ext_len && k + 1 < out_sz; i++) out[k++] = ext[i];
+	}
+	out[k] = '\0';
+}
+
+static int ramfs_used_name_contains(char used[][16], int used_count, const char *name)
+{
+	int i;
+	for (i = 0; i < used_count; i++)
+	{
+		if (string_equals_ci(used[i], name)) return 1;
+	}
+	return 0;
+}
+
+static void ramfs_used_name_add(char used[][16], int *used_count, const char *name)
+{
+	unsigned long i = 0;
+	if (*used_count >= 128) return;
+	while (name[i] != '\0' && i + 1 < 16)
+	{
+		used[*used_count][i] = fat83_safe_upper(name[i]);
+		i++;
+	}
+	used[*used_count][i] = '\0';
+	(*used_count)++;
+}
+
+static void ramfs_copy_to_fat_r(const char *rpath, const char *fpath, int *copied, int *errors, int depth, int map_only)
+{
+	char names[64][FS_NAME_MAX + 2];
+	int types[64];
+	char used_names[128][16];
+	int used_count = 0;
+	int count;
+	int i;
+
+	if (depth > 16) return;
+	count = 0;
+	if (fs_ls(rpath, names, types, 64, &count) != 0) return;
+
+	/* seed collision table with already-existing FAT entries in this directory */
+	{
+		char fat_names[64][40];
+		int fat_count = 0;
+		if (fat32_ls_path(fpath, fat_names, 64, &fat_count) == 0)
+		{
+			for (i = 0; i < fat_count && used_count < 128; i++)
+			{
+				char clean[16];
+				unsigned long j = 0;
+				while (fat_names[i][j] != '\0' && fat_names[i][j] != '/' && j + 1 < sizeof(clean))
+				{
+					clean[j] = fat83_safe_upper(fat_names[i][j]);
+					j++;
+				}
+				clean[j] = '\0';
+				if (clean[0] != '\0' && !ramfs_used_name_contains(used_names, used_count, clean))
+					ramfs_used_name_add(used_names, &used_count, clean);
+			}
+		}
+	}
+
+	for (i = 0; i < count; i++)
+	{
+		char name_clean[FS_NAME_MAX + 1];
+		char fat_base[9];
+		char fat_ext[4];
+		char fat_name[16];
+		char child_rpath[256];
+		char child_fpath[256];
+		unsigned long rlen;
+		unsigned long flen;
+		unsigned long nlen;
+		unsigned long fnlen;
+		unsigned int suffix;
+		unsigned long k;
+		unsigned long j;
+
+		/* strip trailing '/' from directory names */
+		nlen = 0;
+		while (names[i][nlen] != '\0' && names[i][nlen] != '/' && nlen < FS_NAME_MAX)
+		{
+			name_clean[nlen] = names[i][nlen];
+			nlen++;
+		}
+		name_clean[nlen] = '\0';
+		if (nlen == 0) continue;
+
+		ramfs_name_to_fat83_parts(name_clean, fat_base, sizeof(fat_base), fat_ext, sizeof(fat_ext));
+		fat_name[0] = '\0';
+		for (suffix = 0; suffix < 1000; suffix++)
+		{
+			ramfs_build_fat83_name(fat_base, fat_ext, suffix, fat_name, sizeof(fat_name));
+			if (fat_name[0] == '\0') continue;
+			if (!ramfs_used_name_contains(used_names, used_count, fat_name)) break;
+		}
+		if (suffix >= 1000)
+		{
+			(*errors)++;
+			continue;
+		}
+		ramfs_used_name_add(used_names, &used_count, fat_name);
+
+		fnlen = string_length(fat_name);
+		if (fnlen == 0) continue;
+
+		/* build child_rpath = rpath + "/" + name_clean */
+		rlen = string_length(rpath);
+		flen = string_length(fpath);
+		if (rlen + 1 + nlen + 1 > sizeof(child_rpath)) continue;
+		if (flen + 1 + fnlen + 1 > sizeof(child_fpath)) continue;
+
+		k = 0;
+		for (j = 0; j < rlen; j++) child_rpath[k++] = rpath[j];
+		if (k == 0 || child_rpath[k - 1] != '/') child_rpath[k++] = '/';
+		for (j = 0; j < nlen; j++) child_rpath[k++] = name_clean[j];
+		child_rpath[k] = '\0';
+
+		k = 0;
+		for (j = 0; j < flen; j++) child_fpath[k++] = fpath[j];
+		if (k == 0 || child_fpath[k - 1] != '/') child_fpath[k++] = '/';
+		for (j = 0; j < fnlen; j++) child_fpath[k++] = fat_name[j];
+		child_fpath[k] = '\0';
+
+		if (types[i] == 1) /* directory */
+		{
+			if (!map_only) fat32_mkdir_path(child_fpath); /* ignore error — may already exist */
+			ramfs_copy_to_fat_r(child_rpath, child_fpath, copied, errors, depth + 1, map_only);
+		}
+		else /* file */
+		{
+			if (map_only)
+			{
+				terminal_write("  ");
+				terminal_write(child_rpath);
+				terminal_write(" -> ");
+				terminal_write_line(child_fpath);
+				(*copied)++;
+			}
+			else
+			{
+				unsigned char data[2048];
+				unsigned long size;
+				size = 0;
+				if (fs_read_file(child_rpath, data, sizeof(data), &size) == 0)
+				{
+					if (fat32_write_file_path(child_fpath, data, size) == 0)
+						(*copied)++;
+					else
+						(*errors)++;
+				}
+				else (*errors)++;
+			}
+		}
+	}
+}
+
+static void cmd_ramfs2fat(const char *args)
+{
+	int copied;
+	int errors;
+	int map_only = 0;
+	char mode[16];
+	char num[16];
+	const char *p;
+
+	args = skip_spaces(args);
+	if (args[0] != '\0')
+	{
+		p = read_token(args, mode, sizeof(mode));
+		if (p == (void *)0)
+		{
+			terminal_write_line("Usage: ramfs2fat [map]");
+			return;
+		}
+		if (string_equals(mode, "map")) map_only = 1;
+		else
+		{
+			terminal_write_line("Usage: ramfs2fat [map]");
+			return;
+		}
+	}
+
+	if (!fat32_is_mounted())
+	{
+		terminal_write_line("ramfs2fat: FAT not mounted. Use fatmount first.");
+		return;
+	}
+
+	copied = 0;
+	errors = 0;
+	if (map_only)
+	{
+		terminal_write_line("ramfs2fat: map preview (RAM FS -> FAT names)");
+	}
+	else
+	{
+		terminal_write_line("ramfs2fat: copying RAM FS tree to FAT ...");
+	}
+	ramfs_copy_to_fat_r("/", "/", &copied, &errors, 0, map_only);
+
+	uint_to_dec((unsigned long)copied, num, sizeof(num));
+	terminal_write("ramfs2fat: ");
+	terminal_write(num);
+	if (map_only)
+	{
+		terminal_write_line(" file mapping(s)");
+		return;
+	}
+	if (errors > 0)
+	{
+		uint_to_dec((unsigned long)errors, num, sizeof(num));
+		terminal_write(" file(s) copied, ");
+		terminal_write(num);
+		terminal_write_line(" error(s)");
+	}
+	else
+	{
+		terminal_write_line(" file(s) copied");
+	}
+}
+
 static void cmd_glyph(const char *args)
 {
 	char tok[16];
@@ -3278,6 +3912,102 @@ static void cmd_fatwrite(const char *args)
 		return;
 	}
 	terminal_write_line("fatwrite: done");
+}
+
+static void cmd_fatattr(const char *args)
+{
+	char path[128];
+	char full_path[128];
+	char tok[16];
+	unsigned char attr;
+	unsigned char set_mask = 0;
+	unsigned char clear_mask = 0;
+	int modify = 0;
+	const char *p = read_token(args, path, sizeof(path));
+
+	if (p == (void *)0 || path[0] == '\0')
+	{
+		terminal_write_line("Usage: fatattr <path> [+r|-r] [+h|-h] [+s|-s] [+a|-a]");
+		return;
+	}
+	if (!fat32_is_mounted())
+	{
+		terminal_write_line("fatattr: not mounted (run fatmount)");
+		return;
+	}
+	if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
+	{
+		terminal_write_line("fatattr: bad path");
+		return;
+	}
+
+	for (;;)
+	{
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0)
+		{
+			terminal_write_line("Usage: fatattr <path> [+r|-r] [+h|-h] [+s|-s] [+a|-a]");
+			return;
+		}
+		if (tok[0] == '\0') break;
+		if ((tok[0] != '+' && tok[0] != '-') || tok[1] == '\0' || tok[2] != '\0')
+		{
+			terminal_write_line("fatattr: expected +r/-r +h/-h +s/-s +a/-a");
+			return;
+		}
+
+		modify = 1;
+		if (tok[1] == 'r' || tok[1] == 'R')
+		{
+			if (tok[0] == '+') set_mask |= 0x01; else clear_mask |= 0x01;
+		}
+		else if (tok[1] == 'h' || tok[1] == 'H')
+		{
+			if (tok[0] == '+') set_mask |= 0x02; else clear_mask |= 0x02;
+		}
+		else if (tok[1] == 's' || tok[1] == 'S')
+		{
+			if (tok[0] == '+') set_mask |= 0x04; else clear_mask |= 0x04;
+		}
+		else if (tok[1] == 'a' || tok[1] == 'A')
+		{
+			if (tok[0] == '+') set_mask |= 0x20; else clear_mask |= 0x20;
+		}
+		else
+		{
+			terminal_write_line("fatattr: unknown attribute (use r,h,s,a)");
+			return;
+		}
+	}
+
+	if (modify)
+	{
+		if (fat32_set_attr_path(full_path, set_mask, clear_mask, &attr) != 0)
+		{
+			terminal_write_line("fatattr: set failed");
+			return;
+		}
+	}
+	else
+	{
+		if (fat32_get_attr_path(full_path, &attr) != 0)
+		{
+			terminal_write_line("fatattr: read failed");
+			return;
+		}
+	}
+
+	terminal_write("fatattr: ");
+	terminal_write(full_path);
+	terminal_write(" = [");
+	terminal_putc((attr & 0x01) ? 'R' : '-');
+	terminal_putc((attr & 0x02) ? 'H' : '-');
+	terminal_putc((attr & 0x04) ? 'S' : '-');
+	terminal_putc((attr & 0x20) ? 'A' : '-');
+	terminal_write("]");
+	if (attr & 0x10) terminal_write(" DIR");
+	if (attr & 0x08) terminal_write(" VOL");
+	terminal_putc('\n');
 }
 
 static void cmd_fatrm(const char *args)
@@ -3452,9 +4182,15 @@ static void run_command(void)
 		if (input_buffer[8] == ' ') cmd_writesec(input_buffer + 9);
 		else terminal_write_line("Usage: writesec <lba-hex> <text>");
 	}
-	else if (string_equals(input_buffer, "fatmount"))
+	else if (string_equals(input_buffer, "drives"))
 	{
-		cmd_fatmount();
+		cmd_drives();
+	}
+	else if (string_starts_with(input_buffer, "fatmount"))
+	{
+		if (input_buffer[8] == '\0') cmd_fatmount((void *)0);
+		else if (input_buffer[8] == ' ') cmd_fatmount(input_buffer + 9);
+		else terminal_write_line("Usage: fatmount [0|1]");
 	}
 	else if (string_equals(input_buffer, "fatunmount"))
 	{
@@ -3478,6 +4214,11 @@ static void run_command(void)
 	{
 		if (input_buffer[8] == ' ') cmd_fatwrite(input_buffer + 9);
 		else terminal_write_line("Usage: fatwrite <path> <text>");
+	}
+	else if (string_starts_with(input_buffer, "fatattr"))
+	{
+		if (input_buffer[7] == ' ') cmd_fatattr(input_buffer + 8);
+		else terminal_write_line("Usage: fatattr <path> [+r|-r] [+h|-h] [+s|-s] [+a|-a]");
 	}
 	else if (string_starts_with(input_buffer, "fatrm"))
 	{
@@ -3505,6 +4246,18 @@ static void run_command(void)
 		else if (input_buffer[5] == ' ') cmd_color(input_buffer + 6);
 		else terminal_write_line("Usage: color [show|text <0xNN>|prompt <0xNN>]");
 	}
+	else if (string_starts_with(input_buffer, "serial"))
+	{
+		if (input_buffer[6] == '\0') cmd_serial("show");
+		else if (input_buffer[6] == ' ') cmd_serial(input_buffer + 7);
+		else terminal_write_line("Usage: serial [on|off|show]");
+	}
+	else if (string_starts_with(input_buffer, "display"))
+	{
+		if (input_buffer[7] == '\0') cmd_display("show");
+		else if (input_buffer[7] == ' ') cmd_display(input_buffer + 8);
+		else terminal_write_line("Usage: display [show|vga25|vga50|fb]");
+	}
 	else if (string_starts_with(input_buffer, "themes"))
 	{
 		if (input_buffer[6] == '\0') cmd_themes("list");
@@ -3526,6 +4279,12 @@ static void run_command(void)
 	{
 		if (input_buffer[6] == ' ') cmd_etheme(input_buffer + 7);
 		else terminal_write_line("Usage: etheme <name>|edit <name>");
+	}
+	else if (string_starts_with(input_buffer, "ramfs2fat"))
+	{
+		if (input_buffer[9] == '\0') cmd_ramfs2fat((void *)0);
+		else if (input_buffer[9] == ' ') cmd_ramfs2fat(input_buffer + 10);
+		else terminal_write_line("Usage: ramfs2fat [map]");
 	}
 	else if (string_equals(input_buffer, "ramfs"))
 	{
@@ -3960,6 +4719,38 @@ insert_character:
 	}
 }
 
+static void handle_serial_input_char(char c)
+{
+	if (editor_active) return;
+	if (script_mode_active) return;
+
+	if (c == '\r' || c == '\n')
+	{
+		submit_current_line();
+		return;
+	}
+	if (c == 0x08 || c == 0x7F)
+	{
+		handle_backspace();
+		return;
+	}
+
+	if (c < 0x20 || c > 0x7E) return;
+	if (input_length >= (INPUT_BUFFER_SIZE - 1)) return;
+
+	if (cursor_pos != input_length)
+	{
+		cursor_pos = input_length;
+		screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+	}
+
+	input_buffer[input_length++] = c;
+	input_buffer[input_length] = '\0';
+	cursor_pos++;
+	terminal_putc(c);
+	screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+}
+
 /* ================================================================== */
 /* Public API                                                         */
 /* ================================================================== */
@@ -3977,7 +4768,8 @@ void terminal_init(unsigned long mb2_info_addr)
 	ensure_theme_files();
 	load_current_system_theme();
 	load_current_editor_theme();
-	screen_clear();
+	screen_set_text_mode_80x25();
+	display_mode = 0;
 	screen_set_color(terminal_text_color);
 	serial_ready = serial_init();
 	memmap_init(mb2_info_addr);
@@ -3989,6 +4781,20 @@ void terminal_init(unsigned long mb2_info_addr)
 
 void terminal_poll(void)
 {
+	static int last_was_cr = 0;
+	char ch;
+
+	while (serial_ready && serial_try_read(&ch))
+	{
+		if (last_was_cr && ch == '\n')
+		{
+			last_was_cr = 0;
+			continue;
+		}
+		last_was_cr = (ch == '\r');
+		handle_serial_input_char(ch);
+	}
+
 	while (scancode_queue_tail != scancode_queue_head)
 	{
 		unsigned char sc = scancode_queue[scancode_queue_tail];
