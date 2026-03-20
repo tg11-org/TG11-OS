@@ -25,8 +25,7 @@ ISO_NAME := TG11-OS.iso
 BOOT_DISK_NAME := TG11-DISK.img
 DATA_DISK_NAME := TG11-DATA.img
 
-OBJS := \
-	$(BUILD_DIR)/boot32.o \
+CORE_OBJS := \
 	$(BUILD_DIR)/longmode64.o \
 	$(BUILD_DIR)/interrupts.o \
 	$(BUILD_DIR)/gdt.o \
@@ -44,6 +43,14 @@ OBJS := \
 	$(BUILD_DIR)/fat32.o \
 	$(BUILD_DIR)/basic.o
 
+OBJS := \
+	$(BUILD_DIR)/boot32.o \
+	$(CORE_OBJS)
+
+OBJS_FB := \
+	$(BUILD_DIR)/boot32_fb.o \
+	$(CORE_OBJS)
+
 all: check-toolchain $(ISO_NAME)
 
 check-toolchain:
@@ -54,6 +61,9 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 $(BUILD_DIR)/boot32.o: arch/x86_64/boot32.s Makefile | $(BUILD_DIR)
+	$(CC) -c $< -o $@
+
+$(BUILD_DIR)/boot32_fb.o: arch/x86_64/boot32_fb.s Makefile | $(BUILD_DIR)
 	$(CC) -c $< -o $@
 
 $(BUILD_DIR)/longmode64.o: arch/x86_64/longmode64.s Makefile | $(BUILD_DIR)
@@ -109,7 +119,12 @@ $(ISO_DIR)/boot/kernel.elf: $(OBJS) linker.ld
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) -lgcc
 	grub-file --is-x86-multiboot2 $@
 
-$(ISO_NAME): $(ISO_DIR)/boot/kernel.elf iso/boot/grub/grub.cfg
+$(ISO_DIR)/boot/kernel-fb.elf: $(OBJS_FB) linker.ld
+	mkdir -p $(ISO_DIR)/boot/grub
+	$(CC) $(LDFLAGS) -o $@ $(OBJS_FB) -lgcc
+	grub-file --is-x86-multiboot2 $@
+
+$(ISO_NAME): $(ISO_DIR)/boot/kernel.elf $(ISO_DIR)/boot/kernel-fb.elf iso/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(ISO_DIR)
 
 $(BOOT_DISK_NAME): $(ISO_NAME)
@@ -150,6 +165,6 @@ run-disk-debug: $(BOOT_DISK_NAME) prepare-data-disk
 	qemu-system-x86_64 -no-reboot -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
 
 clean:
-	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_NAME) $(BOOT_DISK_NAME) $(DATA_DISK_NAME) QEMU.log
+	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_DIR)/boot/kernel-fb.elf $(ISO_NAME) $(BOOT_DISK_NAME) $(DATA_DISK_NAME) QEMU.log
 
 .PHONY: all run run-big run-debug run-disk run-disk-big run-disk-debug prepare-data-disk format-data-disk clean

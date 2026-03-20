@@ -14,5 +14,13 @@ unsigned long screen_get_width(void);
 unsigned long screen_get_height(void);
 void screen_set_text_mode_80x25(void);
 void screen_set_text_mode_80x50(void);
+int screen_set_framebuffer_text_mode(void);
+int screen_fbfont_get_style(void);
+int screen_fbfont_set_style(int style);
+unsigned int screen_fbfont_get_size(void);
+int screen_fbfont_set_size(unsigned int size);
+void screen_fbfont_reset_custom(void);
+int screen_fbfont_set_custom_glyph(char ch, const unsigned char rows[7]);
+int screen_fbfont_get_custom_glyph(char ch, unsigned char rows[7], int *is_custom);
 
 #endif

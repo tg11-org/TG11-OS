@@ -28,6 +28,9 @@
 #define SYSTEM_THEME_CURRENT_PATH "/themes/current"
 #define EDITOR_THEME_DIR "/edit/themes"
 #define EDITOR_THEME_CURRENT_PATH "/edit/themes/current"
+#define FBFONT_DIR "/fonts"
+#define MB2_TAG_END 0
+#define MB2_TAG_CMDLINE 1
 
 /* ------------------------------------------------------------------ */
 /* Scancode ring buffer                                               */
@@ -68,7 +71,9 @@ static int  history_draft_len = 0;
 /* ------------------------------------------------------------------ */
 static int serial_ready = 0;
 static int serial_mirror_enabled = 1;
-static int display_mode = 0; /* 0=vga25, 1=vga50, 2=framebuffer(scaffold) */
+static int serial_compact_enabled = 0;
+static int serial_rxecho_enabled = 1;
+static int display_mode = 0; /* 0=vga25, 1=vga50, 2=framebuffer */
 static int vfs_prefer_fat_root = 0;
 static char fat_cwd[128] = "/";
 static unsigned char terminal_text_color = 0x0F;
@@ -119,6 +124,7 @@ static char script_var_names[SCRIPT_VAR_MAX][16];
 static char script_var_values[SCRIPT_VAR_MAX][96];
 
 static int string_equals(const char *a, const char *b);
+static int string_equals_ci(const char *a, const char *b);
 static const char *read_token(const char *s, char *out, unsigned long out_size);
 static unsigned long string_length(const char *s);
 static int fat_mode_active(void);
@@ -171,7 +177,79 @@ static void cmd_fatmount(const char *args);
 static void cmd_fatattr(const char *args);
 static void cmd_serial(const char *args);
 static void cmd_display(const char *args);
+static void cmd_fbfont(const char *args);
 static void print_help_commands(const char *args);
+
+#pragma pack(push, 1)
+struct mb2_tag_header
+{
+	unsigned int type;
+	unsigned int size;
+};
+
+struct mb2_tag_cmdline
+{
+	unsigned int type;
+	unsigned int size;
+	char string[1];
+};
+#pragma pack(pop)
+
+enum boot_display_pref
+{
+	BOOT_DISPLAY_AUTO = 0,
+	BOOT_DISPLAY_VGA,
+	BOOT_DISPLAY_FB
+};
+
+static enum boot_display_pref boot_display_preference(unsigned long mb2_info_addr)
+{
+	unsigned long offset;
+	struct mb2_tag_header *tag;
+
+	if (mb2_info_addr == 0) return BOOT_DISPLAY_AUTO;
+
+	offset = mb2_info_addr + 8;
+	for (;;)
+	{
+		char *s;
+		tag = (struct mb2_tag_header *)offset;
+		if (tag->type == MB2_TAG_END) break;
+		if (tag->type == MB2_TAG_CMDLINE)
+		{
+			struct mb2_tag_cmdline *cmd = (struct mb2_tag_cmdline *)tag;
+			s = cmd->string;
+			while (*s != '\0')
+			{
+				char value[16];
+				unsigned long i = 0;
+				while (*s == ' ' || *s == '\t') s++;
+				if (*s == '\0') break;
+				if (s[0] == 'd' || s[0] == 'D')
+				{
+					if ((s[1] == 'i' || s[1] == 'I') &&
+						(s[2] == 's' || s[2] == 'S') &&
+						(s[3] == 'p' || s[3] == 'P') &&
+						(s[4] == 'l' || s[4] == 'L') &&
+						(s[5] == 'a' || s[5] == 'A') &&
+						(s[6] == 'y' || s[6] == 'Y') &&
+						s[7] == '=')
+					{
+						s += 8;
+						while (*s != '\0' && *s != ' ' && *s != '\t' && i + 1 < sizeof(value)) value[i++] = *s++;
+						value[i] = '\0';
+						if (string_equals_ci(value, "fb") || string_equals_ci(value, "framebuffer")) return BOOT_DISPLAY_FB;
+						if (string_equals_ci(value, "vga") || string_equals_ci(value, "text") || string_equals_ci(value, "vga25") || string_equals_ci(value, "vga50")) return BOOT_DISPLAY_VGA;
+					}
+				}
+				while (*s != '\0' && *s != ' ' && *s != '\t') s++;
+			}
+		}
+		offset += (tag->size + 7) & ~7u;
+	}
+
+	return BOOT_DISPLAY_AUTO;
+}
 
 static void print_help_basic(void)
 {
@@ -182,10 +260,12 @@ static void print_help_basic(void)
 	terminal_write_line("  glyph <0xNN>         - Print one CP437 glyph byte");
 	terminal_write_line("  charmap              - Show CP437 alias escapes");
 	terminal_write_line("  color show           - Show current colors");
+	terminal_write_line("  color preview [text|prompt] - Preview palette or current attrs");
 	terminal_write_line("  color text <0xNN>    - Set text color attr byte");
 	terminal_write_line("  color prompt <0xNN>  - Set prompt color attr byte");
-	terminal_write_line("  serial [on|off|show] - Toggle COM1 mirror for terminal output");
+	terminal_write_line("  serial [on|off|show|compact <on|off>|rxecho <on|off>] - Serial options");
 	terminal_write_line("  display [show|vga25|vga50|fb] - Switch terminal display mode");
+	terminal_write_line("  fbfont [show|list|style <classic|blocky>|size <small|normal|large>|reset|glyph <ch> <r0..r6>|save <name>|load <name>] - FB font");
 	terminal_write_line("  theme <name>         - Apply system theme from /themes");
 	terminal_write_line("  themes [list]        - List system themes");
 	terminal_write_line("  etheme <name>        - Apply editor theme from /edit/themes");
@@ -271,7 +351,36 @@ static void terminal_putc(char c)
 
 	if (serial_ready && serial_mirror_enabled)
 	{
-		serial_putchar(c);
+		static int serial_prev_space = 0;
+
+		if (serial_compact_enabled)
+		{
+			if (c == '\n' || c == '\r')
+			{
+				serial_prev_space = 0;
+				if (c == '\n') serial_putchar('\r');
+				serial_putchar(c);
+			}
+			else if (c == '\t' || c == ' ')
+			{
+				if (!serial_prev_space)
+				{
+					serial_putchar(' ');
+					serial_prev_space = 1;
+				}
+			}
+			else
+			{
+				serial_prev_space = 0;
+				serial_putchar(c);
+			}
+		}
+		else
+		{
+			serial_prev_space = 0;
+			if (c == '\n') serial_putchar('\r');
+			serial_putchar(c);
+		}
 	}
 }
 
@@ -842,6 +951,8 @@ static void ensure_theme_files(void)
 {
 	const char *existing;
 	fs_mkdir(SYSTEM_THEME_DIR);
+	fs_mkdir(FBFONT_DIR);
+	fs_mkdir("/scripts");
 	fs_mkdir("/edit");
 	fs_mkdir(EDITOR_THEME_DIR);
 
@@ -895,6 +1006,68 @@ static void ensure_theme_files(void)
 			"basic_comment=0x13\n"
 			"basic_string=0x1E\n"
 			"basic_keywords=PRINT,LET,IF,THEN,GOTO,GOSUB,RETURN,FOR,TO,STEP,NEXT,INPUT,REM,END,STOP,LIST,RUN\n");
+	}
+	if (fs_read_text("/scripts/demo.sh", &existing) != 0)
+	{
+		fs_write_text("/scripts/demo.sh",
+			"# TG11-OS shell demo\n"
+			"echo --- TG11 DEMO START ---\n"
+			"echo Version: $(version)\n"
+			"echo Working dir: $(pwd)\n"
+			"touch demo.txt\n"
+			"write demo.txt Hello from TG11 demo script on $(version)\n"
+			"echo demo.txt says:\n"
+			"cat demo.txt\n"
+			"foreach item in alpha,beta,gamma do echo loop item = $(item)\n"
+			"echo --- TG11 DEMO END ---\n");
+	}
+	if (fs_read_text("/scripts/c64-demo.sh", &existing) != 0)
+	{
+		fs_write_text("/scripts/c64-demo.sh",
+			"# TG11 shell demo for visuals\n"
+			"echo --- C64 style demo start ---\n"
+			"theme c64\n"
+			"color preview prompt\n"
+			"echo \\boxul\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxur\n"
+			"echo \\boxv TG11 C64 THEME \\boxv\n"
+			"echo \\boxll\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxlr\n"
+			"echo \\blk\\blk\\blk  \\shade1\\shade2\\shade3\n"
+			"theme default\n"
+			"color text 0x0F\n"
+			"color prompt 0x0B\n"
+			"echo --- C64 style demo end ---\n");
+	}
+	if (fs_read_text("/scripts/demo.bas", &existing) != 0)
+	{
+		fs_write_text("/scripts/demo.bas",
+			"10 PRINT \"TG11 Tiny BASIC demo\"\n"
+			"20 LET A = 0\n"
+			"30 PRINT A\n"
+			"40 ADD A 1\n"
+			"50 IF A < 5 THEN 30\n"
+			"60 PRINT \"Done counting\"\n"
+			"70 END\n");
+	}
+	if (fs_read_text("/scripts/tiny-basic-demo.bas", &existing) != 0)
+	{
+		fs_write_text("/scripts/tiny-basic-demo.bas",
+			"10 PRINT \"TG11 Tiny BASIC quick demo\"\n"
+			"20 LET A = 1\n"
+			"30 PRINT A\n"
+			"40 ADD A 1\n"
+			"50 IF A <= 5 THEN 30\n"
+			"60 PRINT \"Done\"\n"
+			"70 END\n");
+	}
+	if (fs_read_text("/scripts/colors.sh", &existing) != 0)
+	{
+		fs_write_text("/scripts/colors.sh",
+			"# TG11 color preview demo\n"
+			"echo --- Color Preview Demo ---\n"
+			"color preview\n"
+			"color preview text\n"
+			"color preview prompt\n"
+			"echo --- End ---\n");
 	}
 
 	{
@@ -1013,8 +1186,11 @@ static int expand_cp437_aliases(const char *in, char *out, unsigned long out_siz
 
 static unsigned long editor_visible_rows(void)
 {
-	unsigned long start_row = (unsigned long)(editor_vga_start / VGA_TEXT_WIDTH);
+	unsigned long sw = screen_get_width();
+	unsigned long start_row;
 	unsigned long h = screen_get_height();
+	if (sw == 0) sw = 80;
+	start_row = (unsigned long)(editor_vga_start / sw);
 	if (h == 0) h = 25;
 	if (start_row >= h) return 1;
 	return h - start_row;
@@ -1022,8 +1198,10 @@ static unsigned long editor_visible_rows(void)
 
 static unsigned long editor_text_width(void)
 {
-	if (VGA_TEXT_WIDTH <= EDITOR_TEXT_GUTTER) return 1;
-	return VGA_TEXT_WIDTH - EDITOR_TEXT_GUTTER;
+	unsigned long sw = screen_get_width();
+	if (sw == 0) sw = 80;
+	if (sw <= EDITOR_TEXT_GUTTER) return 1;
+	return sw - EDITOR_TEXT_GUTTER;
 }
 
 static char editor_hex_digit(unsigned char v)
@@ -1219,6 +1397,10 @@ static void editor_render(void)
 	{
 		unsigned long row;
 		unsigned long view_limit;
+		unsigned long sw = screen_get_width();
+		unsigned long sh = screen_get_height();
+		if (sw == 0) sw = 80;
+		if (sh == 0) sh = 25;
 		if (editor_view_top > editor_length) editor_view_top = (editor_length / EDITOR_HEX_BYTES_PER_ROW) * EDITOR_HEX_BYTES_PER_ROW;
 		rows = editor_visible_rows();
 		if (editor_cursor < editor_view_top) editor_view_top = (editor_cursor / EDITOR_HEX_BYTES_PER_ROW) * EDITOR_HEX_BYTES_PER_ROW;
@@ -1232,11 +1414,11 @@ static void editor_render(void)
 		can_scroll_down = (editor_view_top + rows * EDITOR_HEX_BYTES_PER_ROW < editor_length);
 		editor_draw_header(can_scroll_up, can_scroll_down);
 		rows = editor_visible_rows();
-		for (clear_off = editor_vga_start; clear_off < (VGA_TEXT_WIDTH * screen_get_height()); clear_off++) screen_write_char_at(clear_off, ' ');
+		for (clear_off = editor_vga_start; clear_off < (sw * sh); clear_off++) screen_write_char_at(clear_off, ' ');
 		for (row = 0; row < rows; row++)
 		{
 			unsigned long row_start = editor_view_top + row * EDITOR_HEX_BYTES_PER_ROW;
-			unsigned short row_off = (unsigned short)(editor_vga_start + row * VGA_TEXT_WIDTH);
+			unsigned short row_off = (unsigned short)(editor_vga_start + row * sw);
 			unsigned long b;
 			screen_write_char_at((unsigned short)(row_off + 0), editor_hex_digit((unsigned char)((row_start >> 12) & 0xF)));
 			screen_write_char_at((unsigned short)(row_off + 1), editor_hex_digit((unsigned char)((row_start >> 8) & 0xF)));
@@ -1267,15 +1449,15 @@ static void editor_render(void)
 				}
 			}
 		}
-		editor_prev_end = (unsigned short)(editor_vga_start + (rows - 1) * VGA_TEXT_WIDTH);
+		editor_prev_end = (unsigned short)(editor_vga_start + (rows - 1) * sw);
 		{
 			unsigned long r = (editor_cursor - editor_view_top) / EDITOR_HEX_BYTES_PER_ROW;
 			unsigned long c = (editor_cursor - editor_view_top) % EDITOR_HEX_BYTES_PER_ROW;
 			unsigned short cursor_off;
 			if (r >= rows) r = rows - 1;
 			if (c >= EDITOR_HEX_BYTES_PER_ROW) c = EDITOR_HEX_BYTES_PER_ROW - 1;
-			cursor_off = (unsigned short)(editor_vga_start + r * VGA_TEXT_WIDTH + EDITOR_HEX_DATA_COL + c * 3 + editor_hex_nibble);
-			if (cursor_off >= VGA_TEXT_WIDTH * screen_get_height()) cursor_off = (unsigned short)(VGA_TEXT_WIDTH * screen_get_height() - 1);
+			cursor_off = (unsigned short)(editor_vga_start + r * sw + EDITOR_HEX_DATA_COL + c * 3 + editor_hex_nibble);
+			if (cursor_off >= sw * sh) cursor_off = (unsigned short)(sw * sh - 1);
 			screen_set_hw_cursor(cursor_off);
 			screen_set_pos(cursor_off);
 		}
@@ -1296,14 +1478,22 @@ static void editor_render(void)
 	can_scroll_down = editor_has_more_below(editor_view_top, rows);
 	editor_draw_header(can_scroll_up, can_scroll_down);
 	rows = editor_visible_rows();
-	for (clear_off = editor_vga_start; clear_off < (VGA_TEXT_WIDTH * screen_get_height()); clear_off++) screen_write_char_at(clear_off, ' ');
+	{
+		unsigned long sw = screen_get_width();
+		unsigned long sh = screen_get_height();
+		if (sw == 0) sw = 80;
+		if (sh == 0) sh = 25;
+		for (clear_off = editor_vga_start; clear_off < (sw * sh); clear_off++) screen_write_char_at(clear_off, ' ');
+	}
 	{
 		unsigned long row = 0;
 		unsigned long row_start = editor_view_top;
 		unsigned long width = editor_text_width();
+		unsigned long sw = screen_get_width();
+		if (sw == 0) sw = 80;
 		while (row < rows)
 		{
-			unsigned short row_off = (unsigned short)(editor_vga_start + row * VGA_TEXT_WIDTH);
+			unsigned short row_off = (unsigned short)(editor_vga_start + row * sw);
 			unsigned long row_end = row_start;
 			unsigned long col = 0;
 			int in_comment = 0;
@@ -1428,17 +1618,23 @@ static void editor_render(void)
 			row++;
 		}
 	}
-	editor_prev_end = (unsigned short)(editor_vga_start + (rows - 1) * VGA_TEXT_WIDTH);
+	{
+		unsigned long sw = screen_get_width();
+		unsigned long sh = screen_get_height();
+		if (sw == 0) sw = 80;
+		if (sh == 0) sh = 25;
+		editor_prev_end = (unsigned short)(editor_vga_start + (rows - 1) * sw);
 	{
 		unsigned long r = editor_cursor_row_from_top(editor_view_top, editor_cursor);
 		unsigned long c = editor_visual_row_col(editor_cursor);
 		unsigned short cursor_off;
 		if (r >= rows) r = rows - 1;
 		if (c >= editor_text_width()) c = editor_text_width() - 1;
-		cursor_off = (unsigned short)(editor_vga_start + r * VGA_TEXT_WIDTH + EDITOR_TEXT_GUTTER + c);
-		if (cursor_off >= VGA_TEXT_WIDTH * screen_get_height()) cursor_off = (unsigned short)(VGA_TEXT_WIDTH * screen_get_height() - 1);
+		cursor_off = (unsigned short)(editor_vga_start + r * sw + EDITOR_TEXT_GUTTER + c);
+		if (cursor_off >= sw * sh) cursor_off = (unsigned short)(sw * sh - 1);
 		screen_set_hw_cursor(cursor_off);
 		screen_set_pos(cursor_off);
+	}
 	}
 }
 
@@ -1918,7 +2114,7 @@ static char translate_scancode(unsigned char sc)
 /* Backspace (cursor-aware)                                           */
 /* ================================================================== */
 
-static void handle_backspace(void)
+static void handle_backspace(int from_serial)
 {
 	unsigned long i;
 	if (cursor_pos == 0) return;
@@ -1931,7 +2127,7 @@ static void handle_backspace(void)
 	screen_write_char_at((unsigned short)(prompt_vga_start + input_length), ' ');
 	sync_screen_pos();
 	screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-	if (serial_ready && serial_mirror_enabled) serial_write("\b \b");
+	if (!from_serial && serial_ready && serial_mirror_enabled && !serial_compact_enabled) serial_write("\b \b");
 }
 
 /* ================================================================== */
@@ -3150,10 +3346,66 @@ static void cmd_color(const char *args)
 		return;
 	}
 
+	if (string_equals(what, "preview"))
+	{
+		unsigned char saved = terminal_text_color;
+		char which[16];
+		p = read_token(p, which, sizeof(which));
+		if (p == (void *)0 || which[0] == '\0')
+		{
+			unsigned char bg;
+			unsigned char fg;
+			static const char hex[] = "0123456789ABCDEF";
+			terminal_write_line("color preview: fg across, bg down");
+			terminal_write("    ");
+			for (fg = 0; fg < 16; fg++)
+			{
+				terminal_putc(hex[fg]);
+				terminal_write("  ");
+			}
+			terminal_putc('\n');
+			for (bg = 0; bg < 16; bg++)
+			{
+				screen_set_color(saved);
+				terminal_putc(hex[bg]);
+				terminal_write(" : ");
+				for (fg = 0; fg < 16; fg++)
+				{
+					screen_set_color((unsigned char)((bg << 4) | fg));
+					terminal_write("Aa ");
+				}
+				screen_set_color(saved);
+				terminal_putc('\n');
+			}
+			screen_set_color(saved);
+			return;
+		}
+		if (string_equals(which, "text"))
+		{
+			screen_set_color(terminal_text_color);
+			terminal_write("text ");
+			terminal_write_hex8(terminal_text_color);
+			terminal_write_line(": The quick brown fox jumps over 1234567890");
+			screen_set_color(saved);
+			return;
+		}
+		if (string_equals(which, "prompt"))
+		{
+			screen_set_color(terminal_prompt_color);
+			terminal_write("prompt ");
+			terminal_write_hex8(terminal_prompt_color);
+			terminal_write_line(": > preview prompt sample");
+			screen_set_color(saved);
+			return;
+		}
+		terminal_write_line("Usage: color [show|preview [text|prompt]|text <0xNN>|prompt <0xNN>]");
+		return;
+	}
+
 	p = read_token(p, value, sizeof(value));
 	if (p == (void *)0 || value[0] == '\0' || parse_color_token(value, &c) != 0)
 	{
-		terminal_write_line("Usage: color [show|text <0xNN>|prompt <0xNN>]");
+		terminal_write_line("Usage: color [show|preview [text|prompt]|text <0xNN>|prompt <0xNN>]");
 		return;
 	}
 
@@ -3171,12 +3423,13 @@ static void cmd_color(const char *args)
 		return;
 	}
 
-	terminal_write_line("Usage: color [show|text <0xNN>|prompt <0xNN>]");
+	terminal_write_line("Usage: color [show|preview [text|prompt]|text <0xNN>|prompt <0xNN>]");
 }
 
 static void cmd_serial(const char *args)
 {
 	char op[16];
+	char arg2[16];
 	const char *p = read_token(args, op, sizeof(op));
 
 	if (!serial_ready)
@@ -3188,7 +3441,11 @@ static void cmd_serial(const char *args)
 	if (p == (void *)0 || op[0] == '\0' || string_equals(op, "show"))
 	{
 		terminal_write("serial: mirror=");
-		terminal_write_line(serial_mirror_enabled ? "on" : "off");
+		terminal_write(serial_mirror_enabled ? "on" : "off");
+		terminal_write(" compact=");
+		terminal_write(serial_compact_enabled ? "on" : "off");
+		terminal_write(" rxecho=");
+		terminal_write_line(serial_rxecho_enabled ? "on" : "off");
 		return;
 	}
 
@@ -3204,8 +3461,54 @@ static void cmd_serial(const char *args)
 		terminal_write_line("serial: mirror disabled");
 		return;
 	}
+	if (string_equals(op, "compact"))
+	{
+		p = read_token(p, arg2, sizeof(arg2));
+		if (p == (void *)0 || arg2[0] == '\0')
+		{
+			terminal_write_line("Usage: serial compact <on|off>");
+			return;
+		}
+		if (string_equals(arg2, "on"))
+		{
+			serial_compact_enabled = 1;
+			terminal_write_line("serial: compact mode enabled");
+			return;
+		}
+		if (string_equals(arg2, "off"))
+		{
+			serial_compact_enabled = 0;
+			terminal_write_line("serial: compact mode disabled");
+			return;
+		}
+		terminal_write_line("Usage: serial compact <on|off>");
+		return;
+	}
+	if (string_equals(op, "rxecho"))
+	{
+		p = read_token(p, arg2, sizeof(arg2));
+		if (p == (void *)0 || arg2[0] == '\0')
+		{
+			terminal_write_line("Usage: serial rxecho <on|off>");
+			return;
+		}
+		if (string_equals(arg2, "on"))
+		{
+			serial_rxecho_enabled = 1;
+			terminal_write_line("serial: rx echo enabled");
+			return;
+		}
+		if (string_equals(arg2, "off"))
+		{
+			serial_rxecho_enabled = 0;
+			terminal_write_line("serial: rx echo disabled");
+			return;
+		}
+		terminal_write_line("Usage: serial rxecho <on|off>");
+		return;
+	}
 
-	terminal_write_line("Usage: serial [on|off|show]");
+	terminal_write_line("Usage: serial [on|off|show|compact <on|off>|rxecho <on|off>]");
 }
 
 static void cmd_display(const char *args)
@@ -3219,10 +3522,13 @@ static void cmd_display(const char *args)
 		if (display_mode == 0) terminal_write("vga25");
 		else if (display_mode == 1) terminal_write("vga50");
 		else terminal_write("fb");
-		terminal_write(" vga=");
-		terminal_write("80x");
-		if (screen_get_height() == 50) terminal_write("50");
-		else terminal_write("25");
+		terminal_write(" term=");
+		{
+			char n[16];
+			uint_to_dec((unsigned long)screen_get_width(), n, sizeof(n)); terminal_write(n);
+			terminal_write("x");
+			uint_to_dec((unsigned long)screen_get_height(), n, sizeof(n)); terminal_write(n);
+		}
 		if (framebuffer_available())
 		{
 			char n[16];
@@ -3262,12 +3568,313 @@ static void cmd_display(const char *args)
 			terminal_write_line("display: framebuffer not available from bootloader");
 			return;
 		}
+		if (!screen_set_framebuffer_text_mode())
+		{
+			terminal_write_line("display: framebuffer mode unsupported by current boot framebuffer");
+			return;
+		}
 		display_mode = 2;
-		terminal_write_line("display: framebuffer scaffold enabled (renderer WIP), keeping VGA output");
+		terminal_write_line("display: switched to framebuffer text mode");
 		return;
 	}
 
 	terminal_write_line("Usage: display [show|vga25|vga50|fb]");
+}
+
+static void cmd_fbfont(const char *args)
+{
+	char op[16];
+	char tok[16];
+	char chs[8];
+	char name[32];
+	char path[64];
+	char out[EDITOR_BUFFER_SIZE];
+	char line[128];
+	char names[FS_MAX_LIST][FS_NAME_MAX + 2];
+	int types[FS_MAX_LIST];
+	int count = 0;
+	int i_count;
+	unsigned long out_len = 0;
+	unsigned char rows[7];
+	unsigned char v;
+	unsigned long i;
+	const char *text;
+	const char *p = read_token(args, op, sizeof(op));
+
+	#define APPEND_CH(C) do { if (out_len + 1 >= sizeof(out)) { terminal_write_line("fbfont: profile too large"); return; } out[out_len++] = (C); } while (0)
+	#define APPEND_STR(S) do { const char *q_ = (S); while (*q_ != '\0') { APPEND_CH(*q_); q_++; } } while (0)
+	#define APPEND_HEX5(B) do { unsigned char b_ = (unsigned char)((B) & 0x1F); APPEND_CH('0'); APPEND_CH('x'); APPEND_CH('0'); APPEND_CH((char)(b_ < 10 ? ('0' + b_) : ('A' + (b_ - 10)))); } while (0)
+
+	if (p == (void *)0 || op[0] == '\0' || string_equals(op, "show"))
+	{
+		terminal_write("fbfont: style=");
+		terminal_write(screen_fbfont_get_style() == 1 ? "blocky" : "classic");
+		terminal_write(" size=");
+		if (screen_fbfont_get_size() == 12) terminal_write("small");
+		else if (screen_fbfont_get_size() == 16) terminal_write("large");
+		else terminal_write("normal");
+		terminal_write(" custom-dir=");
+		terminal_write_line(FBFONT_DIR);
+		return;
+	}
+
+	if (string_equals(op, "list"))
+	{
+		if (fs_ls(FBFONT_DIR, names, types, FS_MAX_LIST, &count) != 0)
+		{
+			terminal_write_line("fbfont: no profiles");
+			return;
+		}
+		terminal_write_line("fbfont profiles:");
+		for (i_count = 0; i_count < count; i_count++)
+		{
+			if (types[i_count] != 0) continue;
+			if (!editor_path_has_ext_ci(names[i_count], ".fbf")) continue;
+			terminal_write("  ");
+			terminal_write_line(names[i_count]);
+		}
+		return;
+	}
+
+	if (string_equals(op, "style"))
+	{
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0 || tok[0] == '\0')
+		{
+			terminal_write_line("Usage: fbfont style <classic|blocky>");
+			return;
+		}
+		if (string_equals(tok, "classic"))
+		{
+			screen_fbfont_set_style(0);
+			terminal_write_line("fbfont: style set to classic");
+			return;
+		}
+		if (string_equals(tok, "blocky"))
+		{
+			screen_fbfont_set_style(1);
+			terminal_write_line("fbfont: style set to blocky");
+			return;
+		}
+		terminal_write_line("Usage: fbfont style <classic|blocky>");
+		return;
+	}
+
+	if (string_equals(op, "reset"))
+	{
+		screen_fbfont_reset_custom();
+		terminal_write_line("fbfont: custom glyphs reset");
+		return;
+	}
+
+	if (string_equals(op, "size"))
+	{
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0 || tok[0] == '\0')
+		{
+			terminal_write_line("Usage: fbfont size <small|normal|large>");
+			return;
+		}
+		if (string_equals(tok, "small"))
+		{
+			screen_fbfont_set_size(12);
+			terminal_write_line("fbfont: size set to small");
+			return;
+		}
+		if (string_equals(tok, "normal"))
+		{
+			screen_fbfont_set_size(14);
+			terminal_write_line("fbfont: size set to normal");
+			return;
+		}
+		if (string_equals(tok, "large"))
+		{
+			screen_fbfont_set_size(16);
+			terminal_write_line("fbfont: size set to large");
+			return;
+		}
+		terminal_write_line("Usage: fbfont size <small|normal|large>");
+		return;
+	}
+
+	if (string_equals(op, "glyph"))
+	{
+		p = read_token(p, chs, sizeof(chs));
+		if (p == (void *)0 || chs[0] == '\0' || chs[1] != '\0')
+		{
+			terminal_write_line("Usage: fbfont glyph <ch> <r0> <r1> <r2> <r3> <r4> <r5> <r6>");
+			terminal_write_line("Rows are 5-bit values (0x00..0x1F)");
+			return;
+		}
+		for (i = 0; i < 7; i++)
+		{
+			p = read_token(p, tok, sizeof(tok));
+			if (p == (void *)0 || tok[0] == '\0' || parse_color_token(tok, &v) != 0 || v > 0x1F)
+			{
+				terminal_write_line("Usage: fbfont glyph <ch> <r0> <r1> <r2> <r3> <r4> <r5> <r6>");
+				terminal_write_line("Rows are 5-bit values (0x00..0x1F)");
+				return;
+			}
+			rows[i] = v;
+		}
+		if (!screen_fbfont_set_custom_glyph(chs[0], rows))
+		{
+			terminal_write_line("fbfont: failed (printable ASCII only)");
+			return;
+		}
+		terminal_write("fbfont: glyph updated for '");
+		terminal_putc(chs[0]);
+		terminal_write_line("'");
+		return;
+	}
+
+	if (string_equals(op, "save"))
+	{
+		p = read_token(p, name, sizeof(name));
+		if (p == (void *)0 || name[0] == '\0')
+		{
+			terminal_write_line("Usage: fbfont save <name>");
+			return;
+		}
+		if (!editor_path_has_ext_ci(name, ".fbf"))
+		{
+			terminal_write_line("fbfont: use .fbf extension (example: myfont.fbf)");
+			return;
+		}
+		path[0] = '\0';
+		APPEND_STR("");
+		{
+			unsigned long j = 0;
+			const char *base = FBFONT_DIR "/";
+			while (base[j] != '\0' && j + 1 < sizeof(path)) { path[j] = base[j]; j++; }
+			for (i = 0; name[i] != '\0' && j + 1 < sizeof(path); i++) path[j++] = name[i];
+			path[j] = '\0';
+		}
+
+		out_len = 0;
+		APPEND_STR("style=");
+		APPEND_STR(screen_fbfont_get_style() == 1 ? "blocky" : "classic");
+		APPEND_CH('\n');
+		APPEND_STR("size=");
+		if (screen_fbfont_get_size() == 12) APPEND_STR("small");
+		else if (screen_fbfont_get_size() == 16) APPEND_STR("large");
+		else APPEND_STR("normal");
+		APPEND_CH('\n');
+		for (i = 32; i <= 126; i++)
+		{
+			int is_custom = 0;
+			if (!screen_fbfont_get_custom_glyph((char)i, rows, &is_custom)) continue;
+			if (!is_custom) continue;
+			APPEND_STR("glyph ");
+			APPEND_CH((char)i);
+			APPEND_CH(' ');
+			APPEND_HEX5(rows[0]); APPEND_CH(' ');
+			APPEND_HEX5(rows[1]); APPEND_CH(' ');
+			APPEND_HEX5(rows[2]); APPEND_CH(' ');
+			APPEND_HEX5(rows[3]); APPEND_CH(' ');
+			APPEND_HEX5(rows[4]); APPEND_CH(' ');
+			APPEND_HEX5(rows[5]); APPEND_CH(' ');
+			APPEND_HEX5(rows[6]);
+			APPEND_CH('\n');
+		}
+		APPEND_CH('\0');
+
+		if (fs_write_text(path, out) != 0)
+		{
+			terminal_write_line("fbfont: save failed");
+			return;
+		}
+		terminal_write("fbfont: saved ");
+		terminal_write_line(path);
+		return;
+	}
+
+	if (string_equals(op, "load"))
+	{
+		p = read_token(p, name, sizeof(name));
+		if (p == (void *)0 || name[0] == '\0')
+		{
+			terminal_write_line("Usage: fbfont load <name>");
+			return;
+		}
+		if (!editor_path_has_ext_ci(name, ".fbf"))
+		{
+			terminal_write_line("fbfont: use .fbf extension (example: myfont.fbf)");
+			return;
+		}
+		{
+			unsigned long j = 0;
+			const char *base = FBFONT_DIR "/";
+			while (base[j] != '\0' && j + 1 < sizeof(path)) { path[j] = base[j]; j++; }
+			for (i = 0; name[i] != '\0' && j + 1 < sizeof(path); i++) path[j++] = name[i];
+			path[j] = '\0';
+		}
+
+		if (fs_read_text(path, &text) != 0)
+		{
+			terminal_write("fbfont: profile not found: ");
+			terminal_write_line(path);
+			return;
+		}
+
+		screen_fbfont_reset_custom();
+		while (*text != '\0')
+		{
+			unsigned long li = 0;
+			while (*text == '\r' || *text == '\n') text++;
+			if (*text == '\0') break;
+			while (*text != '\0' && *text != '\n' && li + 1 < sizeof(line)) line[li++] = *text++;
+			line[li] = '\0';
+
+			if (line[0] == '#' || line[0] == '\0') continue;
+			if (string_starts_with(line, "style="))
+			{
+				if (string_equals(line + 6, "classic")) screen_fbfont_set_style(0);
+				else if (string_equals(line + 6, "blocky")) screen_fbfont_set_style(1);
+				continue;
+			}
+			if (string_starts_with(line, "size="))
+			{
+				if (string_equals(line + 5, "small")) screen_fbfont_set_size(12);
+				else if (string_equals(line + 5, "large")) screen_fbfont_set_size(16);
+				else screen_fbfont_set_size(14);
+				continue;
+			}
+			if (string_starts_with(line, "glyph "))
+			{
+				const char *gp = line + 6;
+				char gch[8];
+				char gtok[16];
+				unsigned char grows[7];
+				unsigned long gi;
+
+				gp = read_token(gp, gch, sizeof(gch));
+				if (gp == (void *)0 || gch[0] == '\0' || gch[1] != '\0') continue;
+				for (gi = 0; gi < 7; gi++)
+				{
+					gp = read_token(gp, gtok, sizeof(gtok));
+					if (gp == (void *)0 || gtok[0] == '\0' || parse_color_token(gtok, &v) != 0 || v > 0x1F)
+					{
+						gi = 99;
+						break;
+					}
+					grows[gi] = v;
+				}
+				if (gi == 99) continue;
+				screen_fbfont_set_custom_glyph(gch[0], grows);
+			}
+		}
+
+		terminal_write("fbfont: loaded ");
+		terminal_write_line(path);
+		return;
+	}
+
+	terminal_write_line("Usage: fbfont [show|list|style <classic|blocky>|size <small|normal|large>|reset|glyph <ch> <r0..r6>|save <name>|load <name>]");
+
+	#undef APPEND_CH
+	#undef APPEND_STR
+	#undef APPEND_HEX5
 }
 
 static void cmd_theme(const char *args)
@@ -4244,19 +4851,25 @@ static void run_command(void)
 	{
 		if (input_buffer[5] == '\0') cmd_color("show");
 		else if (input_buffer[5] == ' ') cmd_color(input_buffer + 6);
-		else terminal_write_line("Usage: color [show|text <0xNN>|prompt <0xNN>]");
+		else terminal_write_line("Usage: color [show|preview [text|prompt]|text <0xNN>|prompt <0xNN>]");
 	}
 	else if (string_starts_with(input_buffer, "serial"))
 	{
 		if (input_buffer[6] == '\0') cmd_serial("show");
 		else if (input_buffer[6] == ' ') cmd_serial(input_buffer + 7);
-		else terminal_write_line("Usage: serial [on|off|show]");
+		else terminal_write_line("Usage: serial [on|off|show|compact <on|off>|rxecho <on|off>]");
 	}
 	else if (string_starts_with(input_buffer, "display"))
 	{
 		if (input_buffer[7] == '\0') cmd_display("show");
 		else if (input_buffer[7] == ' ') cmd_display(input_buffer + 8);
 		else terminal_write_line("Usage: display [show|vga25|vga50|fb]");
+	}
+	else if (string_starts_with(input_buffer, "fbfont"))
+	{
+		if (input_buffer[6] == '\0') cmd_fbfont("show");
+		else if (input_buffer[6] == ' ') cmd_fbfont(input_buffer + 7);
+		else terminal_write_line("Usage: fbfont [show|list|style <classic|blocky>|size <small|normal|large>|reset|glyph <ch> <r0..r6>|save <name>|load <name>]");
 	}
 	else if (string_starts_with(input_buffer, "themes"))
 	{
@@ -4683,7 +5296,7 @@ static void handle_scancode(unsigned char scancode)
 	if (scancode == 0x0F) { handle_tab(); return; }
 	if (scancode & 0x80)  return;
 
-	if (scancode == 0x0E) { handle_backspace(); return; }
+	if (scancode == 0x0E) { handle_backspace(0); return; }
 
 	if (scancode == 0x1C)
 	{
@@ -4721,34 +5334,125 @@ insert_character:
 
 static void handle_serial_input_char(char c)
 {
+	static int esc_state = 0; /* 0=normal, 1=ESC, 2=CSI/SS3 */
+	unsigned long i;
+
+	/* Redraw current input line on the serial console using ANSI escapes. */
+	/* This keeps serial editing visible without relying on VGA mirror noise. */
+	#define SERIAL_REDRAW() \
+		do { \
+			if (serial_ready) { \
+				char numbuf[16]; \
+				serial_write("\r\x1B[2K> "); \
+				serial_write(input_buffer); \
+				serial_write("\r"); \
+				uint_to_dec((unsigned long)(cursor_pos + 2), numbuf, sizeof(numbuf)); \
+				serial_write("\x1B["); \
+				serial_write(numbuf); \
+				serial_write("C"); \
+			} \
+		} while (0)
+
 	if (editor_active) return;
 	if (script_mode_active) return;
 
+	if (esc_state == 1)
+	{
+		if (c == '[' || c == 'O')
+		{
+			esc_state = 2;
+			return;
+		}
+		esc_state = 0;
+		return;
+	}
+	if (esc_state == 2)
+	{
+		esc_state = 0;
+		if (c == 'A') { handle_arrow_up(); SERIAL_REDRAW(); return; }
+		if (c == 'B') { handle_arrow_down(); SERIAL_REDRAW(); return; }
+		if (c == 'D')
+		{
+			if (cursor_pos > 0)
+			{
+				cursor_pos--;
+				screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+			}
+			SERIAL_REDRAW();
+			return;
+		}
+		if (c == 'C')
+		{
+			if (cursor_pos < input_length)
+			{
+				cursor_pos++;
+				screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+			}
+			SERIAL_REDRAW();
+			return;
+		}
+		if (c == 'H')
+		{
+			cursor_pos = 0;
+			screen_set_hw_cursor(prompt_vga_start);
+			SERIAL_REDRAW();
+			return;
+		}
+		if (c == 'F')
+		{
+			cursor_pos = input_length;
+			screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+			SERIAL_REDRAW();
+			return;
+		}
+		return;
+	}
+
+	if (c == 0x1B)
+	{
+		esc_state = 1;
+		return;
+	}
+
 	if (c == '\r' || c == '\n')
 	{
+		if (serial_ready) serial_write("\r\n");
 		submit_current_line();
 		return;
 	}
 	if (c == 0x08 || c == 0x7F)
 	{
-		handle_backspace();
+		handle_backspace(1);
+		SERIAL_REDRAW();
 		return;
 	}
 
 	if (c < 0x20 || c > 0x7E) return;
 	if (input_length >= (INPUT_BUFFER_SIZE - 1)) return;
 
-	if (cursor_pos != input_length)
+	if (cursor_pos == input_length)
 	{
-		cursor_pos = input_length;
+		input_buffer[input_length++] = c;
+		input_buffer[input_length] = '\0';
+		cursor_pos++;
+		screen_putchar(c);
 		screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
 	}
+	else
+	{
+		for (i = input_length; i > cursor_pos; i--) input_buffer[i] = input_buffer[i - 1];
+		input_buffer[cursor_pos] = c;
+		input_length++;
+		cursor_pos++;
+		input_buffer[input_length] = '\0';
+		for (i = cursor_pos - 1; i < input_length; i++)
+			screen_write_char_at((unsigned short)(prompt_vga_start + i), input_buffer[i]);
+		sync_screen_pos();
+		screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+	}
+	SERIAL_REDRAW();
 
-	input_buffer[input_length++] = c;
-	input_buffer[input_length] = '\0';
-	cursor_pos++;
-	terminal_putc(c);
-	screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+	#undef SERIAL_REDRAW
 }
 
 /* ================================================================== */
@@ -4765,16 +5469,34 @@ void terminal_enqueue_scancode(unsigned char scancode)
 
 void terminal_init(unsigned long mb2_info_addr)
 {
+	enum boot_display_pref boot_display = boot_display_preference(mb2_info_addr);
+	int boot_fb_fallback = 0;
+
 	ensure_theme_files();
 	load_current_system_theme();
 	load_current_editor_theme();
-	screen_set_text_mode_80x25();
-	display_mode = 0;
+	if (boot_display == BOOT_DISPLAY_FB)
+	{
+		if (screen_set_framebuffer_text_mode()) display_mode = 2;
+		else
+		{
+			screen_set_text_mode_80x25();
+			display_mode = 0;
+			boot_fb_fallback = 1;
+		}
+	}
+	else
+	{
+		screen_set_text_mode_80x25();
+		display_mode = 0;
+	}
 	screen_set_color(terminal_text_color);
 	serial_ready = serial_init();
 	memmap_init(mb2_info_addr);
 	terminal_write_line("TG11 OS (64-bit)");
 	terminal_write_line(TG11_OS_VERSION);
+	if (display_mode == 2) terminal_write_line("display: boot framebuffer mode enabled");
+	else if (boot_fb_fallback) terminal_write_line("display: boot framebuffer unavailable; using VGA text");
 	terminal_write_line("Type help to view available commands.");
 	terminal_prompt();
 }

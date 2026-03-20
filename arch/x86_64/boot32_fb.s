@@ -8,6 +8,14 @@ mb2_header:
     .long mb2_header_end - mb2_header   # header length
     .long -(0xE85250D6 + 0 + (mb2_header_end - mb2_header)) # checksum
 
+    .align 8
+    .short 5                            # framebuffer request
+    .short 0
+    .long 20
+    .long 1024
+    .long 768
+    .long 32
+
     # end tag
     .align 8
     .short 0

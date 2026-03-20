@@ -21,7 +21,6 @@ void kernel_main(unsigned long mb2_info_addr)
 
     for (;;)
     {
-		arch_halt();
         terminal_poll();
     }
 }

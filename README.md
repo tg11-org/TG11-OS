@@ -2,7 +2,7 @@
 
 Small x86_64 hobby OS kernel with:
 - GRUB multiboot2 boot
-- VGA terminal shell
+- VGA and framebuffer text terminal shell
 - Keyboard IRQ input with history/editing/tab completion
 - ATA PIO block I/O
 - RAM filesystem commands
@@ -41,6 +41,9 @@ make run-disk
 ### General
 - `help`, `help fs`, `help disk`
 - `version`
+- `color preview [text|prompt]`
+- `display [show|vga25|vga50|fb]`
+- `fbfont [show|list|style|size|reset|glyph|save|load]`
 - `clear`, `reboot`, `shutdown`
 - `run [-x] <path>` (shell script runner)
 - `basic <path>` (Tiny BASIC text program runner)
@@ -62,8 +65,16 @@ make run-disk
 
 - FAT currently expects 8.3-compatible path components.
 - FAT-mode `cp`/`mv` currently use an internal 4 KiB transfer buffer.
+- Base RAMFS includes example scripts under `/scripts`.
 
-## Tiny BASIC (initial)
+## Bundled Demo Scripts
+
+- [scripts/demo.sh](scripts/demo.sh)
+- [scripts/c64-demo.sh](scripts/c64-demo.sh)
+- [scripts/demo.bas](scripts/demo.bas)
+- [scripts/tiny-basic-demo.bas](scripts/tiny-basic-demo.bas)
+
+## Tiny BASIC
 
 Supported statements:
 - `PRINT "text"` or `PRINT A`
