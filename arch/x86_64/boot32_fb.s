@@ -12,8 +12,8 @@ mb2_header:
     .short 5                            # framebuffer request
     .short 0
     .long 20
-    .long 1024
-    .long 768
+    .long 0                             # width  (0 = bootloader chooses)
+    .long 0                             # height (menu entry gfxpayload decides)
     .long 32
 
     # end tag

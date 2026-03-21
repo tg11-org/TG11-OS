@@ -164,7 +164,10 @@ run-disk-debug: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
 	qemu-system-x86_64 -no-reboot -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
 
+run-disk-serial: $(BOOT_DISK_NAME) prepare-data-disk
+	qemu-system-x86_64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio
+
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_DIR)/boot/kernel-fb.elf $(ISO_NAME) $(BOOT_DISK_NAME) $(DATA_DISK_NAME) QEMU.log
 
-.PHONY: all run run-big run-debug run-disk run-disk-big run-disk-debug prepare-data-disk format-data-disk clean
+.PHONY: all run run-big run-debug run-disk run-disk-big run-disk-debug run-disk-serial prepare-data-disk format-data-disk clean

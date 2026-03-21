@@ -22,8 +22,9 @@
 #define EDITOR_HEX_BYTES_PER_ROW 16
 #define EDITOR_HEX_DATA_COL 6
 #define EDITOR_HEX_ASCII_COL 55
-#define EDITOR_THEME_KEYWORD_MAX 32
+#define EDITOR_THEME_KEYWORD_MAX 40
 #define EDITOR_THEME_KEYWORD_LEN 16
+#define EDITOR_THEME_CUSTOM_GROUP_MAX 4
 #define SYSTEM_THEME_DIR "/themes"
 #define SYSTEM_THEME_CURRENT_PATH "/themes/current"
 #define EDITOR_THEME_DIR "/edit/themes"
@@ -46,6 +47,8 @@ static char           input_buffer[INPUT_BUFFER_SIZE];
 static unsigned long  input_length   = 0;
 static unsigned long  cursor_pos     = 0;     /* insert point 0..input_length */
 static unsigned short prompt_vga_start = 0;   /* VGA offset right after "> " */
+static int terminal_selection_active = 0;
+static unsigned long terminal_selection_anchor = 0;
 
 /* ------------------------------------------------------------------ */
 /* Keyboard modifier state                                            */
@@ -73,6 +76,10 @@ static int serial_ready = 0;
 static int serial_mirror_enabled = 1;
 static int serial_compact_enabled = 0;
 static int serial_rxecho_enabled = 1;
+static int terminal_capture_mode = 0;
+static int terminal_capture_done = 0;
+static char *terminal_capture_out = (void *)0;
+static unsigned long terminal_capture_out_size = 0;
 static int display_mode = 0; /* 0=vga25, 1=vga50, 2=framebuffer */
 static int vfs_prefer_fat_root = 0;
 static char fat_cwd[128] = "/";
@@ -89,14 +96,17 @@ static unsigned char editor_sh_string_color = 0x0E;
 static unsigned char editor_basic_keyword_color = 0x0D;
 static unsigned char editor_basic_comment_color = 0x08;
 static unsigned char editor_basic_string_color = 0x0B;
+static unsigned char editor_custom_colors[EDITOR_THEME_CUSTOM_GROUP_MAX] = {0x0E, 0x0D, 0x0B, 0x0C};
 static char editor_sh_keywords[EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN] = {
 	"if", "then", "else", "fi", "for", "do", "done", "while", "in", "case", "esac", "function", "echo", "exit", "cd", "ls"
 };
 static unsigned long editor_sh_keyword_count = 16;
 static char editor_basic_keywords[EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN] = {
-	"PRINT", "LET", "IF", "THEN", "GOTO", "GOSUB", "RETURN", "FOR", "TO", "STEP", "NEXT", "INPUT", "REM", "END", "STOP", "LIST", "RUN"
+	"PRINT", "LET", "DIM", "IF", "THEN", "GOTO", "GOSUB", "RETURN", "ON", "FOR", "TO", "STEP", "NEXT", "INPUT", "DATA", "READ", "RESTORE", "TAB", "SPC", "ABS", "RND", "LEN", "VAL", "ASC", "CHR$", "STR$", "REM", "END", "STOP", "LIST", "RUN"
 };
-static unsigned long editor_basic_keyword_count = 17;
+static unsigned long editor_basic_keyword_count = 31;
+static char editor_custom_tokens[EDITOR_THEME_CUSTOM_GROUP_MAX][EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN];
+static unsigned long editor_custom_token_counts[EDITOR_THEME_CUSTOM_GROUP_MAX] = {0, 0, 0, 0};
 static int editor_active = 0;
 static int editor_use_fat = 0;
 static int editor_hex_mode = 0;
@@ -112,6 +122,10 @@ static char editor_target_path[128];
 static char editor_buffer[EDITOR_BUFFER_SIZE];
 static unsigned long editor_length = 0;
 static unsigned long editor_cursor = 0;
+static int editor_selection_active = 0;
+static unsigned long editor_selection_anchor = 0;
+static char editor_clipboard[EDITOR_BUFFER_SIZE];
+static unsigned long editor_clipboard_length = 0;
 static unsigned long editor_view_top = 0;
 static unsigned short editor_vga_start = 0;
 static unsigned short editor_prev_end = 0;
@@ -130,6 +144,7 @@ static unsigned long string_length(const char *s);
 static int fat_mode_active(void);
 static int fat_resolve_path(const char *input, char *out, unsigned long out_size);
 static void editor_handle_scancode(unsigned char scancode);
+static void editor_handle_serial_char(char c);
 static void run_command(void);
 static int eval_script_condition(const char *expr);
 static int execute_substitution_command(const char *raw_cmd, char *out, unsigned long out_size);
@@ -148,10 +163,22 @@ static unsigned long editor_visual_row_start(unsigned long index);
 static unsigned long editor_visual_row_col(unsigned long index);
 static unsigned long editor_visual_row_length(unsigned long row_start);
 static unsigned long editor_move_visual_rows(unsigned long index, unsigned long rows, int down);
+static unsigned long editor_move_word_left(unsigned long index);
+static unsigned long editor_move_word_right(unsigned long index);
 static unsigned long editor_line_number_for_index(unsigned long index);
 static int editor_has_more_below(unsigned long top, unsigned long rows);
 static void editor_draw_header(int can_scroll_up, int can_scroll_down);
 static int editor_open_file(const char *path, int hex_mode);
+static int editor_has_selection(void);
+static unsigned long editor_selection_start(void);
+static unsigned long editor_selection_end(void);
+static void editor_clear_selection(void);
+static void editor_begin_selection_if_needed(void);
+static void editor_finish_selection_move(void);
+static void editor_delete_range(unsigned long start, unsigned long end);
+static void editor_delete_selection(void);
+static void editor_copy_selection(int cut);
+static int editor_insert_text(const char *text, unsigned long len);
 static int parse_color_token(const char *s, unsigned char *out);
 static int starts_with_word_ci(const char *s, const char *word, unsigned long *word_len_out);
 static int token_is_keyword_ci_table(const char *s, unsigned long len, char keywords[][EDITOR_THEME_KEYWORD_LEN], unsigned long keyword_count);
@@ -159,6 +186,9 @@ static int editor_path_has_ext_ci(const char *path, const char *ext);
 static enum editor_lang editor_detect_language_from_path(const char *path);
 static void copy_keyword_table(char dst[][EDITOR_THEME_KEYWORD_LEN], unsigned long *dst_count, char src[][EDITOR_THEME_KEYWORD_LEN], unsigned long src_count);
 static int parse_keyword_list(const char *value, char out[][EDITOR_THEME_KEYWORD_LEN], unsigned long max_keywords, unsigned long *out_count);
+static int parse_custom_theme_key(const char *key, const char *suffix, unsigned long *group_index_out);
+static int token_is_word_only(const char *s);
+static int editor_match_custom_token_at(const char *buffer, unsigned long length, unsigned long index, unsigned char *color_out, unsigned long *len_out);
 static int apply_system_theme_from_text(const char *name, const char *text);
 static int apply_system_theme_by_name(const char *name, int persist_current);
 static int apply_editor_theme_from_text(const char *name, const char *text);
@@ -649,6 +679,25 @@ static int char_is_word(char c)
 	return c == '_';
 }
 
+static int char_is_basic_word(char c)
+{
+	if (char_is_word(c)) return 1;
+	return c == '$';
+}
+
+static int starts_with_basic_word_ci(const char *s, const char *word, unsigned long *word_len_out)
+{
+	unsigned long i = 0;
+	while (word[i] != '\0')
+	{
+		if (ascii_upper(s[i]) != ascii_upper(word[i])) return 0;
+		i++;
+	}
+	if (word_len_out != (void *)0) *word_len_out = i;
+	if (char_is_basic_word(s[i])) return 0;
+	return 1;
+}
+
 static int starts_with_word_ci(const char *s, const char *word, unsigned long *word_len_out)
 {
 	unsigned long i = 0;
@@ -719,6 +768,91 @@ static int parse_keyword_list(const char *value, char out[][EDITOR_THEME_KEYWORD
 	if (count == 0) return -1;
 	*out_count = count;
 	return 0;
+}
+
+static int parse_custom_theme_key(const char *key, const char *suffix, unsigned long *group_index_out)
+{
+	unsigned long i;
+	if (key == (void *)0 || suffix == (void *)0 || group_index_out == (void *)0) return 0;
+	if (key[0] != 'c' || key[1] != 'u' || key[2] != 's' || key[3] != 't') return 0;
+	if (key[4] < '1' || key[4] > ('0' + EDITOR_THEME_CUSTOM_GROUP_MAX)) return 0;
+	if (key[5] != '_') return 0;
+	i = 0;
+	while (suffix[i] != '\0')
+	{
+		if (key[6 + i] != suffix[i]) return 0;
+		i++;
+	}
+	if (key[6 + i] != '\0') return 0;
+	*group_index_out = (unsigned long)(key[4] - '1');
+	return 1;
+}
+
+static int token_is_word_only(const char *s)
+{
+	unsigned long i = 0;
+	if (s == (void *)0 || s[0] == '\0') return 0;
+	while (s[i] != '\0')
+	{
+		if (!char_is_word(s[i])) return 0;
+		i++;
+	}
+	return 1;
+}
+
+static int editor_match_custom_token_at(const char *buffer, unsigned long length, unsigned long index, unsigned char *color_out, unsigned long *len_out)
+{
+	unsigned long g;
+	unsigned long k;
+	unsigned long best_len = 0;
+	unsigned char best_color = 0;
+
+	if (buffer == (void *)0 || color_out == (void *)0 || len_out == (void *)0) return 0;
+	if (index >= length) return 0;
+
+	for (g = 0; g < EDITOR_THEME_CUSTOM_GROUP_MAX; g++)
+	{
+		for (k = 0; k < editor_custom_token_counts[g]; k++)
+		{
+			unsigned long i = 0;
+			int match = 1;
+			char *token = editor_custom_tokens[g][k];
+			if (token[0] == '\0') continue;
+
+			while (token[i] != '\0')
+			{
+				if (index + i >= length)
+				{
+					match = 0;
+					break;
+				}
+				if (ascii_upper(buffer[index + i]) != ascii_upper(token[i]))
+				{
+					match = 0;
+					break;
+				}
+				i++;
+			}
+			if (!match || i == 0) continue;
+
+			if (token_is_word_only(token))
+			{
+				if (index > 0 && char_is_word(buffer[index - 1])) continue;
+				if (index + i < length && char_is_word(buffer[index + i])) continue;
+			}
+
+			if (i > best_len)
+			{
+				best_len = i;
+				best_color = editor_custom_colors[g];
+			}
+		}
+	}
+
+	if (best_len == 0) return 0;
+	*color_out = best_color;
+	*len_out = best_len;
+	return 1;
 }
 
 static int editor_path_has_ext_ci(const char *path, const char *ext)
@@ -823,6 +957,7 @@ static int apply_system_theme_by_name(const char *name, int persist_current)
 
 static int apply_editor_theme_from_text(const char *name, const char *text)
 {
+	unsigned long grp;
 	unsigned char e_header = editor_header_color;
 	unsigned char e_path = editor_path_color;
 	unsigned char e_rule = editor_rule_color;
@@ -838,10 +973,18 @@ static int apply_editor_theme_from_text(const char *name, const char *text)
 	unsigned long sh_keyword_count = 0;
 	char basic_keywords[EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN];
 	unsigned long basic_keyword_count = 0;
+	unsigned char custom_colors[EDITOR_THEME_CUSTOM_GROUP_MAX];
+	char custom_tokens[EDITOR_THEME_CUSTOM_GROUP_MAX][EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN];
+	unsigned long custom_token_counts[EDITOR_THEME_CUSTOM_GROUP_MAX];
 	const char *p = text;
 
 	copy_keyword_table(sh_keywords, &sh_keyword_count, editor_sh_keywords, editor_sh_keyword_count);
 	copy_keyword_table(basic_keywords, &basic_keyword_count, editor_basic_keywords, editor_basic_keyword_count);
+	for (grp = 0; grp < EDITOR_THEME_CUSTOM_GROUP_MAX; grp++)
+	{
+		custom_colors[grp] = editor_custom_colors[grp];
+		copy_keyword_table(custom_tokens[grp], &custom_token_counts[grp], editor_custom_tokens[grp], editor_custom_token_counts[grp]);
+	}
 
 	while (p != (void *)0 && *p != '\0')
 	{
@@ -871,6 +1014,28 @@ static int apply_editor_theme_from_text(const char *name, const char *text)
 		while (line[eq + 1 + i] != '\0' && i + 1 < sizeof(val)) { val[i] = line[eq + 1 + i]; i++; }
 		val[i] = '\0';
 
+		if (string_equals(key, "sh_keywords"))
+		{
+			unsigned long parsed_count;
+			if (parse_keyword_list(val, sh_keywords, EDITOR_THEME_KEYWORD_MAX, &parsed_count) == 0) sh_keyword_count = parsed_count;
+			continue;
+		}
+		if (string_equals(key, "basic_keywords"))
+		{
+			unsigned long parsed_count;
+			if (parse_keyword_list(val, basic_keywords, EDITOR_THEME_KEYWORD_MAX, &parsed_count) == 0) basic_keyword_count = parsed_count;
+			continue;
+		}
+		if (parse_custom_theme_key(key, "keywords", &grp) ||
+			parse_custom_theme_key(key, "tokens", &grp) ||
+			parse_custom_theme_key(key, "words", &grp) ||
+			parse_custom_theme_key(key, "others", &grp))
+		{
+			unsigned long parsed_count;
+			if (parse_keyword_list(val, custom_tokens[grp], EDITOR_THEME_KEYWORD_MAX, &parsed_count) == 0) custom_token_counts[grp] = parsed_count;
+			continue;
+		}
+
 		if (parse_color_token(val, &c) != 0) continue;
 		if (string_equals(key, "editor_header")) e_header = c;
 		else if (string_equals(key, "editor_path")) e_path = c;
@@ -883,15 +1048,13 @@ static int apply_editor_theme_from_text(const char *name, const char *text)
 		else if (string_equals(key, "basic_keyword")) b_kw = c;
 		else if (string_equals(key, "basic_comment")) b_comment = c;
 		else if (string_equals(key, "basic_string")) b_string = c;
-		else if (string_equals(key, "sh_keywords"))
+		else if (parse_custom_theme_key(key, "color", &grp) ||
+			parse_custom_theme_key(key, "keyword", &grp) ||
+			parse_custom_theme_key(key, "comment", &grp) ||
+			parse_custom_theme_key(key, "string", &grp) ||
+			parse_custom_theme_key(key, "other", &grp))
 		{
-			unsigned long parsed_count;
-			if (parse_keyword_list(val, sh_keywords, EDITOR_THEME_KEYWORD_MAX, &parsed_count) == 0) sh_keyword_count = parsed_count;
-		}
-		else if (string_equals(key, "basic_keywords"))
-		{
-			unsigned long parsed_count;
-			if (parse_keyword_list(val, basic_keywords, EDITOR_THEME_KEYWORD_MAX, &parsed_count) == 0) basic_keyword_count = parsed_count;
+			custom_colors[grp] = c;
 		}
 	}
 
@@ -906,6 +1069,11 @@ static int apply_editor_theme_from_text(const char *name, const char *text)
 	editor_basic_keyword_color = b_kw;
 	editor_basic_comment_color = b_comment;
 	editor_basic_string_color = b_string;
+	for (grp = 0; grp < EDITOR_THEME_CUSTOM_GROUP_MAX; grp++)
+	{
+		editor_custom_colors[grp] = custom_colors[grp];
+		copy_keyword_table(editor_custom_tokens[grp], &editor_custom_token_counts[grp], custom_tokens[grp], custom_token_counts[grp]);
+	}
 	copy_keyword_table(editor_sh_keywords, &editor_sh_keyword_count, sh_keywords, sh_keyword_count);
 	copy_keyword_table(editor_basic_keywords, &editor_basic_keyword_count, basic_keywords, basic_keyword_count);
 	if (editor_active) screen_set_color(editor_text_color);
@@ -970,6 +1138,21 @@ static void ensure_theme_files(void)
 			"terminal_text=0x19\n"
 			"terminal_prompt=0x1E\n");
 	}
+	if (fs_read_text(SYSTEM_THEME_DIR "/synthwave.theme", &existing) != 0)
+	{
+		fs_write_text(SYSTEM_THEME_DIR "/synthwave.theme",
+			"# Synthwave system palette\n"
+			"terminal_text=0x5E\n"
+			"terminal_prompt=0x5F\n");
+	}
+
+	if (fs_read_text(FBFONT_DIR "/default.fbf", &existing) != 0)
+	{
+		fs_write_text(FBFONT_DIR "/default.fbf",
+			"# TG11 default framebuffer font profile\n"
+			"style=classic\n"
+			"size=normal\n");
+	}
 
 	if (fs_read_text(EDITOR_THEME_DIR "/default.theme", &existing) != 0)
 	{
@@ -987,7 +1170,12 @@ static void ensure_theme_files(void)
 			"basic_keyword=0x0D\n"
 			"basic_comment=0x08\n"
 			"basic_string=0x0B\n"
-			"basic_keywords=PRINT,LET,IF,THEN,GOTO,GOSUB,RETURN,FOR,TO,STEP,NEXT,INPUT,REM,END,STOP,LIST,RUN\n");
+			"basic_keywords=PRINT,LET,DIM,IF,THEN,GOTO,GOSUB,RETURN,ON,FOR,TO,STEP,NEXT,INPUT,DATA,READ,RESTORE,TAB,SPC,ABS,RND,LEN,VAL,ASC,CHR$,STR$,REM,END,STOP,LIST,RUN\n"
+			"# Custom groups: cust1..cust4\n"
+			"# Use custN_color plus custN_keywords (or custN_tokens)\n"
+			"# Example Markdown symbols:\n"
+			"# cust1_color=0x0E\n"
+			"# cust1_keywords=#,##,###,*,**,(),[],---\n");
 	}
 	if (fs_read_text(EDITOR_THEME_DIR "/c64.theme", &existing) != 0)
 	{
@@ -1005,7 +1193,33 @@ static void ensure_theme_files(void)
 			"basic_keyword=0x1D\n"
 			"basic_comment=0x13\n"
 			"basic_string=0x1E\n"
-			"basic_keywords=PRINT,LET,IF,THEN,GOTO,GOSUB,RETURN,FOR,TO,STEP,NEXT,INPUT,REM,END,STOP,LIST,RUN\n");
+			"basic_keywords=PRINT,LET,DIM,IF,THEN,GOTO,GOSUB,RETURN,ON,FOR,TO,STEP,NEXT,INPUT,DATA,READ,RESTORE,TAB,SPC,ABS,RND,LEN,VAL,ASC,CHR$,STR$,REM,END,STOP,LIST,RUN\n"
+			"# Custom groups available: cust1..cust4\n");
+	}
+	if (fs_read_text(EDITOR_THEME_DIR "/synthwave.theme", &existing) != 0)
+	{
+		fs_write_text(EDITOR_THEME_DIR "/synthwave.theme",
+			"# Synthwave editor palette\n"
+			"editor_header=0x5E\n"
+			"editor_path=0x5D\n"
+			"editor_rule=0x58\n"
+			"editor_line=0x5D\n"
+			"editor_text=0x5E\n"
+			"sh_keyword=0x5E\n"
+			"sh_comment=0x5D\n"
+			"sh_string=0x5B\n"
+			"sh_keywords=if,then,else,fi,for,do,done,while,in,case,esac,function,echo,exit,cd,ls\n"
+			"basic_keyword=0x5E\n"
+			"basic_comment=0x5D\n"
+			"basic_string=0x5B\n"
+			"basic_keywords=PRINT,LET,DIM,IF,THEN,GOTO,GOSUB,RETURN,ON,FOR,TO,STEP,NEXT,INPUT,DATA,READ,RESTORE,TAB,SPC,ABS,RND,LEN,VAL,ASC,CHR$,STR$,REM,END,STOP,LIST,RUN\n"
+			"# Markdown-style custom groups\n"
+			"cust1_color=0x5E\n"
+			"cust1_keywords=#,##,###,####,#####,######,---\n"
+			"cust2_color=0x5D\n"
+			"cust2_keywords=*,**,_,__,`\n"
+			"cust3_color=0x5B\n"
+			"cust3_keywords=(,),[,],{,}\n");
 	}
 	if (fs_read_text("/scripts/demo.sh", &existing) != 0)
 	{
@@ -1025,12 +1239,13 @@ static void ensure_theme_files(void)
 	{
 		fs_write_text("/scripts/c64-demo.sh",
 			"# TG11 shell demo for visuals\n"
+			"clear"
 			"echo --- C64 style demo start ---\n"
 			"theme c64\n"
 			"color preview prompt\n"
-			"echo \\boxul\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxur\n"
+			"echo \\boxul\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxur\n"
 			"echo \\boxv TG11 C64 THEME \\boxv\n"
-			"echo \\boxll\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxlr\n"
+			"echo \\boxll\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxh\\boxlr\n"
 			"echo \\blk\\blk\\blk  \\shade1\\shade2\\shade3\n"
 			"theme default\n"
 			"color text 0x0F\n"
@@ -1051,13 +1266,37 @@ static void ensure_theme_files(void)
 	if (fs_read_text("/scripts/tiny-basic-demo.bas", &existing) != 0)
 	{
 		fs_write_text("/scripts/tiny-basic-demo.bas",
-			"10 PRINT \"TG11 Tiny BASIC quick demo\"\n"
-			"20 LET A = 1\n"
-			"30 PRINT A\n"
-			"40 ADD A 1\n"
-			"50 IF A <= 5 THEN 30\n"
-			"60 PRINT \"Done\"\n"
-			"70 END\n");
+			"10 PRINT \"TG11 Tiny BASIC v4 demo\";\n"
+			"20 PRINT \" (arrays + funcs)\"\n"
+			"30 DIM A(5)\n"
+			"40 LET NAME$ = \"friend\"\n"
+			"50 INPUT \"Your name\"; NAME$\n"
+			"60 PRINT \"Hello, \", NAME$\n"
+			"70 LET SUM = 0\n"
+			"80 FOR I = 0 TO 5\n"
+			"90 LET A(I) = I * I\n"
+			"100 ADD SUM A(I)\n"
+			"110 NEXT I\n"
+			"120 PRINT \"SUM=\"; SPC(1); SUM\n"
+			"130 PRINT \"LEN(name)=\", LEN(NAME$), \" ASC(first)=\", ASC(NAME$)\n"
+			"140 PRINT \"VAL(\\\"123\\\")=\", VAL(\"123\"), \" ABS(-9)=\", ABS(-9)\n"
+			"150 INPUT \"Pick mode (1..3)\"; MODE\n"
+			"160 ON MODE GOSUB 300,320,340\n"
+			"170 RESTORE\n"
+			"180 READ X, Y, LABEL$\n"
+			"190 PRINT TAB(2), \"DATA:\", X, Y, LABEL$\n"
+			"200 PRINT \"RND(10)=\", RND(10), \" CHR$(33)=\", CHR$(33)\n"
+			"210 PRINT \"STR$(SUM)=\", STR$(SUM)\n"
+			"220 PRINT \"Done\"\n"
+			"230 END\n"
+			"300 PRINT \"Mode 1\";\n"
+			"310 PRINT \" selected\"\n"
+			"315 RETURN\n"
+			"320 PRINT \"Mode 2 selected\"\n"
+			"330 RETURN\n"
+			"340 PRINT \"Mode 3 selected\"\n"
+			"350 RETURN\n"
+			"900 DATA 7, 42, \"synthwave\"\n");
 	}
 	if (fs_read_text("/scripts/colors.sh", &existing) != 0)
 	{
@@ -1118,8 +1357,12 @@ static int expand_cp437_aliases(const char *in, char *out, unsigned long out_siz
 		{"boxh", 0xC4}, {"boxv", 0xB3}, {"boxul", 0xDA}, {"boxur", 0xBF},
 		{"boxll", 0xC0}, {"boxlr", 0xD9}, {"boxt", 0xC2}, {"boxb", 0xC1},
 		{"boxl", 0xC3}, {"boxr", 0xB4}, {"boxx", 0xC5},
-		{"blkup", 0xDF}, {"blkdn", 0xDC}, {"blk", 0xDB},
+		{"blkup", 0xDF}, {"blkdn", 0xDC}, 
+		{"blkl", 0xDD}, {"blkr", 0xDE}, {"blk", 0xDB},
+		{"dboxh", 0xCD}, {"dboxv", 0xBA}, {"dboxul", 0xC9}, {"dboxur", 0xBB},
+		{"dboxll", 0xC8}, {"dboxlr", 0xBC},
 		{"shade1", 0xB0}, {"shade2", 0xB1}, {"shade3", 0xB2},
+		{"deg", 0xF8}, {"pm", 0xF1}, {"dot", 0xFA},
 		{"tri", 0x1E}, {"arru", 0x18}, {"arrd", 0x19}, {"arrl", 0x1B}, {"arrr", 0x1A}
 	};
 	unsigned long i = 0;
@@ -1382,6 +1625,122 @@ static unsigned long editor_line_end(unsigned long index)
 	return index;
 }
 
+static unsigned long editor_move_word_left(unsigned long index)
+{
+	while (index > 0 && !char_is_word(editor_buffer[index - 1])) index--;
+	while (index > 0 && char_is_word(editor_buffer[index - 1])) index--;
+	return index;
+}
+
+static unsigned long editor_move_word_right(unsigned long index)
+{
+	while (index < editor_length && char_is_word(editor_buffer[index])) index++;
+	while (index < editor_length && !char_is_word(editor_buffer[index])) index++;
+	return index;
+}
+
+static int editor_has_selection(void)
+{
+	return editor_selection_active && editor_selection_anchor != editor_cursor;
+}
+
+static unsigned long editor_selection_start(void)
+{
+	return editor_selection_anchor < editor_cursor ? editor_selection_anchor : editor_cursor;
+}
+
+static unsigned long editor_selection_end(void)
+{
+	return editor_selection_anchor < editor_cursor ? editor_cursor : editor_selection_anchor;
+}
+
+static void editor_clear_selection(void)
+{
+	editor_selection_active = 0;
+	editor_selection_anchor = editor_cursor;
+}
+
+static void editor_begin_selection_if_needed(void)
+{
+	if (!shift_held) return;
+	if (!editor_selection_active)
+	{
+		editor_selection_active = 1;
+		editor_selection_anchor = editor_cursor;
+	}
+}
+
+static void editor_finish_selection_move(void)
+{
+	if (!shift_held)
+	{
+		editor_clear_selection();
+		return;
+	}
+	if (editor_selection_anchor == editor_cursor) editor_selection_active = 0;
+}
+
+static void editor_delete_range(unsigned long start, unsigned long end)
+{
+	unsigned long i;
+	if (end <= start || start > editor_length) return;
+	if (end > editor_length) end = editor_length;
+	for (i = start; i + (end - start) < editor_length; i++) editor_buffer[i] = editor_buffer[i + (end - start)];
+	editor_length -= (end - start);
+	editor_buffer[editor_length] = '\0';
+	editor_cursor = start;
+	editor_dirty = 1;
+	editor_clear_selection();
+}
+
+static void editor_delete_selection(void)
+{
+	if (!editor_has_selection()) return;
+	editor_delete_range(editor_selection_start(), editor_selection_end());
+}
+
+static void editor_copy_selection(int cut)
+{
+	unsigned long i;
+	unsigned long start;
+	unsigned long end;
+	if (!editor_has_selection())
+	{
+		editor_status_line(cut ? "[editor] nothing selected to cut" : "[editor] nothing selected to copy");
+		return;
+	}
+	start = editor_selection_start();
+	end = editor_selection_end();
+	editor_clipboard_length = end - start;
+	for (i = 0; i < editor_clipboard_length; i++) editor_clipboard[i] = editor_buffer[start + i];
+	editor_clipboard[editor_clipboard_length] = '\0';
+	if (cut)
+	{
+		editor_delete_range(start, end);
+		editor_status_line("[editor] cut");
+	}
+	else
+	{
+		editor_status_line("[editor] copied");
+	}
+}
+
+static int editor_insert_text(const char *text, unsigned long len)
+{
+	unsigned long i;
+	if (text == (void *)0 || len == 0) return 1;
+	if (editor_has_selection()) editor_delete_selection();
+	if (editor_length + len >= EDITOR_BUFFER_SIZE) return 0;
+	for (i = editor_length; i > editor_cursor; i--) editor_buffer[i + len - 1] = editor_buffer[i - 1];
+	for (i = 0; i < len; i++) editor_buffer[editor_cursor + i] = text[i];
+	editor_cursor += len;
+	editor_length += len;
+	editor_buffer[editor_length] = '\0';
+	editor_dirty = 1;
+	editor_clear_selection();
+	return 1;
+}
+
 static void editor_render(void)
 {
 	unsigned short clear_off;
@@ -1490,7 +1849,14 @@ static void editor_render(void)
 		unsigned long row_start = editor_view_top;
 		unsigned long width = editor_text_width();
 		unsigned long sw = screen_get_width();
+		unsigned long sel_start = 0;
+		unsigned long sel_end = 0;
 		if (sw == 0) sw = 80;
+		if (editor_has_selection())
+		{
+			sel_start = editor_selection_start();
+			sel_end = editor_selection_end();
+		}
 		while (row < rows)
 		{
 			unsigned short row_off = (unsigned short)(editor_vga_start + row * sw);
@@ -1499,7 +1865,9 @@ static void editor_render(void)
 			int in_comment = 0;
 			int in_string = 0;
 			unsigned long token_remaining = 0;
+			unsigned long custom_token_remaining = 0;
 			unsigned char token_color = editor_text_color;
+			unsigned char custom_token_color = editor_text_color;
 			if (row_start == 0 || (row_start <= editor_length && editor_buffer[row_start - 1] == '\n'))
 			{
 				screen_set_color(editor_line_number_color);
@@ -1582,12 +1950,12 @@ static void editor_render(void)
 						in_string = 1;
 						ch_color = editor_basic_string_color;
 					}
-					else if ((row_end == row_start || !char_is_word(editor_buffer[row_end - 1])) && char_is_word(ch))
+					else if ((row_end == row_start || !char_is_basic_word(editor_buffer[row_end - 1])) && char_is_basic_word(ch))
 					{
 						unsigned long tlen = 0;
 						unsigned long rem_len = 0;
-						while (row_end + tlen < editor_length && char_is_word(editor_buffer[row_end + tlen])) tlen++;
-						if (starts_with_word_ci(&editor_buffer[row_end], "REM", &rem_len))
+						while (row_end + tlen < editor_length && char_is_basic_word(editor_buffer[row_end + tlen])) tlen++;
+						if (starts_with_basic_word_ci(&editor_buffer[row_end], "REM", &rem_len))
 						{
 							in_comment = 1;
 							ch_color = editor_basic_comment_color;
@@ -1601,6 +1969,28 @@ static void editor_render(void)
 							if (tlen > 0) token_remaining = tlen - 1;
 						}
 					}
+				}
+
+				if (custom_token_remaining > 0)
+				{
+					ch_color = custom_token_color;
+					custom_token_remaining--;
+				}
+				else
+				{
+					unsigned char custom_color;
+					unsigned long custom_len;
+					if (editor_match_custom_token_at(editor_buffer, editor_length, row_end, &custom_color, &custom_len))
+					{
+						ch_color = custom_color;
+						custom_token_color = custom_color;
+						if (custom_len > 0) custom_token_remaining = custom_len - 1;
+					}
+				}
+
+				if (editor_has_selection() && row_end >= sel_start && row_end < sel_end)
+				{
+					ch_color = (unsigned char)(0x70 | (ch_color & 0x0F));
 				}
 
 				screen_set_color(ch_color);
@@ -1865,6 +2255,135 @@ static void history_push(void)
 	}
 }
 
+static int terminal_has_selection(void)
+{
+	return terminal_selection_active && terminal_selection_anchor != cursor_pos;
+}
+
+static unsigned long terminal_selection_start(void)
+{
+	return terminal_selection_anchor < cursor_pos ? terminal_selection_anchor : cursor_pos;
+}
+
+static unsigned long terminal_selection_end(void)
+{
+	return terminal_selection_anchor < cursor_pos ? cursor_pos : terminal_selection_anchor;
+}
+
+static void terminal_clear_selection(void)
+{
+	terminal_selection_active = 0;
+	terminal_selection_anchor = cursor_pos;
+}
+
+static void terminal_begin_selection_if_needed(void)
+{
+	if (!shift_held) return;
+	if (!terminal_selection_active)
+	{
+		terminal_selection_active = 1;
+		terminal_selection_anchor = cursor_pos;
+	}
+}
+
+static void terminal_finish_selection_move(void)
+{
+	if (!shift_held)
+	{
+		terminal_clear_selection();
+		return;
+	}
+	if (terminal_selection_anchor == cursor_pos) terminal_selection_active = 0;
+}
+
+static void terminal_redraw_input_line(void)
+{
+	unsigned long i;
+	unsigned long sel_start = 0;
+	unsigned long sel_end = 0;
+	if (terminal_has_selection())
+	{
+		sel_start = terminal_selection_start();
+		sel_end = terminal_selection_end();
+	}
+	for (i = 0; i < INPUT_BUFFER_SIZE - 1; i++)
+	{
+		if (i < input_length)
+		{
+			unsigned char color = terminal_text_color;
+			if (terminal_has_selection() && i >= sel_start && i < sel_end) color = (unsigned char)(0x70 | (color & 0x0F));
+			screen_set_color(color);
+			screen_write_char_at((unsigned short)(prompt_vga_start + i), input_buffer[i]);
+		}
+		else
+		{
+			screen_set_color(terminal_text_color);
+			screen_write_char_at((unsigned short)(prompt_vga_start + i), ' ');
+			if (i >= input_length) break;
+		}
+	}
+	if (input_length < INPUT_BUFFER_SIZE - 1)
+	{
+		screen_set_color(terminal_text_color);
+		screen_write_char_at((unsigned short)(prompt_vga_start + input_length), ' ');
+	}
+	sync_screen_pos();
+	screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+	if (serial_ready) { }
+	/* restore normal text color */
+	screen_set_color(terminal_text_color);
+	terminal_selection_anchor = terminal_selection_active ? terminal_selection_anchor : cursor_pos;
+}
+
+static void terminal_delete_range(unsigned long start, unsigned long end)
+{
+	unsigned long i;
+	if (end <= start || start > input_length) return;
+	if (end > input_length) end = input_length;
+	for (i = start; i + (end - start) < input_length; i++) input_buffer[i] = input_buffer[i + (end - start)];
+	input_length -= (end - start);
+	input_buffer[input_length] = '\0';
+	cursor_pos = start;
+	terminal_clear_selection();
+	terminal_redraw_input_line();
+}
+
+static void terminal_delete_selection(void)
+{
+	if (!terminal_has_selection()) return;
+	terminal_delete_range(terminal_selection_start(), terminal_selection_end());
+}
+
+static void terminal_copy_selection(int cut)
+{
+	unsigned long i;
+	unsigned long start;
+	unsigned long end;
+	if (!terminal_has_selection()) return;
+	start = terminal_selection_start();
+	end = terminal_selection_end();
+	editor_clipboard_length = end - start;
+	for (i = 0; i < editor_clipboard_length; i++) editor_clipboard[i] = input_buffer[start + i];
+	editor_clipboard[editor_clipboard_length] = '\0';
+	if (cut) terminal_delete_range(start, end);
+}
+
+static int terminal_insert_text(const char *text, unsigned long len)
+{
+	unsigned long i;
+	if (text == (void *)0 || len == 0) return 1;
+	if (terminal_has_selection()) terminal_delete_selection();
+	if (input_length + len >= INPUT_BUFFER_SIZE) return 0;
+	for (i = input_length; i > cursor_pos; i--) input_buffer[i + len - 1] = input_buffer[i - 1];
+	for (i = 0; i < len; i++) input_buffer[cursor_pos + i] = text[i];
+	input_length += len;
+	cursor_pos += len;
+	input_buffer[input_length] = '\0';
+	terminal_clear_selection();
+	terminal_redraw_input_line();
+	return 1;
+}
+
 static void clear_input_line(void)
 {
 	unsigned long i;
@@ -1873,18 +2392,16 @@ static void clear_input_line(void)
 	input_length = 0;
 	cursor_pos   = 0;
 	input_buffer[0] = '\0';
+	terminal_clear_selection();
 	screen_set_pos(prompt_vga_start);
 	screen_set_hw_cursor(prompt_vga_start);
 }
 
 static void draw_from_buffer(void)
 {
-	unsigned long i;
-	for (i = 0; i < input_length; i++)
-		screen_write_char_at((unsigned short)(prompt_vga_start + i), input_buffer[i]);
 	cursor_pos = input_length;
-	sync_screen_pos();
-	screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+	terminal_clear_selection();
+	terminal_redraw_input_line();
 }
 
 static void handle_arrow_up(void)
@@ -2117,11 +2634,18 @@ static char translate_scancode(unsigned char sc)
 static void handle_backspace(int from_serial)
 {
 	unsigned long i;
+	if (terminal_has_selection())
+	{
+		terminal_delete_selection();
+		if (!from_serial && serial_ready && serial_mirror_enabled && !serial_compact_enabled) serial_write("\b \b");
+		return;
+	}
 	if (cursor_pos == 0) return;
 	cursor_pos--;
 	for (i = cursor_pos; i < input_length - 1; i++) input_buffer[i] = input_buffer[i + 1];
 	input_length--;
 	input_buffer[input_length] = '\0';
+	terminal_clear_selection();
 	for (i = cursor_pos; i < input_length; i++)
 		screen_write_char_at((unsigned short)(prompt_vga_start + i), input_buffer[i]);
 	screen_write_char_at((unsigned short)(prompt_vga_start + input_length), ' ');
@@ -2536,7 +3060,7 @@ static void editor_draw_header(int can_scroll_up, int can_scroll_down)
 	terminal_write_line(editor_target_path);
 	screen_set_color(editor_header_color);
 	if (editor_hex_mode) terminal_write_line("Hex: 0-9/A-F edit | arrows PgUp PgDn Home End | Ctrl+Home/End");
-	else terminal_write_line("Ctrl+S save | F10 save+exit | Esc cancel | PgUp PgDn Home End");
+	else terminal_write_line("Ctrl+S save | Ctrl+C/X/V copy cut paste | Shift+arrows select | Ctrl+arrows jump words");
 	screen_set_color(editor_rule_color);
 	terminal_write_line("--------------------------------");
 	screen_set_color(editor_text_color);
@@ -2591,6 +3115,7 @@ static int editor_open_file(const char *path, int hex_mode)
 
 	screen_clear();
 	editor_cursor = editor_length;
+	editor_clear_selection();
 	editor_view_top = 0;
 	editor_render();
 	editor_active = 1;
@@ -4401,8 +4926,10 @@ static void cmd_charmap(void)
 {
 	terminal_write_line("CP437 aliases (use in commands/scripts):");
 	terminal_write_line("  \\boxh \\boxv \\boxul \\boxur \\boxll \\boxlr");
+	terminal_write_line("  \\dboxh \\dboxv \\dboxul \\dboxur \\dboxll \\dboxlr");
 	terminal_write_line("  \\boxt \\boxb \\boxl \\boxr \\boxx");
-	terminal_write_line("  \\blk \\blkup \\blkdn \\shade1 \\shade2 \\shade3");
+	terminal_write_line("  \\blk \\blkup \\blkdn \\blkl \\blkr");
+	terminal_write_line("  \\shade1 \\shade2 \\shade3 \\deg \\pm \\dot");
 	terminal_write_line("  \\arru \\arrd \\arrl \\arrr \\tri");
 	terminal_write_line("  \\xNN for raw byte (hex), example: echo \\xDB\\xDB\\xDB");
 }
@@ -4927,10 +5454,24 @@ static void run_command(void)
 
 static void submit_current_line(void)
 {
+	unsigned long i;
 	sync_screen_pos();
 	terminal_putc('\n');
 	input_buffer[input_length] = '\0';
 	history_pos = -1;
+	if (terminal_capture_mode)
+	{
+		if (terminal_capture_out != (void *)0 && terminal_capture_out_size > 0)
+		{
+			for (i = 0; i + 1 < terminal_capture_out_size && input_buffer[i] != '\0'; i++) terminal_capture_out[i] = input_buffer[i];
+			terminal_capture_out[i] = '\0';
+		}
+		input_length = 0;
+		cursor_pos = 0;
+		input_buffer[0] = '\0';
+		terminal_capture_done = 1;
+		return;
+	}
 	history_push();
 	run_command();
 }
@@ -5034,27 +5575,37 @@ static void editor_handle_scancode(unsigned char scancode)
 		}
 		if (scancode == 0x4B)
 		{
-			if (editor_cursor > 0) editor_cursor--;
+			editor_begin_selection_if_needed();
+			if (ctrl_held) editor_cursor = editor_move_word_left(editor_cursor);
+			else if (editor_cursor > 0) editor_cursor--;
+			editor_finish_selection_move();
 			editor_render();
 			return;
 		}
 		if (scancode == 0x4D)
 		{
-			if (editor_cursor < editor_length) editor_cursor++;
+			editor_begin_selection_if_needed();
+			if (ctrl_held) editor_cursor = editor_move_word_right(editor_cursor);
+			else if (editor_cursor < editor_length) editor_cursor++;
+			editor_finish_selection_move();
 			editor_render();
 			return;
 		}
 		if (scancode == 0x47)
 		{
+			editor_begin_selection_if_needed();
 			if (ctrl_held) editor_cursor = 0;
 			else editor_cursor = editor_line_start(editor_cursor);
+			editor_finish_selection_move();
 			editor_render();
 			return;
 		}
 		if (scancode == 0x4F)
 		{
+			editor_begin_selection_if_needed();
 			if (ctrl_held) editor_cursor = editor_length;
 			else editor_cursor = editor_line_end(editor_cursor);
+			editor_finish_selection_move();
 			editor_render();
 			return;
 		}
@@ -5062,7 +5613,9 @@ static void editor_handle_scancode(unsigned char scancode)
 		{
 			rows = editor_visible_rows();
 			if (rows > 1) rows--;
+			editor_begin_selection_if_needed();
 			editor_cursor = editor_move_visual_rows(editor_cursor, rows, 0);
+			editor_finish_selection_move();
 			editor_render();
 			return;
 		}
@@ -5070,15 +5623,19 @@ static void editor_handle_scancode(unsigned char scancode)
 		{
 			rows = editor_visible_rows();
 			if (rows > 1) rows--;
+			editor_begin_selection_if_needed();
 			editor_cursor = editor_move_visual_rows(editor_cursor, rows, 1);
+			editor_finish_selection_move();
 			editor_render();
 			return;
 		}
 		if (scancode == 0x48)
 		{
+			editor_begin_selection_if_needed();
 			line_start = editor_line_start(editor_cursor);
 			if (line_start == 0)
 			{
+				editor_finish_selection_move();
 				editor_render();
 				return;
 			}
@@ -5089,15 +5646,18 @@ static void editor_handle_scancode(unsigned char scancode)
 				unsigned long prev_len = prev_end - prev_start;
 				editor_cursor = prev_start + (col < prev_len ? col : prev_len);
 			}
+			editor_finish_selection_move();
 			editor_render();
 			return;
 		}
 		if (scancode == 0x50)
 		{
+			editor_begin_selection_if_needed();
 			line_start = editor_line_start(editor_cursor);
 			line_end = editor_line_end(editor_cursor);
 			if (line_end >= editor_length)
 			{
+				editor_finish_selection_move();
 				editor_render();
 				return;
 			}
@@ -5108,6 +5668,14 @@ static void editor_handle_scancode(unsigned char scancode)
 				unsigned long next_len = next_end - next_start;
 				editor_cursor = next_start + (col < next_len ? col : next_len);
 			}
+			editor_finish_selection_move();
+			editor_render();
+			return;
+		}
+		if (scancode == 0x53)
+		{
+			if (editor_has_selection()) editor_delete_selection();
+			else if (editor_cursor < editor_length) editor_delete_range(editor_cursor, editor_cursor + 1);
 			editor_render();
 			return;
 		}
@@ -5141,6 +5709,36 @@ static void editor_handle_scancode(unsigned char scancode)
 		if (editor_save() == 0) editor_status_line("[editor] saved");
 		else editor_status_line("[editor] save failed");
 		return;
+	}
+
+	if (!editor_hex_mode && ctrl_held)
+	{
+		if (scancode == 0x1E)
+		{
+			editor_selection_active = 1;
+			editor_selection_anchor = 0;
+			editor_cursor = editor_length;
+			editor_render();
+			return;
+		}
+		if (scancode == 0x2E)
+		{
+			editor_copy_selection(0);
+			return;
+		}
+		if (scancode == 0x2D)
+		{
+			editor_copy_selection(1);
+			return;
+		}
+		if (scancode == 0x2F)
+		{
+			if (!editor_insert_text(editor_clipboard, editor_clipboard_length))
+				editor_status_line("[editor] paste failed (buffer full)");
+			else
+				editor_render();
+			return;
+		}
 	}
 
 	if (scancode == 0x01)
@@ -5209,13 +5807,19 @@ static void editor_handle_scancode(unsigned char scancode)
 
 	if (scancode == 0x0E)
 	{
-		if (editor_cursor > 0)
+		if (editor_has_selection())
+		{
+			editor_delete_selection();
+			editor_render();
+		}
+		else if (editor_cursor > 0)
 		{
 			for (i = editor_cursor - 1; i < editor_length - 1; i++) editor_buffer[i] = editor_buffer[i + 1];
 			editor_cursor--;
 			editor_length--;
 			editor_buffer[editor_length] = '\0';
 			editor_dirty = 1;
+			editor_clear_selection();
 			editor_render();
 		}
 		return;
@@ -5223,15 +5827,11 @@ static void editor_handle_scancode(unsigned char scancode)
 
 	if (scancode == 0x1C)
 	{
-		if (editor_length + 1 < EDITOR_BUFFER_SIZE)
+		if (editor_insert_text("\n", 1))
 		{
-			for (i = editor_length; i > editor_cursor; i--) editor_buffer[i] = editor_buffer[i - 1];
-			editor_buffer[editor_cursor++] = '\n';
-			editor_length++;
-			editor_buffer[editor_length] = '\0';
-			editor_dirty = 1;
 			editor_render();
 		}
+		else editor_status_line("[editor] buffer full");
 		return;
 	}
 
@@ -5243,12 +5843,55 @@ static void editor_handle_scancode(unsigned char scancode)
 		editor_status_line("[editor] buffer full");
 		return;
 	}
-	for (i = editor_length; i > editor_cursor; i--) editor_buffer[i] = editor_buffer[i - 1];
-	editor_buffer[editor_cursor++] = c;
-	editor_length++;
-	editor_buffer[editor_length] = '\0';
-	editor_dirty = 1;
-	editor_render();
+	if (!editor_insert_text(&c, 1)) editor_status_line("[editor] buffer full");
+	else editor_render();
+}
+
+static void editor_handle_serial_char(char c)
+{
+	unsigned long i;
+
+	if (editor_hex_mode)
+	{
+		if (c == 0x08 || c == 0x7F)
+		{
+			if (editor_cursor > 0)
+			{
+				editor_cursor--;
+				for (i = editor_cursor; i + 1 < editor_length; i++) editor_buffer[i] = editor_buffer[i + 1];
+				editor_length--;
+				editor_dirty = 1;
+				editor_hex_nibble = 0;
+				editor_render();
+			}
+		}
+		return;
+	}
+
+	if (c == 0x08 || c == 0x7F)
+	{
+		if (editor_has_selection())
+		{
+			editor_delete_selection();
+			editor_render();
+		}
+		else if (editor_cursor > 0)
+		{
+			for (i = editor_cursor - 1; i < editor_length - 1; i++) editor_buffer[i] = editor_buffer[i + 1];
+			editor_cursor--;
+			editor_length--;
+			editor_buffer[editor_length] = '\0';
+			editor_dirty = 1;
+			editor_clear_selection();
+			editor_render();
+		}
+		return;
+	}
+
+	if (c == '\r' || c == '\n') c = '\n';
+	if (!(c == '\n' || c == '\t' || (c >= 0x20 && c <= 0x7E))) return;
+	if (!editor_insert_text(&c, 1)) editor_status_line("[editor] buffer full");
+	else editor_render();
 }
 
 /* ================================================================== */
@@ -5278,9 +5921,27 @@ static void handle_scancode(unsigned char scancode)
 		if (scancode == 0x48) { handle_arrow_up(); return; }
 		if (scancode == 0x50) { handle_arrow_down(); return; }
 		if (scancode == 0x4B && cursor_pos > 0)  /* Left */
-		{ cursor_pos--; screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos)); return; }
+		{
+			if (ctrl_held)
+			{
+				while (cursor_pos > 0 && !char_is_word(input_buffer[cursor_pos - 1])) cursor_pos--;
+				while (cursor_pos > 0 && char_is_word(input_buffer[cursor_pos - 1])) cursor_pos--;
+			}
+			else cursor_pos--;
+			screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+			return;
+		}
 		if (scancode == 0x4D && cursor_pos < input_length)  /* Right */
-		{ cursor_pos++; screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos)); return; }
+		{
+			if (ctrl_held)
+			{
+				while (cursor_pos < input_length && char_is_word(input_buffer[cursor_pos])) cursor_pos++;
+				while (cursor_pos < input_length && !char_is_word(input_buffer[cursor_pos])) cursor_pos++;
+			}
+			else cursor_pos++;
+			screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+			return;
+		}
 		if (scancode == 0x47) /* Home */
 		{ cursor_pos = 0; screen_set_hw_cursor(prompt_vga_start); return; }
 		if (scancode == 0x4F) /* End */
@@ -5353,7 +6014,11 @@ static void handle_serial_input_char(char c)
 			} \
 		} while (0)
 
-	if (editor_active) return;
+	if (editor_active)
+	{
+		editor_handle_serial_char(c);
+		return;
+	}
 	if (script_mode_active) return;
 
 	if (esc_state == 1)
@@ -5523,5 +6188,32 @@ void terminal_poll(void)
 		scancode_queue_tail = (scancode_queue_tail + 1) % SCANCODE_QUEUE_SIZE;
 		handle_scancode(sc);
 	}
+}
+
+int terminal_read_line(char *out, unsigned long out_size)
+{
+	if (out == (void *)0 || out_size == 0) return -1;
+	if (editor_active || script_mode_active || terminal_capture_mode) return -1;
+
+	terminal_capture_mode = 1;
+	terminal_capture_done = 0;
+	terminal_capture_out = out;
+	terminal_capture_out_size = out_size;
+
+	input_length = 0;
+	cursor_pos = 0;
+	input_buffer[0] = '\0';
+	prompt_vga_start = screen_get_pos();
+	screen_set_hw_cursor(prompt_vga_start);
+
+	while (!terminal_capture_done)
+	{
+		terminal_poll();
+	}
+
+	terminal_capture_mode = 0;
+	terminal_capture_out = (void *)0;
+	terminal_capture_out_size = 0;
+	return 0;
 }
 

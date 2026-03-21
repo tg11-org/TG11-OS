@@ -8,5 +8,6 @@ void terminal_write(const char *str);
 void terminal_write_line(const char *str);
 void terminal_write_hex64(unsigned long v);
 void terminal_write_hex8(unsigned char v);
+int terminal_read_line(char *out, unsigned long out_size);
 
 #endif

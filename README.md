@@ -36,6 +36,16 @@ make run-disk
 
 - Boots from `TG11-DISK.img` (`-boot c`) and also attaches `TG11-DATA.img`.
 
+### Host paste-friendly run mode (serial stdio)
+
+```bash
+make run-disk-serial
+```
+
+- Opens a host terminal-connected serial console via QEMU `-serial stdio`.
+- You can paste from your host directly into the guest shell through that terminal.
+- Current on-screen text selection inside the guest display is not implemented yet.
+
 ## Shell Quickstart
 
 ### General
@@ -77,11 +87,20 @@ make run-disk
 ## Tiny BASIC
 
 Supported statements:
-- `PRINT "text"` or `PRINT A`
-- `LET A = 10`
-- `ADD A 1`
-- `IF A < 5 THEN 30`
-- `GOTO 30`
-- `END`
+- `PRINT "text"`, `PRINT A`, or mixed `PRINT "A=", A`
+- `PRINT ...;` (suppress newline), `TAB(n)`, `SPC(n)`
+- `LET A = (B + 2) * 3` (supports `+ - * / %` and parentheses)
+- `DIM A(32)` and indexed access via `A(I)`
+- `LET A$ = "hello"` and `PRINT A$` for simple string variables (`A$..Z$`)
+- String helpers: `CHR$(n)`, `STR$(n)` and concatenation in string expressions
+- `ADD A n`, `SUB A n`, `MUL A n`, `DIV A n`, `MOD A n`
+- `FOR I = 1 TO 10 [STEP n]` with `NEXT [I]`
+- `INPUT A` / `INPUT A$` and `INPUT "Prompt: "; A`
+- Numeric built-ins: `ABS(x)`, `RND(n)`, `LEN(s$)`, `VAL(s$)`, `ASC(s$)`
+- `IF <expr> <op> <expr> THEN <label>` (`=`, `==`, `!=`, `<>`, `<`, `<=`, `>`, `>=`)
+- `ON <expr> GOTO <l1,l2,...>` and `ON <expr> GOSUB <l1,l2,...>`
+- `DATA ...`, `READ ...`, `RESTORE [label]`
+- `GOTO <label>`, `GOSUB <label>`, `RETURN`
+- `LIST`, `RUN`, `END`, `STOP`
 
-Example file: [scripts/demo.bas](scripts/demo.bas)
+Example file: [scripts/tiny-basic-demo.bas](scripts/tiny-basic-demo.bas)
