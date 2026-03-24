@@ -1,7 +1,6 @@
 #include "fs.h"
 
 #define FS_MAX_NODES      256
-#define FS_MAX_FILE_SIZE  2048
 
 struct fs_node
 {

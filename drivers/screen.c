@@ -6,14 +6,17 @@ static volatile unsigned short *const VGA = (unsigned short *)0xB8000;
 static volatile unsigned char *const VGA_FONT = (unsigned char *)0xA0000;
 
 #define FB_FONT_W    8
-#define FB_MAX_COLS 160
-#define FB_MAX_ROWS 80
+#define FB_MAX_COLS 256
+#define FB_MAX_ROWS 144
 #define FB_GLYPH_FIRST 32
 #define FB_GLYPH_LAST 126
 #define FB_GLYPH_COUNT (FB_GLYPH_LAST - FB_GLYPH_FIRST + 1)
 
 #define FB_FONT_STYLE_CLASSIC 0
 #define FB_FONT_STYLE_BLOCKY  1
+#define SCREEN_CURSOR_UNDERLINE 0
+#define SCREEN_CURSOR_BLOCK     1
+#define SCREEN_CURSOR_BAR       2
 
 enum screen_backend
 {
@@ -30,6 +33,7 @@ static unsigned long fb_rows = 0;
 static unsigned long screen_row = 0;
 static unsigned long screen_col = 0;
 static unsigned char screen_color = 0x0F;
+static unsigned char screen_style = 0;
 
 static int vga_font_saved = 0;
 static unsigned char vga_font_16[256][16];
@@ -44,7 +48,9 @@ static unsigned int fb_cell_h = 14;
 static unsigned int fb_cursor_offset = 0xFFFFFFFFU;
 static char fb_chars[FB_MAX_COLS * FB_MAX_ROWS];
 static unsigned char fb_attrs[FB_MAX_COLS * FB_MAX_ROWS];
+static unsigned char fb_styles[FB_MAX_COLS * FB_MAX_ROWS];
 static int fb_font_style = FB_FONT_STYLE_CLASSIC;
+static int screen_cursor_style = SCREEN_CURSOR_UNDERLINE;
 static unsigned char fb_custom_valid[FB_GLYPH_COUNT];
 static unsigned char fb_custom_rows[FB_GLYPH_COUNT][7];
 
@@ -164,6 +170,23 @@ static void vga_set_cursor_shape(unsigned char start, unsigned char end)
 static void vga_hide_cursor(void)
 {
 	vga_crtc_write(0x0A, 0x20);
+}
+
+static void vga_apply_cursor_style(void)
+{
+	if (vga_height >= 50)
+	{
+		if (screen_cursor_style == SCREEN_CURSOR_BLOCK) vga_set_cursor_shape(0x00, 0x07);
+		else if (screen_cursor_style == SCREEN_CURSOR_BAR) vga_set_cursor_shape(0x00, 0x07);
+		else vga_set_cursor_shape(0x06, 0x07);
+	}
+	else
+	{
+		if (screen_cursor_style == SCREEN_CURSOR_BLOCK) vga_set_cursor_shape(0x00, 0x0F);
+		else if (screen_cursor_style == SCREEN_CURSOR_BAR) vga_set_cursor_shape(0x00, 0x0F);
+		else vga_set_cursor_shape(0x0E, 0x0F);
+	}
+	if (backend == SCREEN_BACKEND_VGA) screen_set_hw_cursor((unsigned short)(screen_row * active_width() + screen_col));
 }
 
 static void vga_set_scanline_height(unsigned char max_scanline)
@@ -404,6 +427,19 @@ static unsigned char fb_builtin_font_bits(char ch, unsigned long gy)
 	return fb_expand_row_5_to_8(bits);
 }
 
+static unsigned char fb_apply_style_bits(unsigned char bits, unsigned long gy, unsigned char style)
+{
+	if (style & SCREEN_STYLE_ITALIC)
+	{
+		if (gy < fb_cell_h / 3) bits = (unsigned char)(bits >> 1);
+		else if (gy + fb_cell_h / 3 >= fb_cell_h) bits = (unsigned char)((bits << 1) & 0xFE);
+	}
+	if (style & SCREEN_STYLE_BOLD) bits |= (unsigned char)(bits >> 1);
+	if ((style & SCREEN_STYLE_STRIKE) && (gy == fb_cell_h / 2 || gy + 1 == fb_cell_h / 2)) bits = 0xFF;
+	if ((style & SCREEN_STYLE_UNDERLINE) && gy + 2 >= fb_cell_h) bits = 0xFF;
+	return bits;
+}
+
 static void fb_draw_cursor_overlay(unsigned long offset)
 {
 	unsigned long row;
@@ -418,6 +454,29 @@ static void fb_draw_cursor_overlay(unsigned long offset)
 	col = offset % fb_cols;
 	attr = fb_attrs[offset];
 	fg = vga_palette_rgb[attr & 0x0F];
+
+	if (screen_cursor_style == SCREEN_CURSOR_BLOCK)
+	{
+		for (gy = 0; gy < fb_cell_h; gy++)
+		{
+			for (gx = 0; gx < FB_FONT_W; gx++)
+			{
+				fb_plot((unsigned int)(col * FB_FONT_W + gx), (unsigned int)(row * fb_cell_h + gy), fg);
+			}
+		}
+		return;
+	}
+	if (screen_cursor_style == SCREEN_CURSOR_BAR)
+	{
+		for (gy = 0; gy < fb_cell_h; gy++)
+		{
+			for (gx = 0; gx < 2; gx++)
+			{
+				fb_plot((unsigned int)(col * FB_FONT_W + gx), (unsigned int)(row * fb_cell_h + gy), fg);
+			}
+		}
+		return;
+	}
 
 	for (gy = fb_cell_h - 2; gy < fb_cell_h; gy++)
 	{
@@ -451,6 +510,7 @@ static void fb_render_cell(unsigned long offset)
 	for (gy = 0; gy < fb_cell_h; gy++)
 	{
 		bits = fb_builtin_font_bits((char)ch, gy);
+		bits = fb_apply_style_bits(bits, gy, fb_styles[offset]);
 		for (gx = 0; gx < FB_FONT_W; gx++)
 		{
 			unsigned int color = (bits & (0x80 >> gx)) ? fg : bg;
@@ -474,6 +534,7 @@ static void fb_clear_shadow(void)
 	{
 		fb_chars[i] = ' ';
 		fb_attrs[i] = screen_color;
+		fb_styles[i] = 0;
 	}
 	fb_cursor_offset = 0xFFFFFFFFU;
 	if (fb_cols > 0 && fb_rows > 0) fb_fill_rect(0, 0, fb_w, fb_h, vga_palette_rgb[(screen_color >> 4) & 0x0F]);
@@ -492,6 +553,7 @@ static void fb_scroll(void)
 			unsigned long src = row * fb_cols + col;
 			fb_chars[dst] = fb_chars[src];
 			fb_attrs[dst] = fb_attrs[src];
+			fb_styles[dst] = fb_styles[src];
 		}
 	}
 	for (col = 0; col < fb_cols; col++)
@@ -499,6 +561,7 @@ static void fb_scroll(void)
 		unsigned long last = (fb_rows - 1) * fb_cols + col;
 		fb_chars[last] = ' ';
 		fb_attrs[last] = screen_color;
+		fb_styles[last] = 0;
 	}
 	screen_row = fb_rows - 1;
 	fb_redraw_all();
@@ -588,6 +651,21 @@ void screen_set_color(unsigned char color)
 	screen_color = color;
 }
 
+unsigned char screen_get_color(void)
+{
+	return screen_color;
+}
+
+void screen_set_style(unsigned char style)
+{
+	screen_style = style;
+}
+
+unsigned char screen_get_style(void)
+{
+	return screen_style;
+}
+
 unsigned short screen_get_pos(void)
 {
 	return (unsigned short)(screen_row * active_width() + screen_col);
@@ -629,17 +707,50 @@ void screen_set_hw_cursor(unsigned short offset)
 
 void screen_write_char_at(unsigned short offset, char c)
 {
+	screen_write_cell_at(offset, c, screen_color, screen_style);
+}
+
+void screen_write_cell_at(unsigned short offset, char c, unsigned char color, unsigned char style)
+{
 	if (backend == SCREEN_BACKEND_FB)
 	{
 		unsigned long total = fb_cols * fb_rows;
 		if (offset >= total) return;
 		fb_chars[offset] = c;
-		fb_attrs[offset] = screen_color;
+		fb_attrs[offset] = color;
+		fb_styles[offset] = style;
 		fb_render_cell(offset);
 		if (offset == fb_cursor_offset) fb_draw_cursor_overlay(offset);
 		return;
 	}
-	VGA[offset] = ((unsigned short)screen_color << 8) | (unsigned char)c;
+	VGA[offset] = ((unsigned short)color << 8) | (unsigned char)c;
+}
+
+void screen_read_char_at(unsigned short offset, char *c, unsigned char *color)
+{
+	screen_read_cell_at(offset, c, color, (void *)0);
+}
+
+void screen_read_cell_at(unsigned short offset, char *c, unsigned char *color, unsigned char *style)
+{
+	if (c != (void *)0) *c = ' ';
+	if (color != (void *)0) *color = 0x0F;
+	if (style != (void *)0) *style = 0;
+	if (backend == SCREEN_BACKEND_FB)
+	{
+		unsigned long total = fb_cols * fb_rows;
+		if (offset >= total) return;
+		if (c != (void *)0) *c = fb_chars[offset];
+		if (color != (void *)0) *color = fb_attrs[offset];
+		if (style != (void *)0) *style = fb_styles[offset];
+		return;
+	}
+	if (offset >= vga_width * vga_height) return;
+	{
+		unsigned short cell = VGA[offset];
+		if (c != (void *)0) *c = (char)(cell & 0x00FF);
+		if (color != (void *)0) *color = (unsigned char)((cell >> 8) & 0x00FF);
+	}
 }
 
 unsigned long screen_get_width(void)
@@ -659,7 +770,7 @@ void screen_set_text_mode_80x25(void)
 	vga_width = 80;
 	vga_height = 25;
 	vga_set_scanline_height(0x0F);
-	vga_set_cursor_shape(0x0E, 0x0F);
+	vga_apply_cursor_style();
 	screen_clear();
 	screen_set_hw_cursor(0);
 }
@@ -676,7 +787,7 @@ void screen_set_text_mode_80x50(void)
 	vga_width = 80;
 	vga_height = 50;
 	vga_set_scanline_height(0x07);
-	vga_set_cursor_shape(0x06, 0x07);
+	vga_apply_cursor_style();
 	screen_clear();
 	screen_set_hw_cursor(0);
 }
@@ -702,6 +813,20 @@ int screen_set_framebuffer_text_mode(void)
 	vga_hide_cursor();
 	screen_clear();
 	screen_set_hw_cursor(0);
+	return 1;
+}
+
+int screen_get_cursor_style(void)
+{
+	return screen_cursor_style;
+}
+
+int screen_set_cursor_style(int style)
+{
+	if (!(style == SCREEN_CURSOR_UNDERLINE || style == SCREEN_CURSOR_BLOCK || style == SCREEN_CURSOR_BAR)) return 0;
+	screen_cursor_style = style;
+	if (backend == SCREEN_BACKEND_FB) fb_redraw_all();
+	else vga_apply_cursor_style();
 	return 1;
 }
 

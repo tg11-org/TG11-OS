@@ -24,6 +24,7 @@ ISO_DIR := iso
 ISO_NAME := TG11-OS.iso
 BOOT_DISK_NAME := TG11-DISK.img
 DATA_DISK_NAME := TG11-DATA.img
+OVMF_CODE := /usr/share/OVMF/OVMF_CODE.fd
 
 CORE_OBJS := \
 	$(BUILD_DIR)/longmode64.o \
@@ -38,6 +39,8 @@ CORE_OBJS := \
 	$(BUILD_DIR)/blockdev.o \
 	$(BUILD_DIR)/mouse.o \
 	$(BUILD_DIR)/memmap.o \
+	$(BUILD_DIR)/memory.o \
+	$(BUILD_DIR)/elf.o \
 	$(BUILD_DIR)/framebuffer.o \
 	$(BUILD_DIR)/fs.o \
 	$(BUILD_DIR)/fat32.o \
@@ -102,6 +105,12 @@ $(BUILD_DIR)/mouse.o: drivers/mouse.c Makefile | $(BUILD_DIR)
 $(BUILD_DIR)/memmap.o: kernel/memmap.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/memory.o: kernel/memory.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/elf.o: kernel/elf.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/framebuffer.o: kernel/framebuffer.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -142,32 +151,68 @@ format-data-disk:
 
 run: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
 
 run-big: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -boot d -display gtk,zoom-to-fit=on -full-screen -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -boot d -display gtk,zoom-to-fit=on -full-screen -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
 
 run-debug: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -no-reboot -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -no-reboot -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
 
 run-disk: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -D QEMU.log -d cpu_reset
 
 run-disk-big: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -boot c -display gtk,zoom-to-fit=on -full-screen -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -display gtk,zoom-to-fit=on -full-screen -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -D QEMU.log -d cpu_reset
 
 run-disk-debug: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -no-reboot -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -no-reboot -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
 
 run-disk-serial: $(BOOT_DISK_NAME) prepare-data-disk
-	qemu-system-x86_64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
+
+run-safe: $(ISO_NAME) prepare-data-disk
+	rm -f QEMU.log
+	qemu-system-x86_64 -vga std -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -D QEMU.log -d cpu_reset
+
+run-disk-safe: $(BOOT_DISK_NAME) prepare-data-disk
+	rm -f QEMU.log
+	qemu-system-x86_64 -vga std -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -D QEMU.log -d cpu_reset
+
+run-disk-safe-serial: $(BOOT_DISK_NAME) prepare-data-disk
+	qemu-system-x86_64 -vga std -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
+
+run-hires: $(ISO_NAME) prepare-data-disk
+	rm -f QEMU.log
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -D QEMU.log -d cpu_reset
+
+run-disk-hires: $(BOOT_DISK_NAME) prepare-data-disk
+	rm -f QEMU.log
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -D QEMU.log -d cpu_reset
+
+run-disk-hires-serial: $(BOOT_DISK_NAME) prepare-data-disk
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
+
+run-uefi-hires: $(ISO_NAME) prepare-data-disk
+	@if [ ! -f $(OVMF_CODE) ]; then echo "error: OVMF firmware not found at $(OVMF_CODE)"; echo "install package: ovmf"; exit 1; fi
+	rm -f QEMU.log
+	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+
+run-disk-uefi-hires: $(BOOT_DISK_NAME) prepare-data-disk
+	@if [ ! -f $(OVMF_CODE) ]; then echo "error: OVMF firmware not found at $(OVMF_CODE)"; echo "install package: ovmf"; exit 1; fi
+	rm -f QEMU.log
+	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+
+run-disk-uefi-hires-serial: $(BOOT_DISK_NAME) prepare-data-disk
+	@if [ ! -f $(OVMF_CODE) ]; then echo "error: OVMF firmware not found at $(OVMF_CODE)"; echo "install package: ovmf"; exit 1; fi
+	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_DIR)/boot/kernel-fb.elf $(ISO_NAME) $(BOOT_DISK_NAME) $(DATA_DISK_NAME) QEMU.log
 
-.PHONY: all run run-big run-debug run-disk run-disk-big run-disk-debug run-disk-serial prepare-data-disk format-data-disk clean
+.PHONY: all run run-big run-debug run-disk run-disk-big run-disk-debug run-disk-serial run-safe run-disk-safe run-disk-safe-serial run-hires run-disk-hires run-disk-hires-serial run-uefi-hires run-disk-uefi-hires run-disk-uefi-hires-serial prepare-data-disk format-data-disk clean

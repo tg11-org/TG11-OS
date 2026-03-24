@@ -1,20 +1,33 @@
 #ifndef TG11_SCREEN_H
 #define TG11_SCREEN_H
 
+
+#define SCREEN_STYLE_BOLD      0x01
+#define SCREEN_STYLE_ITALIC    0x02
+#define SCREEN_STYLE_UNDERLINE 0x04
+#define SCREEN_STYLE_STRIKE    0x08
 void screen_clear(void);
 void screen_putchar(char c);
 void screen_write(const char *str);
 void screen_backspace(void);
 void screen_set_color(unsigned char color);
+unsigned char screen_get_color(void);
 unsigned short screen_get_pos(void);
+void screen_set_style(unsigned char style);
+unsigned char screen_get_style(void);
 void screen_set_pos(unsigned short offset);
 void screen_set_hw_cursor(unsigned short offset);
 void screen_write_char_at(unsigned short offset, char c);
+void screen_read_char_at(unsigned short offset, char *c, unsigned char *color);
 unsigned long screen_get_width(void);
+void screen_write_cell_at(unsigned short offset, char c, unsigned char color, unsigned char style);
+void screen_read_cell_at(unsigned short offset, char *c, unsigned char *color, unsigned char *style);
 unsigned long screen_get_height(void);
 void screen_set_text_mode_80x25(void);
 void screen_set_text_mode_80x50(void);
 int screen_set_framebuffer_text_mode(void);
+int screen_get_cursor_style(void);
+int screen_set_cursor_style(int style);
 int screen_fbfont_get_style(void);
 int screen_fbfont_set_style(int style);
 unsigned int screen_fbfont_get_size(void);

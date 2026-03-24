@@ -11,6 +11,9 @@ void arch_outw(unsigned short port, unsigned short value);
 void arch_io_wait(void);
 void arch_lidt(const void *idtr);
 void arch_lgdt(const void *gdtr);
+unsigned long arch_read_cr3(void);
+void arch_write_cr3(unsigned long value);
+void arch_invlpg(const void *addr);
 void gdt_init(void);
 
 #endif

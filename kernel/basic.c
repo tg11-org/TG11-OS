@@ -1,5 +1,6 @@
 #include "basic.h"
 #include "terminal.h"
+#include "screen.h"
 
 #define BASIC_MAX_LINES 256
 #define BASIC_MAX_STEPS 20000
@@ -908,6 +909,12 @@ int basic_run(char *program_text)
 		if (*s == '\0' || *s == '#') { pc++; continue; }
 		if (b_starts_with_ci(s, "REM")) { pc++; continue; }
 		if (b_starts_with_ci(s, "END") || b_starts_with_ci(s, "STOP")) return 0;
+		if (b_starts_with_ci(s, "CLS") || b_starts_with_ci(s, "CLEAR"))
+		{
+			screen_clear();
+			pc++;
+			continue;
+		}
 
 		if (b_starts_with_ci(s, "LIST"))
 		{
@@ -1633,6 +1640,87 @@ int basic_run(char *program_text)
 				pc++;
 			}
 			continue;
+		}
+
+		/* Allow classic BASIC implicit assignment without LET (e.g. A = 1, P$ = "X"). */
+		if (b_is_alpha(*s))
+		{
+			const char *as = s;
+			int idx;
+			int is_string;
+			int v;
+			int arr_index = -1;
+			char sbuf[BASIC_MAX_STRING_LEN];
+
+			if (b_parse_var_ref(&as, &idx, &is_string) == 0)
+			{
+				as = b_skip_spaces(as);
+				if (!is_string && *as == '(')
+				{
+					as++;
+					if (b_parse_expr(&as, vars, &arr_index) != 0)
+					{
+						B_RT_ERR("assignment array index parse error");
+					}
+					as = b_skip_spaces(as);
+					if (*as != ')')
+					{
+						B_RT_ERR("assignment array missing ')'");
+					}
+					as++;
+					as = b_skip_spaces(as);
+				}
+
+				if (*as == '=')
+				{
+					as++;
+					if (is_string)
+					{
+						as = b_skip_spaces(as);
+						if (*as == '"')
+						{
+							if (b_parse_string_literal(&as, sbuf, sizeof(sbuf)) != 0)
+							{
+								B_RT_ERR("assignment string literal error");
+							}
+						}
+						else if (b_is_alpha(*as))
+						{
+							int src_idx;
+							int src_is_string;
+							const char *sv = as;
+							if (b_parse_var_ref(&sv, &src_idx, &src_is_string) != 0 || !src_is_string)
+							{
+								B_RT_ERR("assignment string value error");
+							}
+							b_copy_string(sbuf, str_vars[src_idx], sizeof(sbuf));
+							as = sv;
+						}
+						else
+						{
+							B_RT_ERR("assignment string value error");
+						}
+						b_copy_string(str_vars[idx], sbuf, BASIC_MAX_STRING_LEN);
+						pc++;
+						continue;
+					}
+
+					if (b_parse_expr(&as, vars, &v) != 0)
+					{
+						B_RT_ERR("assignment value error");
+					}
+					if (arr_index >= 0)
+					{
+						if (b_array_set(idx, arr_index, v) != 0)
+						{
+							B_RT_ERR("assignment array index out of range");
+						}
+					}
+					else vars[idx] = v;
+					pc++;
+					continue;
+				}
+			}
 		}
 
 		B_RT_ERR("unknown statement");

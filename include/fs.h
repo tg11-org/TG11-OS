@@ -3,6 +3,7 @@
 
 #define FS_NAME_MAX 31
 #define FS_MAX_LIST 64
+#define FS_MAX_FILE_SIZE 8192
 
 void fs_init(void);
 

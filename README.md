@@ -35,6 +35,16 @@ make run-disk
 ```
 
 - Boots from `TG11-DISK.img` (`-boot c`) and also attaches `TG11-DATA.img`.
+- Uses the high-res-friendly path (`std` VGA + kernel framebuffer upscale when available).
+
+### Safe fallback run targets
+
+```bash
+make run-safe
+make run-disk-safe
+```
+
+- Uses conservative VGA launch settings if you need a fallback for host-specific QEMU issues.
 
 ### Host paste-friendly run mode (serial stdio)
 
@@ -52,11 +62,18 @@ make run-disk-serial
 - `help`, `help fs`, `help disk`
 - `version`
 - `color preview [text|prompt]`
-- `display [show|vga25|vga50|fb]`
+- `display [show|vga25|vga50|fb|mode <show|list|1080p|900p|768p|720p|WIDTHxHEIGHT[xBPP]>]`
 - `fbfont [show|list|style|size|reset|glyph|save|load]`
 - `clear`, `reboot`, `shutdown`
 - `run [-x] <path>` (shell script runner)
 - `basic <path>` (Tiny BASIC text program runner)
+
+### Editor keys
+- `Ctrl+S` save
+- `Ctrl+F` find (Enter for next match, Shift+Enter for previous, Esc to cancel)
+- `Ctrl+C/X/V` copy/cut/paste selection
+- `Shift+Arrow` selection, `Ctrl+Arrow` word jumps
+- Exiting editor restores the previous terminal screen context (alternate-screen style)
 
 ### Filesystem (auto-routes to FAT after `fatmount`)
 - `pwd`, `ls [path]`, `cd <path>`

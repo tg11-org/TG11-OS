@@ -11,6 +11,8 @@
 #include "fat32.h"
 #include "basic.h"
 #include "framebuffer.h"
+#include "memory.h"
+#include "elf.h"
 
 #define INPUT_BUFFER_SIZE 128
 #define SCANCODE_QUEUE_SIZE 256
@@ -32,6 +34,7 @@
 #define FBFONT_DIR "/fonts"
 #define MB2_TAG_END 0
 #define MB2_TAG_CMDLINE 1
+#define EDITOR_SCREEN_SNAPSHOT_MAX_CELLS (256UL * 144UL)
 
 /* ------------------------------------------------------------------ */
 /* Scancode ring buffer                                               */
@@ -49,6 +52,7 @@ static unsigned long  cursor_pos     = 0;     /* insert point 0..input_length */
 static unsigned short prompt_vga_start = 0;   /* VGA offset right after "> " */
 static int terminal_selection_active = 0;
 static unsigned long terminal_selection_anchor = 0;
+static unsigned long terminal_last_drawn_length = 0;
 
 /* ------------------------------------------------------------------ */
 /* Keyboard modifier state                                            */
@@ -102,9 +106,9 @@ static char editor_sh_keywords[EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LE
 };
 static unsigned long editor_sh_keyword_count = 16;
 static char editor_basic_keywords[EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN] = {
-	"PRINT", "LET", "DIM", "IF", "THEN", "GOTO", "GOSUB", "RETURN", "ON", "FOR", "TO", "STEP", "NEXT", "INPUT", "DATA", "READ", "RESTORE", "TAB", "SPC", "ABS", "RND", "LEN", "VAL", "ASC", "CHR$", "STR$", "REM", "END", "STOP", "LIST", "RUN"
+	"PRINT", "LET", "DIM", "IF", "THEN", "GOTO", "GOSUB", "RETURN", "ON", "FOR", "TO", "STEP", "NEXT", "INPUT", "DATA", "READ", "RESTORE", "TAB", "SPC", "ABS", "RND", "LEN", "VAL", "ASC", "CHR$", "STR$", "REM", "END", "STOP", "LIST", "RUN", "CLS", "CLEAR"
 };
-static unsigned long editor_basic_keyword_count = 31;
+static unsigned long editor_basic_keyword_count = 33;
 static char editor_custom_tokens[EDITOR_THEME_CUSTOM_GROUP_MAX][EDITOR_THEME_KEYWORD_MAX][EDITOR_THEME_KEYWORD_LEN];
 static unsigned long editor_custom_token_counts[EDITOR_THEME_CUSTOM_GROUP_MAX] = {0, 0, 0, 0};
 static int editor_active = 0;
@@ -130,6 +134,24 @@ static unsigned long editor_view_top = 0;
 static unsigned short editor_vga_start = 0;
 static unsigned short editor_prev_end = 0;
 static int editor_dirty = 0;
+static int editor_find_active = 0;
+static char editor_find_query[64];
+static unsigned long editor_find_query_length = 0;
+static char editor_find_last_query[64];
+static unsigned long editor_find_last_query_length = 0;
+static int editor_find_match_valid = 0;
+static unsigned long editor_find_match_start = 0;
+static unsigned long editor_find_match_end = 0;
+static int editor_screen_saved = 0;
+static unsigned long editor_screen_saved_width = 0;
+static unsigned long editor_screen_saved_height = 0;
+static unsigned long editor_screen_saved_cells = 0;
+static unsigned short editor_screen_saved_pos = 0;
+static unsigned char editor_screen_saved_color = 0x0F;
+static unsigned char editor_screen_saved_style = 0;
+static char editor_screen_saved_chars[EDITOR_SCREEN_SNAPSHOT_MAX_CELLS];
+static unsigned char editor_screen_saved_attrs[EDITOR_SCREEN_SNAPSHOT_MAX_CELLS];
+static unsigned char editor_screen_saved_styles[EDITOR_SCREEN_SNAPSHOT_MAX_CELLS];
 static int script_mode_active = 0;
 static int script_depth = 0;
 #define SCRIPT_VAR_MAX 8
@@ -141,6 +163,8 @@ static int string_equals(const char *a, const char *b);
 static int string_equals_ci(const char *a, const char *b);
 static const char *read_token(const char *s, char *out, unsigned long out_size);
 static unsigned long string_length(const char *s);
+static void terminal_clear_selection(void);
+static void terminal_redraw_input_line(void);
 static int fat_mode_active(void);
 static int fat_resolve_path(const char *input, char *out, unsigned long out_size);
 static void editor_handle_scancode(unsigned char scancode);
@@ -168,6 +192,16 @@ static unsigned long editor_move_word_right(unsigned long index);
 static unsigned long editor_line_number_for_index(unsigned long index);
 static int editor_has_more_below(unsigned long top, unsigned long rows);
 static void editor_draw_header(int can_scroll_up, int can_scroll_down);
+static void editor_status_line(const char *msg);
+static void editor_capture_screen(void);
+static void editor_restore_screen(void);
+static void editor_close(int saved, int save_attempted);
+static void editor_find_open(void);
+static void editor_find_cancel(void);
+static int editor_find_next(int advance_from_current);
+static int editor_find_prev(void);
+static void editor_find_invalidate_match(void);
+static int parse_display_mode_spec(const char *spec, unsigned int *width, unsigned int *height, unsigned int *bpp);
 static int editor_open_file(const char *path, int hex_mode);
 static int editor_has_selection(void);
 static unsigned long editor_selection_start(void);
@@ -180,7 +214,6 @@ static void editor_delete_selection(void);
 static void editor_copy_selection(int cut);
 static int editor_insert_text(const char *text, unsigned long len);
 static int parse_color_token(const char *s, unsigned char *out);
-static int starts_with_word_ci(const char *s, const char *word, unsigned long *word_len_out);
 static int token_is_keyword_ci_table(const char *s, unsigned long len, char keywords[][EDITOR_THEME_KEYWORD_LEN], unsigned long keyword_count);
 static int editor_path_has_ext_ci(const char *path, const char *ext);
 static enum editor_lang editor_detect_language_from_path(const char *path);
@@ -208,6 +241,9 @@ static void cmd_fatattr(const char *args);
 static void cmd_serial(const char *args);
 static void cmd_display(const char *args);
 static void cmd_fbfont(const char *args);
+static void cmd_memstat(void);
+static void cmd_pagetest(void);
+static void cmd_exec(const char *args);
 static void print_help_commands(const char *args);
 
 #pragma pack(push, 1)
@@ -286,7 +322,7 @@ static void print_help_basic(void)
 	terminal_write_line("Basic commands:");
 	terminal_write_line("  help [basic|fs|disk] - Show help pages");
 	terminal_write_line("  version              - Show OS version");
-	terminal_write_line("  echo <text>          - Print text");
+	terminal_write_line("  echo <text>          - Print text (\\n \\t \\e, §NN colors, §b/§i/§u/§s styles, §r reset)");
 	terminal_write_line("  glyph <0xNN>         - Print one CP437 glyph byte");
 	terminal_write_line("  charmap              - Show CP437 alias escapes");
 	terminal_write_line("  color show           - Show current colors");
@@ -294,7 +330,7 @@ static void print_help_basic(void)
 	terminal_write_line("  color text <0xNN>    - Set text color attr byte");
 	terminal_write_line("  color prompt <0xNN>  - Set prompt color attr byte");
 	terminal_write_line("  serial [on|off|show|compact <on|off>|rxecho <on|off>] - Serial options");
-	terminal_write_line("  display [show|vga25|vga50|fb] - Switch terminal display mode");
+	terminal_write_line("  display [show|vga25|vga50|fb|mode <show|list|1080p|900p|768p|720p|WIDTHxHEIGHT[xBPP]>|cursor <show|underline|block|bar>] - Switch display mode");
 	terminal_write_line("  fbfont [show|list|style <classic|blocky>|size <small|normal|large>|reset|glyph <ch> <r0..r6>|save <name>|load <name>] - FB font");
 	terminal_write_line("  theme <name>         - Apply system theme from /themes");
 	terminal_write_line("  themes [list]        - List system themes");
@@ -305,6 +341,8 @@ static void print_help_basic(void)
 	terminal_write_line("  reboot               - Reboot the system");
 	terminal_write_line("  shutdown/exit/quit   - Shut down");
 	terminal_write_line("  memmap               - Physical memory map");
+	terminal_write_line("  memstat              - Allocator and paging summary");
+	terminal_write_line("  pagetest             - Paging allocator self-test");
 	terminal_write_line("  hexdump <a> [n]      - Hex dump memory");
 }
 
@@ -318,13 +356,14 @@ static void print_help_fs(void)
 	terminal_write_line("  touch <path>         - Create empty file");
 	terminal_write_line("  write <p> <text>     - Write text");
 	terminal_write_line("  cat <path>           - Read file");
-	terminal_write_line("  rm <path>            - Remove path");
-	terminal_write_line("  cp <src> <dst>       - Copy file");
-	terminal_write_line("  mv <src> <dst>       - Move/rename");
+	terminal_write_line("  rm [-r] [-f] <path>  - Remove path (recursive/force)");
+	terminal_write_line("  cp [-r] [-n] [-i] <src> <dst> - Copy file or directory tree");
+	terminal_write_line("  mv [-n] [-i] <src> <dst>      - Move/rename file or directory");
 	terminal_write_line("  edit <path>          - Edit text file");
 	terminal_write_line("  hexedit <path>       - Edit raw bytes in hex");
 	terminal_write_line("  run [-x] <path>      - Run script (-x echoes lines)");
 	terminal_write_line("  basic <path>         - Run Tiny BASIC program");
+	terminal_write_line("  exec <path>          - Load and run ELF64 kernel binary");
 	terminal_write_line("  script: foreach i in a,b do echo $(i)");
 	terminal_write_line("  fatmount [0|1]       - Mount FAT32 drive (0=master, 1=slave)");
 	terminal_write_line("  drives               - List detected ATA drives");
@@ -464,6 +503,14 @@ static void sync_screen_pos(void)
 	screen_set_pos((unsigned short)(prompt_vga_start + input_length));
 }
 
+static void terminal_draw_prompt_prefix(void)
+{
+	screen_set_color(terminal_prompt_color);
+	screen_write_char_at((unsigned short)(prompt_vga_start - 2), '>');
+	screen_write_char_at((unsigned short)(prompt_vga_start - 1), ' ');
+	screen_set_color(terminal_text_color);
+}
+
 static void terminal_prompt(void)
 {
 	screen_set_color(terminal_prompt_color);
@@ -471,6 +518,8 @@ static void terminal_prompt(void)
 	screen_set_color(terminal_text_color);
 	prompt_vga_start = screen_get_pos();
 	cursor_pos = 0;
+	terminal_last_drawn_length = 0;
+	terminal_clear_selection();
 	screen_set_hw_cursor(prompt_vga_start);
 }
 
@@ -698,19 +747,6 @@ static int starts_with_basic_word_ci(const char *s, const char *word, unsigned l
 	return 1;
 }
 
-static int starts_with_word_ci(const char *s, const char *word, unsigned long *word_len_out)
-{
-	unsigned long i = 0;
-	while (word[i] != '\0')
-	{
-		if (ascii_upper(s[i]) != ascii_upper(word[i])) return 0;
-		i++;
-	}
-	if (word_len_out != (void *)0) *word_len_out = i;
-	if (char_is_word(s[i])) return 0;
-	return 1;
-}
-
 static int token_is_keyword_ci_table(const char *s, unsigned long len, char keywords[][EDITOR_THEME_KEYWORD_LEN], unsigned long keyword_count)
 {
 	unsigned long k;
@@ -917,6 +953,16 @@ static int apply_system_theme_from_text(const char *name, const char *text)
 	terminal_text_color = t_text;
 	terminal_prompt_color = t_prompt;
 	if (!editor_active) screen_set_color(terminal_text_color);
+	if (!editor_active)
+	{
+		screen_clear();
+		prompt_vga_start = screen_get_pos();
+		terminal_last_drawn_length = 0;
+	}
+	if (!editor_active && !script_mode_active && prompt_vga_start >= 2)
+	{
+		terminal_redraw_input_line();
+	}
 
 	if (name != (void *)0)
 	{
@@ -1077,6 +1123,7 @@ static int apply_editor_theme_from_text(const char *name, const char *text)
 	copy_keyword_table(editor_sh_keywords, &editor_sh_keyword_count, sh_keywords, sh_keyword_count);
 	copy_keyword_table(editor_basic_keywords, &editor_basic_keyword_count, basic_keywords, basic_keyword_count);
 	if (editor_active) screen_set_color(editor_text_color);
+	if (editor_active) editor_render();
 
 	if (name != (void *)0)
 	{
@@ -1298,6 +1345,159 @@ static void ensure_theme_files(void)
 			"350 RETURN\n"
 			"900 DATA 7, 42, \"synthwave\"\n");
 	}
+	if (fs_read_text("/scripts/tic-tac-toe.bas", &existing) != 0)
+	{
+		fs_write_text("/scripts/tic-tac-toe.bas",
+			"10 CLS\n"
+			"20 DIM B(9)\n"
+			"30 P = 1\n"
+			"40 FOR I = 1 TO 9\n"
+			"50 B(I) = 0\n"
+			"60 NEXT I\n"
+			"70 GOSUB 500\n"
+			"80 PRINT\n"
+			"90 IF P = 1 THEN 120\n"
+			"100 PRINT \"Player O, choose a square (1-9): \";\n"
+			"110 GOTO 130\n"
+			"120 PRINT \"Player X, choose a square (1-9): \";\n"
+			"130 INPUT M\n"
+			"140 IF M < 1 THEN 170\n"
+			"150 IF M > 9 THEN 170\n"
+			"160 GOTO 190\n"
+			"170 PRINT \"Invalid move.\"\n"
+			"180 GOTO 70\n"
+			"190 IF B(M) <> 0 THEN 210\n"
+			"200 GOTO 230\n"
+			"210 PRINT \"That square is taken.\"\n"
+			"220 GOTO 70\n"
+			"230 B(M) = P\n"
+			"240 GOSUB 1000\n"
+			"250 IF W = 0 THEN 280\n"
+			"260 GOSUB 1500\n"
+			"270 END\n"
+			"280 GOSUB 2000\n"
+			"290 IF D = 0 THEN 320\n"
+			"300 GOSUB 1700\n"
+			"310 END\n"
+			"320 IF P = 1 THEN 340\n"
+			"330 P = 1\n"
+			"335 GOTO 70\n"
+			"340 P = 2\n"
+			"350 GOTO 70\n"
+			"500 CLS\n"
+			"510 PRINT \" TIC-TAC-TOE\"\n"
+			"520 PRINT\n"
+			"530 FOR R = 0 TO 2\n"
+			"540 A = R * 3 + 1\n"
+			"550 GOSUB 800\n"
+			"560 PRINT \" \"; C$;\n"
+			"570 PRINT \" |\";\n"
+			"580 A = R * 3 + 2\n"
+			"590 GOSUB 800\n"
+			"600 PRINT \" \"; C$;\n"
+			"610 PRINT \" |\";\n"
+			"620 A = R * 3 + 3\n"
+			"630 GOSUB 800\n"
+			"640 PRINT \" \"; C$\n"
+			"650 IF R < 2 THEN 670\n"
+			"660 GOTO 680\n"
+			"670 PRINT \"---+---+---\"\n"
+			"680 NEXT R\n"
+			"690 RETURN\n"
+			"800 IF B(A) = 1 THEN 840\n"
+			"810 IF B(A) = 2 THEN 860\n"
+			"820 C$ = STR$(A)\n"
+			"830 RETURN\n"
+			"840 C$ = \"X\"\n"
+			"850 RETURN\n"
+			"860 C$ = \"O\"\n"
+			"870 RETURN\n"
+			"1000 W = 0\n"
+			"1010 GOSUB 1100\n"
+			"1020 IF W <> 0 THEN 1070\n"
+			"1030 GOSUB 1230\n"
+			"1040 IF W <> 0 THEN 1070\n"
+			"1050 GOSUB 1360\n"
+			"1060 IF W <> 0 THEN 1070\n"
+			"1070 RETURN\n"
+			"1100 IF B(1) = 0 THEN 1140\n"
+			"1110 IF B(1) = B(2) THEN 1120\n"
+			"1115 GOTO 1140\n"
+			"1120 IF B(2) = B(3) THEN 1130\n"
+			"1125 GOTO 1140\n"
+			"1130 W = B(1)\n"
+			"1135 RETURN\n"
+			"1140 IF B(4) = 0 THEN 1180\n"
+			"1150 IF B(4) = B(5) THEN 1160\n"
+			"1155 GOTO 1180\n"
+			"1160 IF B(5) = B(6) THEN 1170\n"
+			"1165 GOTO 1180\n"
+			"1170 W = B(4)\n"
+			"1175 RETURN\n"
+			"1180 IF B(7) = 0 THEN 1220\n"
+			"1190 IF B(7) = B(8) THEN 1200\n"
+			"1195 GOTO 1220\n"
+			"1200 IF B(8) = B(9) THEN 1210\n"
+			"1205 GOTO 1220\n"
+			"1210 W = B(7)\n"
+			"1215 RETURN\n"
+			"1220 RETURN\n"
+			"1230 IF B(1) = 0 THEN 1270\n"
+			"1240 IF B(1) = B(4) THEN 1250\n"
+			"1245 GOTO 1270\n"
+			"1250 IF B(4) = B(7) THEN 1260\n"
+			"1255 GOTO 1270\n"
+			"1260 W = B(1)\n"
+			"1265 RETURN\n"
+			"1270 IF B(2) = 0 THEN 1310\n"
+			"1280 IF B(2) = B(5) THEN 1290\n"
+			"1285 GOTO 1310\n"
+			"1290 IF B(5) = B(8) THEN 1300\n"
+			"1295 GOTO 1310\n"
+			"1300 W = B(2)\n"
+			"1305 RETURN\n"
+			"1310 IF B(3) = 0 THEN 1350\n"
+			"1320 IF B(3) = B(6) THEN 1330\n"
+			"1325 GOTO 1350\n"
+			"1330 IF B(6) = B(9) THEN 1340\n"
+			"1335 GOTO 1350\n"
+			"1340 W = B(3)\n"
+			"1345 RETURN\n"
+			"1350 RETURN\n"
+			"1360 IF B(1) = 0 THEN 1400\n"
+			"1370 IF B(1) = B(5) THEN 1380\n"
+			"1375 GOTO 1400\n"
+			"1380 IF B(5) = B(9) THEN 1390\n"
+			"1385 GOTO 1400\n"
+			"1390 W = B(1)\n"
+			"1395 RETURN\n"
+			"1400 IF B(3) = 0 THEN 1440\n"
+			"1410 IF B(3) = B(5) THEN 1420\n"
+			"1415 GOTO 1440\n"
+			"1420 IF B(5) = B(7) THEN 1430\n"
+			"1425 GOTO 1440\n"
+			"1430 W = B(3)\n"
+			"1435 RETURN\n"
+			"1440 RETURN\n"
+			"1500 GOSUB 500\n"
+			"1510 PRINT\n"
+			"1520 IF W = 1 THEN 1540\n"
+			"1530 PRINT \"Player O wins!\"\n"
+			"1535 RETURN\n"
+			"1540 PRINT \"Player X wins!\"\n"
+			"1550 RETURN\n"
+			"1700 GOSUB 500\n"
+			"1710 PRINT\n"
+			"1720 PRINT \"It's a draw!\"\n"
+			"1730 RETURN\n"
+			"2000 D = 1\n"
+			"2010 FOR I = 1 TO 9\n"
+			"2020 IF B(I) = 0 THEN 2040\n"
+			"2030 GOTO 2050\n"
+			"2040 D = 0\n"
+			"2050 NEXT I\n"
+			"2060 RETURN\n");
+	}
 	if (fs_read_text("/scripts/colors.sh", &existing) != 0)
 	{
 		fs_write_text("/scripts/colors.sh",
@@ -1425,6 +1625,67 @@ static int expand_cp437_aliases(const char *in, char *out, unsigned long out_siz
 
 	out[o] = '\0';
 	return 0;
+}
+
+static unsigned char color_bold_variant(unsigned char color)
+{
+	return (unsigned char)((color & 0xF0) | ((color & 0x0F) | 0x08));
+}
+
+static void terminal_write_colored(const char *text, unsigned char color)
+{
+	unsigned char prev = screen_get_color();
+	screen_set_color(color);
+	terminal_write(text);
+	screen_set_color(prev);
+}
+
+static void terminal_write_echo_text(const char *text)
+{
+	unsigned char base_color = terminal_text_color;
+	unsigned char base_style = 0;
+	unsigned long i = 0;
+	screen_set_color(base_color);
+	screen_set_style(base_style);
+
+	while (text[i] != '\0')
+	{
+		if ((text[i] == (char)0xA7 || text[i] == '&') && hex_nibble(text[i + 1]) >= 0 && hex_nibble(text[i + 2]) >= 0)
+		{
+			unsigned char next_color = (unsigned char)((hex_nibble(text[i + 1]) << 4) | hex_nibble(text[i + 2]));
+			screen_set_color(next_color);
+			i += 3;
+			continue;
+		}
+		if (text[i] == (char)0xA7 || text[i] == '&')
+		{
+			unsigned char style = screen_get_style();
+			char code = text[i + 1];
+			if (code == 'b') { screen_set_style((unsigned char)(style | SCREEN_STYLE_BOLD)); i += 2; continue; }
+			if (code == 'B') { screen_set_style((unsigned char)(style & (unsigned char)~SCREEN_STYLE_BOLD)); i += 2; continue; }
+			if (code == 'i') { screen_set_style((unsigned char)(style | SCREEN_STYLE_ITALIC)); i += 2; continue; }
+			if (code == 'I') { screen_set_style((unsigned char)(style & (unsigned char)~SCREEN_STYLE_ITALIC)); i += 2; continue; }
+			if (code == 'u') { screen_set_style((unsigned char)(style | SCREEN_STYLE_UNDERLINE)); i += 2; continue; }
+			if (code == 'U') { screen_set_style((unsigned char)(style & (unsigned char)~SCREEN_STYLE_UNDERLINE)); i += 2; continue; }
+			if (code == 's') { screen_set_style((unsigned char)(style | SCREEN_STYLE_STRIKE)); i += 2; continue; }
+			if (code == 'S') { screen_set_style((unsigned char)(style & (unsigned char)~SCREEN_STYLE_STRIKE)); i += 2; continue; }
+			if (code == 'r') { screen_set_color(base_color); screen_set_style(base_style); i += 2; continue; }
+		}
+		if (text[i] == '\\')
+		{
+			char esc = text[i + 1];
+			if (esc == 'n') { terminal_putc('\n'); i += 2; continue; }
+			if (esc == 'r') { terminal_putc('\r'); i += 2; continue; }
+			if (esc == 't') { terminal_putc('\t'); i += 2; continue; }
+			if (esc == 'e') { terminal_putc(27); i += 2; continue; }
+			if (esc == '\\') { terminal_putc('\\'); i += 2; continue; }
+		}
+		terminal_putc(text[i]);
+		i++;
+	}
+
+	screen_set_color(base_color);
+	screen_set_style(base_style);
 }
 
 static unsigned long editor_visible_rows(void)
@@ -1690,6 +1951,7 @@ static void editor_delete_range(unsigned long start, unsigned long end)
 	editor_buffer[editor_length] = '\0';
 	editor_cursor = start;
 	editor_dirty = 1;
+	editor_find_invalidate_match();
 	editor_clear_selection();
 }
 
@@ -1737,6 +1999,7 @@ static int editor_insert_text(const char *text, unsigned long len)
 	editor_length += len;
 	editor_buffer[editor_length] = '\0';
 	editor_dirty = 1;
+	editor_find_invalidate_match();
 	editor_clear_selection();
 	return 1;
 }
@@ -1992,6 +2255,10 @@ static void editor_render(void)
 				{
 					ch_color = (unsigned char)(0x70 | (ch_color & 0x0F));
 				}
+				else if (editor_find_match_valid && row_end >= editor_find_match_start && row_end < editor_find_match_end)
+				{
+					ch_color = (unsigned char)(0x30 | (ch_color & 0x0F));
+				}
 
 				screen_set_color(ch_color);
 				screen_write_char_at((unsigned short)(row_off + EDITOR_TEXT_GUTTER + col), ch);
@@ -2015,9 +2282,18 @@ static void editor_render(void)
 		if (sh == 0) sh = 25;
 		editor_prev_end = (unsigned short)(editor_vga_start + (rows - 1) * sw);
 	{
-		unsigned long r = editor_cursor_row_from_top(editor_view_top, editor_cursor);
-		unsigned long c = editor_visual_row_col(editor_cursor);
+		unsigned long cursor_index = editor_cursor;
+		unsigned long r;
+		unsigned long c;
 		unsigned short cursor_off;
+		if (cursor_index > 0 && cursor_index <= editor_length)
+		{
+			unsigned long row_start = editor_visual_row_start(cursor_index);
+			if (row_start == cursor_index && editor_buffer[cursor_index - 1] != '\n') cursor_index--;
+		}
+		r = editor_cursor_row_from_top(editor_view_top, cursor_index);
+		c = editor_visual_row_col(cursor_index);
+		if (cursor_index != editor_cursor) c++;
 		if (r >= rows) r = rows - 1;
 		if (c >= editor_text_width()) c = editor_text_width() - 1;
 		cursor_off = (unsigned short)(editor_vga_start + r * sw + EDITOR_TEXT_GUTTER + c);
@@ -2120,7 +2396,7 @@ static int execute_substitution_command(const char *raw_cmd, char *out, unsigned
 		if (fat_mode_active())
 		{
 			char full_path[128];
-			unsigned char data[1024];
+			unsigned char data[FS_MAX_FILE_SIZE];
 			unsigned long size;
 			if (fat_resolve_path(arg, full_path, sizeof(full_path)) != 0) return -1;
 			if (fat32_read_file_path(full_path, data, sizeof(data), &size) != 0) return -1;
@@ -2301,12 +2577,15 @@ static void terminal_redraw_input_line(void)
 	unsigned long i;
 	unsigned long sel_start = 0;
 	unsigned long sel_end = 0;
+	unsigned long clear_to = terminal_last_drawn_length > input_length ? terminal_last_drawn_length : input_length;
+	if (clear_to < input_length + 1) clear_to = input_length + 1;
+	terminal_draw_prompt_prefix();
 	if (terminal_has_selection())
 	{
 		sel_start = terminal_selection_start();
 		sel_end = terminal_selection_end();
 	}
-	for (i = 0; i < INPUT_BUFFER_SIZE - 1; i++)
+	for (i = 0; i < clear_to && i < INPUT_BUFFER_SIZE - 1; i++)
 	{
 		if (i < input_length)
 		{
@@ -2319,18 +2598,11 @@ static void terminal_redraw_input_line(void)
 		{
 			screen_set_color(terminal_text_color);
 			screen_write_char_at((unsigned short)(prompt_vga_start + i), ' ');
-			if (i >= input_length) break;
 		}
 	}
-	if (input_length < INPUT_BUFFER_SIZE - 1)
-	{
-		screen_set_color(terminal_text_color);
-		screen_write_char_at((unsigned short)(prompt_vga_start + input_length), ' ');
-	}
+	terminal_last_drawn_length = input_length;
 	sync_screen_pos();
 	screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-	if (serial_ready) { }
-	/* restore normal text color */
 	screen_set_color(terminal_text_color);
 	terminal_selection_anchor = terminal_selection_active ? terminal_selection_anchor : cursor_pos;
 }
@@ -2387,11 +2659,13 @@ static int terminal_insert_text(const char *text, unsigned long len)
 static void clear_input_line(void)
 {
 	unsigned long i;
-	for (i = 0; i < input_length; i++)
+	unsigned long clear_to = terminal_last_drawn_length > input_length ? terminal_last_drawn_length : input_length;
+	for (i = 0; i < clear_to; i++)
 		screen_write_char_at((unsigned short)(prompt_vga_start + i), ' ');
 	input_length = 0;
 	cursor_pos   = 0;
 	input_buffer[0] = '\0';
+	terminal_last_drawn_length = 0;
 	terminal_clear_selection();
 	screen_set_pos(prompt_vga_start);
 	screen_set_hw_cursor(prompt_vga_start);
@@ -2463,7 +2737,7 @@ static const char * const cmd_list[] = {
 	"help", "version", "echo", "glyph", "charmap", "color", "serial", "display", "themes", "theme", "ethemes", "etheme", "clear", "reboot",
 	"quit", "exit", "shutdown",
 	"pwd", "ls", "cd", "mkdir", "touch", "write", "cat", "rm", "cp", "mv", "edit", "hexedit", "run", "basic",
-	"hexdump", "memmap", "ataid", "readsec", "writesec", "drives", "fatmount", "ramfs", "ramfs2fat", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatattr", "fatrm", (void *)0
+	"hexdump", "memmap", "memstat", "pagetest", "exec", "ataid", "readsec", "writesec", "drives", "fatmount", "ramfs", "ramfs2fat", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatattr", "fatrm", (void *)0
 };
 
 static int parse_dec_u32(const char *s, unsigned int *out)
@@ -2721,6 +2995,218 @@ static void cmd_hexdump(const char *args)
 	}
 }
 
+static void cmd_memstat(void)
+{
+	char num[32];
+	unsigned long total_pages = memory_total_pages();
+	unsigned long free_pages = memory_free_pages();
+	unsigned long used_pages = (total_pages >= free_pages) ? (total_pages - free_pages) : 0;
+	unsigned long total_kib = total_pages * (MEMORY_PAGE_SIZE / 1024UL);
+	unsigned long free_kib = free_pages * (MEMORY_PAGE_SIZE / 1024UL);
+	unsigned long used_kib = used_pages * (MEMORY_PAGE_SIZE / 1024UL);
+
+	terminal_write_line("Memory status:");
+	terminal_write("  total pages: ");
+	uint_to_dec(total_pages, num, sizeof(num));
+	terminal_write_line(num);
+	terminal_write("  free pages:  ");
+	uint_to_dec(free_pages, num, sizeof(num));
+	terminal_write_line(num);
+	terminal_write("  used pages:  ");
+	uint_to_dec(used_pages, num, sizeof(num));
+	terminal_write_line(num);
+	terminal_write("  total KiB:   ");
+	uint_to_dec(total_kib, num, sizeof(num));
+	terminal_write_line(num);
+	terminal_write("  free KiB:    ");
+	uint_to_dec(free_kib, num, sizeof(num));
+	terminal_write_line(num);
+	terminal_write("  used KiB:    ");
+	uint_to_dec(used_kib, num, sizeof(num));
+	terminal_write_line(num);
+
+	terminal_write("  virt base:   ");
+	terminal_write_hex64(memory_virtual_base());
+	terminal_putc('\n');
+	terminal_write("  virt limit:  ");
+	terminal_write_hex64(memory_virtual_limit());
+	terminal_putc('\n');
+	terminal_write("  cr3:         ");
+	terminal_write_hex64(arch_read_cr3());
+	terminal_putc('\n');
+}
+
+static void cmd_pagetest(void)
+{
+	void *ptr;
+	unsigned char *p;
+	unsigned long phys;
+	unsigned int i;
+	unsigned int errors = 0;
+	char num[32];
+
+	terminal_write_line("pagetest: allocating 2 pages via virt_alloc_pages...");
+	ptr = virt_alloc_pages(2);
+	if (ptr == (void *)0)
+	{
+		terminal_write_line("pagetest: FAIL - virt_alloc_pages returned null");
+		return;
+	}
+	terminal_write("  virtual addr: ");
+	terminal_write_hex64((unsigned long)ptr);
+	terminal_putc('\n');
+
+	phys = paging_get_phys((unsigned long)ptr);
+	terminal_write("  physical addr: ");
+	terminal_write_hex64(phys);
+	terminal_putc('\n');
+
+	if (phys == 0)
+	{
+		terminal_write_line("pagetest: FAIL - paging_get_phys returned 0");
+		virt_free_pages(ptr, 2);
+		return;
+	}
+
+	/* Write pattern */
+	p = (unsigned char *)ptr;
+	for (i = 0; i < 8192; i++) p[i] = (unsigned char)(i & 0xFF);
+
+	/* Verify pattern */
+	for (i = 0; i < 8192; i++)
+	{
+		if (p[i] != (unsigned char)(i & 0xFF)) errors++;
+	}
+
+	if (errors == 0)
+	{
+		terminal_write_line("  write/read: OK");
+	}
+	else
+	{
+		terminal_write("  write/read: FAIL - ");
+		uint_to_dec((unsigned long)errors, num, sizeof(num));
+		terminal_write(num);
+		terminal_write_line(" mismatches");
+	}
+
+	/* Test second page's physical address is contiguous */
+	{
+		unsigned long phys2 = paging_get_phys((unsigned long)ptr + MEMORY_PAGE_SIZE);
+		terminal_write("  page1 phys: ");
+		terminal_write_hex64(phys);
+		terminal_putc('\n');
+		terminal_write("  page2 phys: ");
+		terminal_write_hex64(phys2);
+		terminal_putc('\n');
+		(void)phys2;
+	}
+
+	virt_free_pages(ptr, 2);
+	terminal_write_line("  freed: OK");
+
+	/* Verify pages are gone */
+	{
+		unsigned long after = paging_get_phys((unsigned long)ptr);
+		if (after == 0)
+			terminal_write_line("  unmap verify: OK");
+		else
+			terminal_write_line("  unmap verify: FAIL - page still present after free");
+	}
+
+	if (errors == 0)
+		terminal_write_line("pagetest: PASSED");
+	else
+		terminal_write_line("pagetest: FAILED");
+}
+
+static void cmd_exec(const char *args)
+{
+	char path[128];
+	char resolved[128];
+	unsigned char buf[8192];
+	unsigned long size = 0;
+	elf_exec_t prog;
+	int rc;
+	long ret;
+	const char *p = read_token(args, path, sizeof(path));
+
+	if (p == (void *)0 || path[0] == '\0')
+	{
+		terminal_write_line("Usage: exec <path>");
+		return;
+	}
+
+	if (fat_mode_active())
+	{
+		if (fat_resolve_path(path, resolved, sizeof(resolved)) != 0)
+		{
+			terminal_write_line("exec: invalid FAT path");
+			return;
+		}
+		if (fat32_read_file_path(resolved, buf, sizeof(buf), &size) != 0)
+		{
+			terminal_write_line("exec: read failed");
+			return;
+		}
+	}
+	else
+	{
+		if (fs_read_file(path, buf, sizeof(buf), &size) != 0)
+		{
+			terminal_write_line("exec: read failed");
+			return;
+		}
+	}
+
+	terminal_write("[exec] loading ");
+	terminal_write(path);
+	terminal_write_line(" ...");
+
+	rc = elf_load(buf, size, &prog);
+	if (rc != 0)
+	{
+		terminal_write("[exec] load error: ");
+		switch (rc)
+		{
+			case ELF_ERR_MAGIC:  terminal_write_line("bad ELF magic"); break;
+			case ELF_ERR_CLASS:  terminal_write_line("not ELF64"); break;
+			case ELF_ERR_TYPE:   terminal_write_line("not executable or shared"); break;
+			case ELF_ERR_ARCH:   terminal_write_line("not x86-64"); break;
+			case ELF_ERR_PHDR:   terminal_write_line("bad program headers"); break;
+			case ELF_ERR_MAP:    terminal_write_line("page mapping failed"); break;
+			case ELF_ERR_RANGE:  terminal_write_line("segment exceeds file"); break;
+			default:             terminal_write_line("unknown error"); break;
+		}
+		return;
+	}
+
+	terminal_write("[exec] entry: ");
+	terminal_write_hex64(prog.entry);
+	terminal_putc('\n');
+	terminal_write_line("[exec] calling...");
+
+	ret = elf_call(&prog);
+
+	terminal_write("[exec] returned: ");
+	{
+		char retbuf[32];
+		if (ret < 0)
+		{
+			terminal_putc('-');
+			uint_to_dec((unsigned long)(-ret), retbuf, sizeof(retbuf));
+		}
+		else
+		{
+			uint_to_dec((unsigned long)ret, retbuf, sizeof(retbuf));
+		}
+		terminal_write_line(retbuf);
+	}
+
+	elf_unload(buf, size);
+	terminal_write_line("[exec] done");
+}
+
 static void cmd_pwd(void)
 {
 	if (fat_mode_active())
@@ -2877,7 +3363,7 @@ static void cmd_cat(const char *args)
 	if (fat_mode_active())
 	{
 		unsigned long i;
-		unsigned char data[2048];
+		unsigned char data[FS_MAX_FILE_SIZE];
 		unsigned long size;
 		if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
 		{
@@ -2933,95 +3419,584 @@ static void cmd_write(const char *args)
 	if (fs_write_text(path, p) != 0) terminal_write_line("write: failed");
 }
 
+static int rm_path_join(char *out, unsigned long out_size, const char *base, const char *name)
+{
+	unsigned long n = 0;
+	unsigned long i = 0;
+	if (out == (void *)0 || out_size == 0 || base == (void *)0 || name == (void *)0) return -1;
+	if (base[0] == '/' && base[1] == '\0')
+	{
+		if (out_size < 2) return -1;
+		out[n++] = '/';
+	}
+	else
+	{
+		while (base[n] != '\0' && n + 1 < out_size)
+		{
+			out[n] = base[n];
+			n++;
+		}
+		if (base[n] != '\0') return -1;
+		if (n == 0 || out[n - 1] != '/')
+		{
+			if (n + 1 >= out_size) return -1;
+			out[n++] = '/';
+		}
+	}
+	while (name[i] != '\0' && name[i] != '/' && name[i] != '\\')
+	{
+		if (n + 1 >= out_size) return -1;
+		out[n++] = name[i++];
+	}
+	out[n] = '\0';
+	return (i == 0) ? -1 : 0;
+}
+
+static int rm_ramfs_recursive(const char *path, int recursive, int force)
+{
+	char names[FS_MAX_LIST][FS_NAME_MAX + 2];
+	int types[FS_MAX_LIST];
+	int count;
+	int i;
+
+	if (path == (void *)0 || path[0] == '\0') return force ? 0 : -1;
+	if (path[0] == '/' && path[1] == '\0') return force ? 0 : -1;
+
+	if (fs_ls(path, names, types, FS_MAX_LIST, &count) == 0)
+	{
+		if (!recursive) return force ? 0 : fs_rm(path);
+		while (count > 0)
+		{
+			for (i = 0; i < count; i++)
+			{
+				char child_path[128];
+				if (rm_path_join(child_path, sizeof(child_path), path, names[i]) != 0)
+				{
+					if (!force) return -1;
+					continue;
+				}
+				if (rm_ramfs_recursive(child_path, 1, force) != 0 && !force) return -1;
+			}
+			if (fs_ls(path, names, types, FS_MAX_LIST, &count) != 0) break;
+		}
+	}
+	if (fs_rm(path) != 0) return force ? 0 : -1;
+	return 0;
+}
+
+static int rm_fat_recursive(const char *path, int recursive, int force)
+{
+	char names[64][40];
+	int count;
+	int i;
+
+	if (path == (void *)0 || path[0] == '\0') return force ? 0 : -1;
+	if (path[0] == '/' && path[1] == '\0') return force ? 0 : -1;
+
+	if (fat32_ls_path(path, names, 64, &count) == 0)
+	{
+		if (!recursive) return force ? 0 : fat32_remove_path(path);
+		while (count > 0)
+		{
+			for (i = 0; i < count; i++)
+			{
+				char child_path[128];
+				if (rm_path_join(child_path, sizeof(child_path), path, names[i]) != 0)
+				{
+					if (!force) return -1;
+					continue;
+				}
+				if (rm_fat_recursive(child_path, 1, force) != 0 && !force) return -1;
+			}
+			if (fat32_ls_path(path, names, 64, &count) != 0) break;
+		}
+	}
+	if (fat32_remove_path(path) != 0) return force ? 0 : -1;
+	return 0;
+}
+
+static const char *path_basename_part(const char *path)
+{
+	const char *base = path;
+	if (path == (void *)0) return "";
+	while (*path != '\0')
+	{
+		if (*path == '/' || *path == '\\') base = path + 1;
+		path++;
+	}
+	return base;
+}
+
+static int ramfs_path_is_dir(const char *path)
+{
+	char names[FS_MAX_LIST][FS_NAME_MAX + 2];
+	int types[FS_MAX_LIST];
+	int count;
+	return fs_ls(path, names, types, FS_MAX_LIST, &count) == 0;
+}
+
+static int fat_path_is_dir(const char *path)
+{
+	unsigned char attr;
+	return fat32_get_attr_path(path, &attr) == 0 && (attr & 0x10) != 0;
+}
+
+static int ramfs_path_exists(const char *path)
+{
+	unsigned long size = 0;
+	char names[FS_MAX_LIST][FS_NAME_MAX + 2];
+	int types[FS_MAX_LIST];
+	int count;
+	if (path == (void *)0 || path[0] == '\0') return 0;
+	if (fs_read_file(path, (void *)0, 0, &size) == 0) return 1;
+	return fs_ls(path, names, types, FS_MAX_LIST, &count) == 0;
+}
+
+static int fat_path_exists(const char *path)
+{
+	unsigned char attr;
+	if (path == (void *)0 || path[0] == '\0') return 0;
+	return fat32_get_attr_path(path, &attr) == 0;
+}
+
+static void path_copy_text(char *dst, unsigned long dst_size, const char *src)
+{
+	unsigned long i = 0;
+	if (dst == (void *)0 || dst_size == 0) return;
+	while (src != (void *)0 && src[i] != '\0' && i + 1 < dst_size)
+	{
+		dst[i] = src[i];
+		i++;
+	}
+	dst[i] = '\0';
+}
+
+static int prompt_overwrite(const char *op, const char *path)
+{
+	char answer[8];
+	terminal_write(op);
+	terminal_write(": overwrite ");
+	terminal_write(path);
+	terminal_write("? [y/N] ");
+	if (terminal_read_line(answer, sizeof(answer)) != 0) return 0;
+	return answer[0] == 'y' || answer[0] == 'Y';
+}
+
+static int resolve_copy_target_ramfs(const char *src, const char *dst, char *target, unsigned long target_size)
+{
+	if (ramfs_path_is_dir(dst)) return rm_path_join(target, target_size, dst, path_basename_part(src));
+	path_copy_text(target, target_size, dst);
+	return 0;
+}
+
+static int resolve_copy_target_fat(const char *src, const char *dst, char *target, unsigned long target_size)
+{
+	if (fat_path_is_dir(dst)) return rm_path_join(target, target_size, dst, path_basename_part(src));
+	path_copy_text(target, target_size, dst);
+	return 0;
+}
+
+static int cp_ramfs_recursive(const char *src, const char *dst, int recursive)
+{
+	char target[128];
+	if (ramfs_path_is_dir(src))
+	{
+		char names[FS_MAX_LIST][FS_NAME_MAX + 2];
+		int types[FS_MAX_LIST];
+		int count;
+		int i;
+		if (!recursive) return -1;
+		if (ramfs_path_is_dir(dst))
+		{
+			if (rm_path_join(target, sizeof(target), dst, path_basename_part(src)) != 0) return -1;
+		}
+		else
+		{
+			if (rm_path_join(target, sizeof(target), "/", dst) != 0 && dst[0] == '\0') return -1;
+			{
+				unsigned long j = 0;
+				while (dst[j] != '\0' && j + 1 < sizeof(target)) { target[j] = dst[j]; j++; }
+				target[j] = '\0';
+			}
+		}
+		if (!ramfs_path_is_dir(target) && fs_mkdir(target) != 0) return -1;
+		if (fs_ls(src, names, types, FS_MAX_LIST, &count) != 0) return -1;
+		for (i = 0; i < count; i++)
+		{
+			char child_src[128];
+			char child_dst[128];
+			if (rm_path_join(child_src, sizeof(child_src), src, names[i]) != 0) return -1;
+			if (rm_path_join(child_dst, sizeof(child_dst), target, names[i]) != 0) return -1;
+			if (cp_ramfs_recursive(child_src, child_dst, 1) != 0) return -1;
+		}
+		return 0;
+	}
+	else
+	{
+		unsigned char data[FS_MAX_FILE_SIZE];
+		unsigned long size;
+		if (ramfs_path_is_dir(dst))
+		{
+			if (rm_path_join(target, sizeof(target), dst, path_basename_part(src)) != 0) return -1;
+		}
+		else
+		{
+			unsigned long j = 0;
+			while (dst[j] != '\0' && j + 1 < sizeof(target)) { target[j] = dst[j]; j++; }
+			target[j] = '\0';
+		}
+		if (fs_read_file(src, data, sizeof(data), &size) != 0) return -1;
+		return fs_write_file(target, data, size);
+	}
+}
+
+static int cp_fat_recursive(const char *src, const char *dst, int recursive)
+{
+	char target[128];
+	if (fat_path_is_dir(src))
+	{
+		char names[64][40];
+		int count;
+		int i;
+		if (!recursive) return -1;
+		if (fat_path_is_dir(dst))
+		{
+			if (rm_path_join(target, sizeof(target), dst, path_basename_part(src)) != 0) return -1;
+		}
+		else
+		{
+			unsigned long j = 0;
+			while (dst[j] != '\0' && j + 1 < sizeof(target)) { target[j] = dst[j]; j++; }
+			target[j] = '\0';
+		}
+		if (!fat_path_is_dir(target) && fat32_mkdir_path(target) != 0) return -1;
+		if (fat32_ls_path(src, names, 64, &count) != 0) return -1;
+		for (i = 0; i < count; i++)
+		{
+			char child_src[128];
+			char child_dst[128];
+			if (rm_path_join(child_src, sizeof(child_src), src, names[i]) != 0) return -1;
+			if (rm_path_join(child_dst, sizeof(child_dst), target, names[i]) != 0) return -1;
+			if (cp_fat_recursive(child_src, child_dst, 1) != 0) return -1;
+		}
+		return 0;
+	}
+	else
+	{
+		unsigned char data[FS_MAX_FILE_SIZE];
+		unsigned long size;
+		if (fat_path_is_dir(dst))
+		{
+			if (rm_path_join(target, sizeof(target), dst, path_basename_part(src)) != 0) return -1;
+		}
+		else
+		{
+			unsigned long j = 0;
+			while (dst[j] != '\0' && j + 1 < sizeof(target)) { target[j] = dst[j]; j++; }
+			target[j] = '\0';
+		}
+		if (fat32_read_file_path(src, data, sizeof(data), &size) != 0) return -1;
+		return fat32_write_file_path(target, data, size);
+	}
+}
+
 static void cmd_rm(const char *args)
 {
+	int recursive = 0;
+	int force = 0;
 	char path[128];
 	char full_path[128];
-	const char *p = read_token(args, path, sizeof(path));
-	if (p == (void *)0 || path[0] == '\0')
+	char tok[32];
+	const char *p = args;
+
+	for (;;)
 	{
-		terminal_write_line("Usage: rm <path>");
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0)
+		{
+			terminal_write_line("Usage: rm [-r] [-f] <path>");
+			return;
+		}
+		if (tok[0] == '\0')
+		{
+			terminal_write_line("Usage: rm [-r] [-f] <path>");
+			return;
+		}
+		if (tok[0] != '-') break;
+		if (tok[1] == '\0')
+		{
+			terminal_write_line("Usage: rm [-r] [-f] <path>");
+			return;
+		}
+		{
+			unsigned long i = 1;
+			while (tok[i] != '\0')
+			{
+				if (tok[i] == 'r') recursive = 1;
+				else if (tok[i] == 'f') force = 1;
+				else
+				{
+					terminal_write_line("Usage: rm [-r] [-f] <path>");
+					return;
+				}
+				i++;
+			}
+		}
+	}
+
+	{
+		unsigned long i = 0;
+		while (tok[i] != '\0' && i + 1 < sizeof(path))
+		{
+			path[i] = tok[i];
+			i++;
+		}
+		path[i] = '\0';
+	}
+	if (path[0] == '\0')
+	{
+		terminal_write_line("Usage: rm [-r] [-f] <path>");
 		return;
 	}
 	if (fat_mode_active())
 	{
-		if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0 || fat32_remove_path(full_path) != 0)
+		if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
 		{
-			terminal_write_line("rm: failed (non-empty dir?)");
+			if (!force) terminal_write_line("rm: failed");
+			return;
 		}
+		if (rm_fat_recursive(full_path, recursive || force, force) != 0 && !force)
+			terminal_write_line("rm: failed (use -r or -f for directories)");
 		return;
 	}
-	if (fs_rm(path) != 0) terminal_write_line("rm: failed (non-empty dir?)");
+	if (rm_ramfs_recursive(path, recursive || force, force) != 0 && !force)
+		terminal_write_line("rm: failed (use -r or -f for directories)");
 }
 
 static void cmd_cp(const char *args)
 {
+	int recursive = 0;
+	int no_clobber = 0;
+	int interactive = 0;
+	char tok[32];
 	char src[128];
 	char dst[128];
+	char target[128];
 	char src_full[128];
 	char dst_full[128];
-	const char *p = read_token(args, src, sizeof(src));
-	if (p == (void *)0 || src[0] == '\0')
+	const char *p = args;
+
+	for (;;)
 	{
-		terminal_write_line("Usage: cp <src> <dst>");
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0)
+		{
+			terminal_write_line("Usage: cp [-r] [-n] [-i] <src> <dst>");
+			return;
+		}
+		if (tok[0] == '\0')
+		{
+			terminal_write_line("Usage: cp [-r] [-n] [-i] <src> <dst>");
+			return;
+		}
+		if (tok[0] != '-') break;
+		{
+			unsigned long i = 1;
+			while (tok[i] != '\0')
+			{
+				if (tok[i] == 'r' || tok[i] == 'R') recursive = 1;
+				else if (tok[i] == 'n') no_clobber = 1;
+				else if (tok[i] == 'i') interactive = 1;
+				else
+				{
+					terminal_write_line("Usage: cp [-r] [-n] [-i] <src> <dst>");
+					return;
+				}
+				i++;
+			}
+		}
+	}
+	{
+		unsigned long i = 0;
+		while (tok[i] != '\0' && i + 1 < sizeof(src)) { src[i] = tok[i]; i++; }
+		src[i] = '\0';
+	}
+	if (src[0] == '\0')
+	{
+		terminal_write_line("Usage: cp [-r] [-n] [-i] <src> <dst>");
 		return;
 	}
 	p = read_token(p, dst, sizeof(dst));
 	if (p == (void *)0 || dst[0] == '\0')
 	{
-		terminal_write_line("Usage: cp <src> <dst>");
+		terminal_write_line("Usage: cp [-r] [-n] [-i] <src> <dst>");
 		return;
 	}
 	if (fat_mode_active())
 	{
-		unsigned char data[4096];
-		unsigned long size;
 		if (fat_resolve_path(src, src_full, sizeof(src_full)) != 0 || fat_resolve_path(dst, dst_full, sizeof(dst_full)) != 0)
 		{
 			terminal_write_line("cp: failed");
 			return;
 		}
-		if (fat32_read_file_path(src_full, data, sizeof(data), &size) != 0 || fat32_write_file_path(dst_full, data, size) != 0)
+		if (resolve_copy_target_fat(src_full, dst_full, target, sizeof(target)) != 0)
 		{
 			terminal_write_line("cp: failed");
+			return;
+		}
+		if (fat_path_exists(target))
+		{
+			if (no_clobber) return;
+			if (interactive && !prompt_overwrite("cp", target)) return;
+			if (rm_fat_recursive(target, 1, 0) != 0)
+			{
+				terminal_write_line("cp: failed");
+				return;
+			}
+		}
+		if (cp_fat_recursive(src_full, dst_full, recursive) != 0)
+		{
+			terminal_write_line("cp: failed (use -r for directories)");
 		}
 		return;
 	}
-	if (fs_cp(src, dst) != 0) terminal_write_line("cp: failed");
+	if (resolve_copy_target_ramfs(src, dst, target, sizeof(target)) != 0)
+	{
+		terminal_write_line("cp: failed");
+		return;
+	}
+	if (ramfs_path_exists(target))
+	{
+		if (no_clobber) return;
+		if (interactive && !prompt_overwrite("cp", target)) return;
+		if (rm_ramfs_recursive(target, 1, 0) != 0)
+		{
+			terminal_write_line("cp: failed");
+			return;
+		}
+	}
+	if (cp_ramfs_recursive(src, dst, recursive) != 0) terminal_write_line("cp: failed (use -r for directories)");
 }
 
 static void cmd_mv(const char *args)
 {
+	int no_clobber = 0;
+	int interactive = 0;
+	char tok[32];
 	char src[128];
 	char dst[128];
+	char target[128];
 	char src_full[128];
 	char dst_full[128];
-	const char *p = read_token(args, src, sizeof(src));
-	if (p == (void *)0 || src[0] == '\0')
+	const char *p = args;
+
+	for (;;)
 	{
-		terminal_write_line("Usage: mv <src> <dst>");
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0)
+		{
+			terminal_write_line("Usage: mv [-n] [-i] <src> <dst>");
+			return;
+		}
+		if (tok[0] == '\0')
+		{
+			terminal_write_line("Usage: mv [-n] [-i] <src> <dst>");
+			return;
+		}
+		if (tok[0] != '-') break;
+		{
+			unsigned long i = 1;
+			while (tok[i] != '\0')
+			{
+				if (tok[i] == 'n') no_clobber = 1;
+				else if (tok[i] == 'i') interactive = 1;
+				else
+				{
+					terminal_write_line("Usage: mv [-n] [-i] <src> <dst>");
+					return;
+				}
+				i++;
+			}
+		}
+	}
+	path_copy_text(src, sizeof(src), tok);
+	if (src[0] == '\0')
+	{
+		terminal_write_line("Usage: mv [-n] [-i] <src> <dst>");
 		return;
 	}
 	p = read_token(p, dst, sizeof(dst));
 	if (p == (void *)0 || dst[0] == '\0')
 	{
-		terminal_write_line("Usage: mv <src> <dst>");
+		terminal_write_line("Usage: mv [-n] [-i] <src> <dst>");
 		return;
 	}
 	if (fat_mode_active())
 	{
-		unsigned char data[4096];
-		unsigned long size;
 		if (fat_resolve_path(src, src_full, sizeof(src_full)) != 0 || fat_resolve_path(dst, dst_full, sizeof(dst_full)) != 0)
 		{
 			terminal_write_line("mv: failed");
 			return;
 		}
-		if (fat32_read_file_path(src_full, data, sizeof(data), &size) != 0 || fat32_write_file_path(dst_full, data, size) != 0 || fat32_remove_path(src_full) != 0)
+		if (fat_path_is_dir(dst_full))
+		{
+			if (rm_path_join(target, sizeof(target), dst_full, path_basename_part(src_full)) != 0)
+			{
+				terminal_write_line("mv: failed");
+				return;
+			}
+		}
+		else
+		{
+			unsigned long i = 0;
+			while (dst_full[i] != '\0' && i + 1 < sizeof(target)) { target[i] = dst_full[i]; i++; }
+			target[i] = '\0';
+		}
+		if (fat_path_exists(target))
+		{
+			if (no_clobber) return;
+			if (interactive && !prompt_overwrite("mv", target)) return;
+			if (rm_fat_recursive(target, 1, 0) != 0)
+			{
+				terminal_write_line("mv: failed");
+				return;
+			}
+		}
+		if (cp_fat_recursive(src_full, target, 1) != 0 || rm_fat_recursive(src_full, 1, 0) != 0)
 		{
 			terminal_write_line("mv: failed");
 		}
 		return;
+	}
+	if (ramfs_path_is_dir(dst))
+	{
+		if (rm_path_join(target, sizeof(target), dst, path_basename_part(src)) != 0)
+		{
+			terminal_write_line("mv: failed");
+			return;
+		}
+		if (ramfs_path_exists(target))
+		{
+			if (no_clobber) return;
+			if (interactive && !prompt_overwrite("mv", target)) return;
+			if (rm_ramfs_recursive(target, 1, 0) != 0)
+			{
+				terminal_write_line("mv: failed");
+				return;
+			}
+		}
+		if (fs_mv(src, target) != 0) terminal_write_line("mv: failed");
+		return;
+	}
+	if (ramfs_path_exists(dst))
+	{
+		if (no_clobber) return;
+		if (interactive && !prompt_overwrite("mv", dst)) return;
+		if (rm_ramfs_recursive(dst, 1, 0) != 0)
+		{
+			terminal_write_line("mv: failed");
+			return;
+		}
 	}
 	if (fs_mv(src, dst) != 0) terminal_write_line("mv: failed");
 }
@@ -3059,8 +4034,14 @@ static void editor_draw_header(int can_scroll_up, int can_scroll_down)
 	terminal_write("Path: ");
 	terminal_write_line(editor_target_path);
 	screen_set_color(editor_header_color);
-	if (editor_hex_mode) terminal_write_line("Hex: 0-9/A-F edit | arrows PgUp PgDn Home End | Ctrl+Home/End");
-	else terminal_write_line("Ctrl+S save | Ctrl+C/X/V copy cut paste | Shift+arrows select | Ctrl+arrows jump words");
+	if (editor_find_active)
+	{
+		terminal_write("Find: ");
+		terminal_write(editor_find_query);
+		terminal_write_line("_  Enter=next  Shift+Enter=prev  Esc=cancel");
+	}
+	else if (editor_hex_mode) terminal_write_line("Hex: 0-9/A-F edit | arrows PgUp PgDn Home End | Ctrl+Home/End");
+	else terminal_write_line("Ctrl+S save | Ctrl+F find | Ctrl+C/X/V copy cut paste | Shift+arrows select");
 	screen_set_color(editor_rule_color);
 	terminal_write_line("--------------------------------");
 	screen_set_color(editor_text_color);
@@ -3089,6 +4070,10 @@ static int editor_open_file(const char *path, int hex_mode)
 
 	editor_length = 0;
 	editor_dirty = 0;
+	editor_find_active = 0;
+	editor_find_query_length = 0;
+	editor_find_query[0] = '\0';
+	editor_find_invalidate_match();
 	if (hex_mode)
 	{
 		if (editor_use_fat)
@@ -3113,6 +4098,7 @@ static int editor_open_file(const char *path, int hex_mode)
 		editor_buffer[editor_length] = '\0';
 	}
 
+	editor_capture_screen();
 	screen_clear();
 	editor_cursor = editor_length;
 	editor_clear_selection();
@@ -3159,6 +4145,218 @@ static void editor_status_line(const char *msg)
 	terminal_putc('\n');
 	terminal_write_line(msg);
 	editor_render();
+}
+
+static void editor_capture_screen(void)
+{
+	unsigned long i;
+	if (editor_screen_saved) return;
+	editor_screen_saved_width = screen_get_width();
+	editor_screen_saved_height = screen_get_height();
+	editor_screen_saved_cells = editor_screen_saved_width * editor_screen_saved_height;
+	if (editor_screen_saved_cells > EDITOR_SCREEN_SNAPSHOT_MAX_CELLS)
+		editor_screen_saved_cells = EDITOR_SCREEN_SNAPSHOT_MAX_CELLS;
+	editor_screen_saved_pos = screen_get_pos();
+	editor_screen_saved_color = screen_get_color();
+	editor_screen_saved_style = screen_get_style();
+	for (i = 0; i < editor_screen_saved_cells; i++)
+		screen_read_cell_at((unsigned short)i, &editor_screen_saved_chars[i], &editor_screen_saved_attrs[i], &editor_screen_saved_styles[i]);
+	editor_screen_saved = 1;
+}
+
+static void editor_restore_screen(void)
+{
+	unsigned long i;
+	if (!editor_screen_saved) return;
+	for (i = 0; i < editor_screen_saved_cells; i++)
+	{
+		screen_write_cell_at((unsigned short)i, editor_screen_saved_chars[i], editor_screen_saved_attrs[i], editor_screen_saved_styles[i]);
+	}
+	screen_set_color(editor_screen_saved_color);
+	screen_set_style(editor_screen_saved_style);
+	screen_set_pos(editor_screen_saved_pos);
+	screen_set_hw_cursor(editor_screen_saved_pos);
+	editor_screen_saved = 0;
+}
+
+static void editor_close(int saved, int save_attempted)
+{
+	editor_active = 0;
+	editor_find_active = 0;
+	editor_restore_screen();
+	input_length = 0;
+	cursor_pos = 0;
+	input_buffer[0] = '\0';
+	if (save_attempted)
+	{
+		if (saved) terminal_write_line("[editor] saved");
+		else terminal_write_line("[editor] save failed");
+	}
+	else
+	{
+		terminal_write_line("[editor] canceled");
+	}
+	terminal_prompt();
+}
+
+static void editor_find_invalidate_match(void)
+{
+	editor_find_match_valid = 0;
+	editor_find_match_start = 0;
+	editor_find_match_end = 0;
+}
+
+static void editor_find_open(void)
+{
+	if (editor_find_query_length == 0 && editor_find_last_query_length > 0)
+	{
+		unsigned long i;
+		editor_find_query_length = editor_find_last_query_length;
+		for (i = 0; i < editor_find_query_length; i++) editor_find_query[i] = editor_find_last_query[i];
+		editor_find_query[editor_find_query_length] = '\0';
+	}
+	editor_find_active = 1;
+	editor_render();
+}
+
+static void editor_find_cancel(void)
+{
+	editor_find_active = 0;
+	editor_render();
+}
+
+static int editor_find_match_at(unsigned long index)
+{
+	unsigned long i;
+	if (editor_find_query_length == 0) return 0;
+	if (index + editor_find_query_length > editor_length) return 0;
+	for (i = 0; i < editor_find_query_length; i++)
+	{
+		if (ascii_upper(editor_buffer[index + i]) != ascii_upper(editor_find_query[i])) return 0;
+	}
+	return 1;
+}
+
+static int editor_find_next(int advance_from_current)
+{
+	unsigned long start;
+	unsigned long i;
+	unsigned long k;
+	if (editor_find_query_length == 0)
+	{
+		editor_status_line("[editor] find: empty query");
+		return 0;
+	}
+	editor_find_last_query_length = editor_find_query_length;
+	for (k = 0; k < editor_find_query_length; k++) editor_find_last_query[k] = editor_find_query[k];
+	editor_find_last_query[editor_find_last_query_length] = '\0';
+	start = editor_cursor;
+	if (advance_from_current && editor_find_match_valid && editor_find_match_end > start) start = editor_find_match_end;
+	for (i = start; i + editor_find_query_length <= editor_length; i++)
+	{
+		if (editor_find_match_at(i))
+		{
+			editor_find_match_valid = 1;
+			editor_find_match_start = i;
+			editor_find_match_end = i + editor_find_query_length;
+			editor_cursor = i;
+			editor_render();
+			return 1;
+		}
+	}
+	for (i = 0; i < start && i + editor_find_query_length <= editor_length; i++)
+	{
+		if (editor_find_match_at(i))
+		{
+			editor_find_match_valid = 1;
+			editor_find_match_start = i;
+			editor_find_match_end = i + editor_find_query_length;
+			editor_cursor = i;
+			editor_render();
+			return 1;
+		}
+	}
+	editor_find_invalidate_match();
+	editor_status_line("[editor] find: no match");
+	return 0;
+}
+
+static int editor_find_prev(void)
+{
+	long i;
+	unsigned long start;
+	unsigned long k;
+	if (editor_find_query_length == 0)
+	{
+		editor_status_line("[editor] find: empty query");
+		return 0;
+	}
+	editor_find_last_query_length = editor_find_query_length;
+	for (k = 0; k < editor_find_query_length; k++) editor_find_last_query[k] = editor_find_query[k];
+	editor_find_last_query[editor_find_last_query_length] = '\0';
+	if (editor_cursor == 0) start = editor_length;
+	else start = editor_cursor;
+	for (i = (long)start - 1; i >= 0; i--)
+	{
+		if (editor_find_match_at((unsigned long)i))
+		{
+			editor_find_match_valid = 1;
+			editor_find_match_start = (unsigned long)i;
+			editor_find_match_end = (unsigned long)i + editor_find_query_length;
+			editor_cursor = (unsigned long)i;
+			editor_render();
+			return 1;
+		}
+	}
+	for (i = (long)editor_length - 1; i >= (long)start; i--)
+	{
+		if (editor_find_match_at((unsigned long)i))
+		{
+			editor_find_match_valid = 1;
+			editor_find_match_start = (unsigned long)i;
+			editor_find_match_end = (unsigned long)i + editor_find_query_length;
+			editor_cursor = (unsigned long)i;
+			editor_render();
+			return 1;
+		}
+	}
+	editor_find_invalidate_match();
+	editor_status_line("[editor] find: no match");
+	return 0;
+}
+
+static int parse_display_mode_spec(const char *spec, unsigned int *width, unsigned int *height, unsigned int *bpp)
+{
+	char wbuf[16];
+	char hbuf[16];
+	char bbuf[16];
+	unsigned long i = 0;
+	unsigned long j = 0;
+	if (spec == (void *)0 || width == (void *)0 || height == (void *)0 || bpp == (void *)0) return 0;
+	while (spec[i] != '\0' && spec[i] != 'x' && spec[i] != 'X' && i + 1 < sizeof(wbuf))
+	{
+		wbuf[i] = spec[i];
+		i++;
+	}
+	if (spec[i] == '\0' || i == 0 || i + 1 >= sizeof(wbuf)) return 0;
+	wbuf[i] = '\0';
+	i++;
+	while (spec[i] != '\0' && spec[i] != 'x' && spec[i] != 'X' && j + 1 < sizeof(hbuf))
+	{
+		hbuf[j++] = spec[i++];
+	}
+	if (j == 0 || j + 1 >= sizeof(hbuf)) return 0;
+	hbuf[j] = '\0';
+	if (parse_dec_u32(wbuf, width) != 0 || parse_dec_u32(hbuf, height) != 0) return 0;
+	*bpp = 32;
+	if (spec[i] == '\0') return 1;
+	i++;
+	j = 0;
+	while (spec[i] != '\0' && j + 1 < sizeof(bbuf)) bbuf[j++] = spec[i++];
+	if (spec[i] != '\0' || j == 0) return 0;
+	bbuf[j] = '\0';
+	if (parse_dec_u32(bbuf, bpp) != 0) return 0;
+	return (*bpp == 24 || *bpp == 32) ? 1 : 0;
 }
 
 static void run_inline_command(const char *line)
@@ -4039,6 +5237,7 @@ static void cmd_serial(const char *args)
 static void cmd_display(const char *args)
 {
 	char op[16];
+	char arg2[16];
 	const char *p = read_token(args, op, sizeof(op));
 
 	if (p == (void *)0 || op[0] == '\0' || string_equals(op, "show"))
@@ -4063,12 +5262,125 @@ static void cmd_display(const char *args)
 			uint_to_dec((unsigned long)framebuffer_height(), n, sizeof(n)); terminal_write(n);
 			terminal_write("x");
 			uint_to_dec((unsigned long)framebuffer_bpp(), n, sizeof(n)); terminal_write(n);
+			terminal_write(" src=");
+			if (framebuffer_mode_source() == 1) terminal_write("kernel-vbe");
+			else terminal_write("bootloader");
 		}
 		else
 		{
 			terminal_write(" fb=none");
 		}
+		terminal_write(" cursor=");
+		if (screen_get_cursor_style() == 1) terminal_write("block");
+		else if (screen_get_cursor_style() == 2) terminal_write("bar");
+		else terminal_write("underline");
 		terminal_putc('\n');
+		return;
+	}
+
+	if (string_equals(op, "mode"))
+	{
+		unsigned int w = 0, h = 0, bpp = 32;
+		p = read_token(p, arg2, sizeof(arg2));
+		if (p == (void *)0 || arg2[0] == '\0' || string_equals(arg2, "show"))
+		{
+			terminal_write_line("display mode presets: 1080p, 900p, 768p, 720p, list, or WIDTHxHEIGHT[xBPP]");
+			if (framebuffer_available())
+			{
+				char n[16];
+				terminal_write("display: current fb mode ");
+				uint_to_dec((unsigned long)framebuffer_width(), n, sizeof(n)); terminal_write(n);
+				terminal_write("x");
+				uint_to_dec((unsigned long)framebuffer_height(), n, sizeof(n)); terminal_write(n);
+				terminal_write("x");
+				uint_to_dec((unsigned long)framebuffer_bpp(), n, sizeof(n)); terminal_write(n);
+				terminal_putc('\n');
+			}
+			return;
+		}
+		if (string_equals(arg2, "list"))
+		{
+			unsigned int old_w, old_h, old_bpp;
+			unsigned long i;
+			struct mode_item { unsigned int w, h, bpp; const char *name; };
+			static const struct mode_item candidates[] = {
+				{1920,1080,32,"1080p"}, {1600,900,32,"900p"}, {1360,768,32,"768p"},
+				{1280,720,32,"720p"}, {1024,768,32,"1024x768"}, {800,600,32,"800x600"}
+			};
+			if (!framebuffer_available())
+			{
+				terminal_write_line("display: framebuffer not available from bootloader");
+				return;
+			}
+			old_w = framebuffer_width();
+			old_h = framebuffer_height();
+			old_bpp = framebuffer_bpp();
+			terminal_write_line("display: probing common modes...");
+			for (i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++)
+			{
+				terminal_write("  ");
+				terminal_write(candidates[i].name);
+				terminal_write(" : ");
+				if (framebuffer_try_set_mode(candidates[i].w, candidates[i].h, candidates[i].bpp)) terminal_write_line("supported");
+				else terminal_write_line("unsupported");
+			}
+			framebuffer_try_set_mode(old_w, old_h, old_bpp);
+			if (display_mode == 2) screen_set_framebuffer_text_mode();
+			return;
+		}
+		if (string_equals(arg2, "1080p")) { w = 1920; h = 1080; }
+		else if (string_equals(arg2, "900p")) { w = 1600; h = 900; }
+		else if (string_equals(arg2, "768p")) { w = 1360; h = 768; }
+		else if (string_equals(arg2, "720p")) { w = 1280; h = 720; }
+		else if (!parse_display_mode_spec(arg2, &w, &h, &bpp))
+		{
+			terminal_write_line("Usage: display mode <show|list|1080p|900p|768p|720p|WIDTHxHEIGHT[xBPP]>");
+			return;
+		}
+
+		if (!framebuffer_available())
+		{
+			terminal_write_line("display: framebuffer not available from bootloader");
+			return;
+		}
+		if (!framebuffer_try_set_mode(w, h, bpp))
+		{
+			terminal_write_line("display: requested mode not supported by current adapter");
+			return;
+		}
+		if (!screen_set_framebuffer_text_mode())
+		{
+			terminal_write_line("display: mode changed but framebuffer text backend failed");
+			return;
+		}
+		display_mode = 2;
+		terminal_write("display: switched framebuffer mode to ");
+		{
+			char n[16];
+			uint_to_dec((unsigned long)w, n, sizeof(n)); terminal_write(n);
+			terminal_write("x");
+			uint_to_dec((unsigned long)h, n, sizeof(n)); terminal_write(n);
+			terminal_write("x");
+			uint_to_dec((unsigned long)bpp, n, sizeof(n)); terminal_write_line(n);
+		}
+		return;
+	}
+
+	if (string_equals(op, "cursor"))
+	{
+		p = read_token(p, arg2, sizeof(arg2));
+		if (p == (void *)0 || arg2[0] == '\0' || string_equals(arg2, "show"))
+		{
+			terminal_write("display: cursor=");
+			if (screen_get_cursor_style() == 1) terminal_write_line("block");
+			else if (screen_get_cursor_style() == 2) terminal_write_line("bar");
+			else terminal_write_line("underline");
+			return;
+		}
+		if (string_equals(arg2, "underline")) { screen_set_cursor_style(0); terminal_write_line("display: cursor set to underline"); return; }
+		if (string_equals(arg2, "block")) { screen_set_cursor_style(1); terminal_write_line("display: cursor set to block"); return; }
+		if (string_equals(arg2, "bar")) { screen_set_cursor_style(2); terminal_write_line("display: cursor set to bar"); return; }
+		terminal_write_line("Usage: display cursor <show|underline|block|bar>");
 		return;
 	}
 
@@ -4103,7 +5415,7 @@ static void cmd_display(const char *args)
 		return;
 	}
 
-	terminal_write_line("Usage: display [show|vga25|vga50|fb]");
+	terminal_write_line("Usage: display [show|vga25|vga50|fb|mode <show|list|1080p|900p|768p|720p|WIDTHxHEIGHT[xBPP]>|cursor <show|underline|block|bar>]");
 }
 
 static void cmd_fbfont(const char *args)
@@ -4817,7 +6129,7 @@ static void ramfs_copy_to_fat_r(const char *rpath, const char *fpath, int *copie
 			}
 			else
 			{
-				unsigned char data[2048];
+				unsigned char data[FS_MAX_FILE_SIZE];
 				unsigned long size;
 				size = 0;
 				if (fs_read_file(child_rpath, data, sizeof(data), &size) == 0)
@@ -4932,6 +6244,7 @@ static void cmd_charmap(void)
 	terminal_write_line("  \\shade1 \\shade2 \\shade3 \\deg \\pm \\dot");
 	terminal_write_line("  \\arru \\arrd \\arrl \\arrr \\tri");
 	terminal_write_line("  \\xNN for raw byte (hex), example: echo \\xDB\\xDB\\xDB");
+	terminal_write_line("  echo styles: §b bold, §i italic, §u underline, §s strike, uppercase disables, §r resets");
 }
 
 static void cmd_fatls(void)
@@ -4963,7 +6276,7 @@ static void cmd_fatcat(const char *args)
 {
 	char path[128];
 	char full_path[128];
-	unsigned char data[1024];
+	unsigned char data[FS_MAX_FILE_SIZE];
 	unsigned long size;
 	unsigned long i;
 	const char *p = read_token(args, path, sizeof(path));
@@ -5255,17 +6568,17 @@ static void run_command(void)
 	else if (string_starts_with(input_buffer, "rm"))
 	{
 		if (input_buffer[2] == ' ') cmd_rm(input_buffer + 3);
-		else terminal_write_line("Usage: rm <path>");
+		else terminal_write_line("Usage: rm [-r] [-f] <path>");
 	}
 	else if (string_starts_with(input_buffer, "cp"))
 	{
 		if (input_buffer[2] == ' ') cmd_cp(input_buffer + 3);
-		else terminal_write_line("Usage: cp <src> <dst>");
+		else terminal_write_line("Usage: cp [-r] [-n] [-i] <src> <dst>");
 	}
 	else if (string_starts_with(input_buffer, "mv"))
 	{
 		if (input_buffer[2] == ' ') cmd_mv(input_buffer + 3);
-		else terminal_write_line("Usage: mv <src> <dst>");
+		else terminal_write_line("Usage: mv [-n] [-i] <src> <dst>");
 	}
 	else if (string_starts_with(input_buffer, "edit"))
 	{
@@ -5297,6 +6610,19 @@ static void run_command(void)
 	else if (string_equals(input_buffer, "memmap"))
 	{
 		memmap_print();
+	}
+	else if (string_equals(input_buffer, "memstat"))
+	{
+		cmd_memstat();
+	}
+	else if (string_equals(input_buffer, "pagetest"))
+	{
+		cmd_pagetest();
+	}
+	else if (string_starts_with(input_buffer, "exec"))
+	{
+		if (input_buffer[4] == ' ') cmd_exec(input_buffer + 5);
+		else terminal_write_line("Usage: exec <path>");
 	}
 	else if (string_starts_with(input_buffer, "hexdump"))
 	{
@@ -5362,7 +6688,11 @@ static void run_command(void)
 	else if (string_starts_with(input_buffer, "echo"))
 	{
 		if      (input_buffer[4] == '\0') terminal_putc('\n');
-		else if (input_buffer[4] == ' ')  terminal_write_line(&input_buffer[5]);
+		else if (input_buffer[4] == ' ')
+		{
+			terminal_write_echo_text(&input_buffer[5]);
+			terminal_putc('\n');
+		}
 		else    terminal_write_line("Unknown command. Type help for a list.");
 	}
 	else if (string_starts_with(input_buffer, "glyph"))
@@ -5390,7 +6720,7 @@ static void run_command(void)
 	{
 		if (input_buffer[7] == '\0') cmd_display("show");
 		else if (input_buffer[7] == ' ') cmd_display(input_buffer + 8);
-		else terminal_write_line("Usage: display [show|vga25|vga50|fb]");
+		else terminal_write_line("Usage: display [show|vga25|vga50|fb|mode <show|list|1080p|900p|768p|720p|WIDTHxHEIGHT[xBPP]>|cursor <show|underline|block|bar>]");
 	}
 	else if (string_starts_with(input_buffer, "fbfont"))
 	{
@@ -5489,6 +6819,7 @@ static void editor_handle_scancode(unsigned char scancode)
 		unsigned long line_end;
 		unsigned long rows;
 		extended_key = 0;
+		if (editor_find_active) return;
 		if (scancode == 0x1D) { ctrl_held = 1; return; }
 		if (scancode == 0x9D) { ctrl_held = 0; return; }
 		if (editor_hex_mode)
@@ -5689,18 +7020,44 @@ static void editor_handle_scancode(unsigned char scancode)
 	if (scancode == 0x3A) { caps_lock_on = !caps_lock_on; return; }
 	if (scancode & 0x80) return;
 
+	if (editor_find_active)
+	{
+		if (scancode == 0x01)
+		{
+			editor_find_cancel();
+			return;
+		}
+		if (scancode == 0x1C)
+		{
+			editor_find_active = 0;
+			if (shift_held) editor_find_prev();
+			else editor_find_next(editor_find_match_valid ? 1 : 0);
+			return;
+		}
+		if (scancode == 0x0E)
+		{
+			if (editor_find_query_length > 0)
+			{
+				editor_find_query_length--;
+				editor_find_query[editor_find_query_length] = '\0';
+			}
+			editor_render();
+			return;
+		}
+		c = translate_scancode(scancode);
+		if (c >= 0x20 && c <= 0x7E && editor_find_query_length + 1 < sizeof(editor_find_query))
+		{
+			editor_find_query[editor_find_query_length++] = c;
+			editor_find_query[editor_find_query_length] = '\0';
+			editor_render();
+		}
+		return;
+	}
+
 	if (scancode == 0x44)
 	{
-		screen_set_pos(editor_prev_end);
-		screen_set_hw_cursor(editor_prev_end);
-		terminal_putc('\n');
-		if (editor_save() == 0) terminal_write_line("[editor] saved");
-		else terminal_write_line("[editor] save failed");
-		editor_active = 0;
-		input_length = 0;
-		cursor_pos = 0;
-		input_buffer[0] = '\0';
-		terminal_prompt();
+		if (editor_save() == 0) editor_close(1, 1);
+		else editor_status_line("[editor] save failed");
 		return;
 	}
 
@@ -5739,19 +7096,16 @@ static void editor_handle_scancode(unsigned char scancode)
 				editor_render();
 			return;
 		}
+		if (scancode == 0x21)
+		{
+			editor_find_open();
+			return;
+		}
 	}
 
 	if (scancode == 0x01)
 	{
-		screen_set_pos(editor_prev_end);
-		screen_set_hw_cursor(editor_prev_end);
-		terminal_putc('\n');
-		terminal_write_line("[editor] canceled");
-		editor_active = 0;
-		input_length = 0;
-		cursor_pos = 0;
-		input_buffer[0] = '\0';
-		terminal_prompt();
+		editor_close(0, 0);
 		return;
 	}
 
@@ -5768,6 +7122,7 @@ static void editor_handle_scancode(unsigned char scancode)
 				for (i = editor_cursor; i + 1 < editor_length; i++) editor_buffer[i] = editor_buffer[i + 1];
 				editor_length--;
 				editor_dirty = 1;
+				editor_find_invalidate_match();
 				editor_hex_nibble = 0;
 				editor_render();
 			}
@@ -5801,6 +7156,7 @@ static void editor_handle_scancode(unsigned char scancode)
 			}
 		}
 		editor_dirty = 1;
+		editor_find_invalidate_match();
 		editor_render();
 		return;
 	}
@@ -5819,6 +7175,7 @@ static void editor_handle_scancode(unsigned char scancode)
 			editor_length--;
 			editor_buffer[editor_length] = '\0';
 			editor_dirty = 1;
+			editor_find_invalidate_match();
 			editor_clear_selection();
 			editor_render();
 		}
@@ -5851,6 +7208,38 @@ static void editor_handle_serial_char(char c)
 {
 	unsigned long i;
 
+	if (editor_find_active)
+	{
+		if (c == 0x1B)
+		{
+			editor_find_cancel();
+			return;
+		}
+		if (c == 0x08 || c == 0x7F)
+		{
+			if (editor_find_query_length > 0)
+			{
+				editor_find_query_length--;
+				editor_find_query[editor_find_query_length] = '\0';
+			}
+			editor_render();
+			return;
+		}
+		if (c == '\r' || c == '\n')
+		{
+			editor_find_active = 0;
+			editor_find_next(editor_find_match_valid ? 1 : 0);
+			return;
+		}
+		if (c >= 0x20 && c <= 0x7E && editor_find_query_length + 1 < sizeof(editor_find_query))
+		{
+			editor_find_query[editor_find_query_length++] = c;
+			editor_find_query[editor_find_query_length] = '\0';
+			editor_render();
+		}
+		return;
+	}
+
 	if (editor_hex_mode)
 	{
 		if (c == 0x08 || c == 0x7F)
@@ -5861,6 +7250,7 @@ static void editor_handle_serial_char(char c)
 				for (i = editor_cursor; i + 1 < editor_length; i++) editor_buffer[i] = editor_buffer[i + 1];
 				editor_length--;
 				editor_dirty = 1;
+				editor_find_invalidate_match();
 				editor_hex_nibble = 0;
 				editor_render();
 			}
@@ -5882,6 +7272,7 @@ static void editor_handle_serial_char(char c)
 			editor_length--;
 			editor_buffer[editor_length] = '\0';
 			editor_dirty = 1;
+			editor_find_invalidate_match();
 			editor_clear_selection();
 			editor_render();
 		}
@@ -5901,7 +7292,6 @@ static void editor_handle_serial_char(char c)
 static void handle_scancode(unsigned char scancode)
 {
 	char c;
-	unsigned long i;
 
 	if (editor_active)
 	{
@@ -5922,30 +7312,42 @@ static void handle_scancode(unsigned char scancode)
 		if (scancode == 0x50) { handle_arrow_down(); return; }
 		if (scancode == 0x4B && cursor_pos > 0)  /* Left */
 		{
+			terminal_begin_selection_if_needed();
 			if (ctrl_held)
 			{
 				while (cursor_pos > 0 && !char_is_word(input_buffer[cursor_pos - 1])) cursor_pos--;
 				while (cursor_pos > 0 && char_is_word(input_buffer[cursor_pos - 1])) cursor_pos--;
 			}
 			else cursor_pos--;
+			terminal_finish_selection_move();
 			screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+			terminal_redraw_input_line();
 			return;
 		}
 		if (scancode == 0x4D && cursor_pos < input_length)  /* Right */
 		{
+			terminal_begin_selection_if_needed();
 			if (ctrl_held)
 			{
 				while (cursor_pos < input_length && char_is_word(input_buffer[cursor_pos])) cursor_pos++;
 				while (cursor_pos < input_length && !char_is_word(input_buffer[cursor_pos])) cursor_pos++;
 			}
 			else cursor_pos++;
+			terminal_finish_selection_move();
 			screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
+			terminal_redraw_input_line();
 			return;
 		}
 		if (scancode == 0x47) /* Home */
-		{ cursor_pos = 0; screen_set_hw_cursor(prompt_vga_start); return; }
+		{ terminal_begin_selection_if_needed(); cursor_pos = 0; terminal_finish_selection_move(); terminal_redraw_input_line(); return; }
 		if (scancode == 0x4F) /* End */
-		{ cursor_pos = input_length; screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos)); return; }
+		{ terminal_begin_selection_if_needed(); cursor_pos = input_length; terminal_finish_selection_move(); terminal_redraw_input_line(); return; }
+		if (scancode == 0x53) /* Delete */
+		{
+			if (terminal_has_selection()) terminal_delete_selection();
+			else if (cursor_pos < input_length) terminal_delete_range(cursor_pos, cursor_pos + 1);
+			return;
+		}
 		return;
 	}
 
@@ -5959,6 +7361,25 @@ static void handle_scancode(unsigned char scancode)
 
 	if (scancode == 0x0E) { handle_backspace(0); return; }
 
+	if (ctrl_held)
+	{
+		if (scancode == 0x1E)
+		{
+			terminal_selection_active = 1;
+			terminal_selection_anchor = 0;
+			cursor_pos = input_length;
+			terminal_redraw_input_line();
+			return;
+		}
+		if (scancode == 0x2E) { terminal_copy_selection(0); terminal_redraw_input_line(); return; }
+		if (scancode == 0x2D) { terminal_copy_selection(1); return; }
+		if (scancode == 0x2F)
+		{
+			terminal_insert_text(editor_clipboard, editor_clipboard_length);
+			return;
+		}
+	}
+
 	if (scancode == 0x1C)
 	{
 		submit_current_line();
@@ -5969,34 +7390,13 @@ static void handle_scancode(unsigned char scancode)
 	if (c == '\0' || input_length >= (INPUT_BUFFER_SIZE - 1)) return;
 
 insert_character:
-	if (input_length >= (INPUT_BUFFER_SIZE - 1)) return;
-
-	if (cursor_pos == input_length)
-	{
-		input_buffer[input_length++] = c;
-		input_buffer[input_length]   = '\0';
-		cursor_pos++;
-		terminal_putc(c);
-		screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-	}
-	else
-	{
-		/* Mid-line insert: shift right, redraw suffix */
-		for (i = input_length; i > cursor_pos; i--) input_buffer[i] = input_buffer[i - 1];
-		input_buffer[cursor_pos] = c;
-		input_length++; cursor_pos++;
-		input_buffer[input_length] = '\0';
-		for (i = cursor_pos - 1; i < input_length; i++)
-			screen_write_char_at((unsigned short)(prompt_vga_start + i), input_buffer[i]);
-		sync_screen_pos();
-		screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-	}
+	if (input_length >= (INPUT_BUFFER_SIZE - 1) && !terminal_has_selection()) return;
+	terminal_insert_text(&c, 1);
 }
 
 static void handle_serial_input_char(char c)
 {
 	static int esc_state = 0; /* 0=normal, 1=ESC, 2=CSI/SS3 */
-	unsigned long i;
 
 	/* Redraw current input line on the serial console using ANSI escapes. */
 	/* This keeps serial editing visible without relying on VGA mirror noise. */
@@ -6093,28 +7493,8 @@ static void handle_serial_input_char(char c)
 	}
 
 	if (c < 0x20 || c > 0x7E) return;
-	if (input_length >= (INPUT_BUFFER_SIZE - 1)) return;
-
-	if (cursor_pos == input_length)
-	{
-		input_buffer[input_length++] = c;
-		input_buffer[input_length] = '\0';
-		cursor_pos++;
-		screen_putchar(c);
-		screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-	}
-	else
-	{
-		for (i = input_length; i > cursor_pos; i--) input_buffer[i] = input_buffer[i - 1];
-		input_buffer[cursor_pos] = c;
-		input_length++;
-		cursor_pos++;
-		input_buffer[input_length] = '\0';
-		for (i = cursor_pos - 1; i < input_length; i++)
-			screen_write_char_at((unsigned short)(prompt_vga_start + i), input_buffer[i]);
-		sync_screen_pos();
-		screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-	}
+	if (input_length >= (INPUT_BUFFER_SIZE - 1) && !terminal_has_selection()) return;
+	if (!terminal_insert_text(&c, 1)) return;
 	SERIAL_REDRAW();
 
 	#undef SERIAL_REDRAW
@@ -6158,11 +7538,53 @@ void terminal_init(unsigned long mb2_info_addr)
 	screen_set_color(terminal_text_color);
 	serial_ready = serial_init();
 	memmap_init(mb2_info_addr);
-	terminal_write_line("TG11 OS (64-bit)");
-	terminal_write_line(TG11_OS_VERSION);
-	if (display_mode == 2) terminal_write_line("display: boot framebuffer mode enabled");
+	screen_set_style(SCREEN_STYLE_BOLD);
+	terminal_write_colored("TG11 OS (64-bit)", color_bold_variant(terminal_text_color));
+	screen_set_style(0);
+	terminal_putc('\n');
+	if (TG11_OS_VERSION[0] != '\0')
+	{
+		char version_rest[32];
+		unsigned long i = 1;
+		unsigned long o = 0;
+		terminal_write_colored("v", 0x02);
+		while (TG11_OS_VERSION[i] != '\0' && o + 1 < sizeof(version_rest))
+		{
+			version_rest[o++] = TG11_OS_VERSION[i++];
+		}
+		version_rest[o] = '\0';
+		terminal_write_line(version_rest);
+	}
+	else terminal_putc('\n');
+	if (display_mode == 2)
+	{
+		terminal_write_line("display: boot framebuffer mode enabled");
+		if (framebuffer_mode_source() == 1)
+		{
+			char n[16];
+			terminal_write("display: source=kernel-vbe ");
+			uint_to_dec((unsigned long)framebuffer_boot_width(), n, sizeof(n)); terminal_write(n);
+			terminal_write("x");
+			uint_to_dec((unsigned long)framebuffer_boot_height(), n, sizeof(n)); terminal_write(n);
+			terminal_write("x");
+			uint_to_dec((unsigned long)framebuffer_boot_bpp(), n, sizeof(n)); terminal_write(n);
+			terminal_write(" -> ");
+			uint_to_dec((unsigned long)framebuffer_width(), n, sizeof(n)); terminal_write(n);
+			terminal_write("x");
+			uint_to_dec((unsigned long)framebuffer_height(), n, sizeof(n)); terminal_write(n);
+			terminal_write("x");
+			uint_to_dec((unsigned long)framebuffer_bpp(), n, sizeof(n)); terminal_write(n);
+			terminal_putc('\n');
+		}
+		else
+		{
+			terminal_write_line("display: source=bootloader");
+		}
+	}
 	else if (boot_fb_fallback) terminal_write_line("display: boot framebuffer unavailable; using VGA text");
-	terminal_write_line("Type help to view available commands.");
+	terminal_write("Type ");
+	terminal_write_colored("help", 0x06);
+	terminal_write_line(" to view available commands.");
 	terminal_prompt();
 }
 

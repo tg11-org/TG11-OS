@@ -62,6 +62,21 @@ arch_lgdt:
     lgdt [rdi]
     ret
 
+.global arch_read_cr3
+arch_read_cr3:
+    mov rax, cr3
+    ret
+
+.global arch_write_cr3
+arch_write_cr3:
+    mov cr3, rdi
+    ret
+
+.global arch_invlpg
+arch_invlpg:
+    invlpg [rdi]
+    ret
+
 .global exception_hang_stub
 exception_hang_stub:
     cli
