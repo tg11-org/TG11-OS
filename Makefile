@@ -15,6 +15,7 @@
 
 TARGET := x86_64-elf
 CC ?= $(TARGET)-gcc
+NM ?= nm
 
 CFLAGS := -Iinclude -ffreestanding -O2 -Wall -Wextra -m64 -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -fno-pic -fno-pie -fno-stack-protector
 LDFLAGS := -T linker.ld -ffreestanding -O2 -nostdlib -no-pie -Wl,-z,max-page-size=0x1000
@@ -44,7 +45,11 @@ CORE_OBJS := \
 	$(BUILD_DIR)/framebuffer.o \
 	$(BUILD_DIR)/fs.o \
 	$(BUILD_DIR)/fat32.o \
-	$(BUILD_DIR)/basic.o
+	$(BUILD_DIR)/basic.o \
+	$(BUILD_DIR)/task_switch.o \
+	$(BUILD_DIR)/task.o \
+	$(BUILD_DIR)/syscall_asm.o \
+	$(BUILD_DIR)/syscall.o
 
 OBJS := \
 	$(BUILD_DIR)/boot32.o \
@@ -111,6 +116,18 @@ $(BUILD_DIR)/memory.o: kernel/memory.c Makefile | $(BUILD_DIR)
 $(BUILD_DIR)/elf.o: kernel/elf.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/task_switch.o: arch/x86_64/task_switch.s Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/task.o: kernel/task.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/syscall_asm.o: arch/x86_64/syscall.s Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/syscall.o: kernel/syscall.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/framebuffer.o: kernel/framebuffer.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -123,14 +140,44 @@ $(BUILD_DIR)/fat32.o: kernel/fat32.c Makefile | $(BUILD_DIR)
 $(BUILD_DIR)/basic.o: kernel/basic.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(ISO_DIR)/boot/kernel.elf: $(OBJS) linker.ld
+$(BUILD_DIR)/ksym.o: kernel/ksym.c include/ksym.h Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Two-pass kernel build: first link produces a partial binary used to extract
+# symbol addresses via nm; those symbols are compiled into kernel_syms.o and
+# linked back in for the final binary.
+#
+# ksym.o is included in the partial link so that idt.o's call to ksym_lookup
+# resolves.  ksym.o's three data externals (ksym_names/ksym_table/count) are
+# provided only by the generated kernel_syms.o, so we allow unresolved symbols
+# during the partial link only.
+
+$(BUILD_DIR)/kernel.partial.elf: $(OBJS) $(BUILD_DIR)/ksym.o linker.ld
+	$(CC) $(LDFLAGS) -Wl,--unresolved-symbols=ignore-all -o $@ $(OBJS) $(BUILD_DIR)/ksym.o -lgcc
+
+$(BUILD_DIR)/kernel_fb.partial.elf: $(OBJS_FB) $(BUILD_DIR)/ksym.o linker.ld
+	$(CC) $(LDFLAGS) -Wl,--unresolved-symbols=ignore-all -o $@ $(OBJS_FB) $(BUILD_DIR)/ksym.o -lgcc
+
+$(BUILD_DIR)/kernel_syms.c: $(BUILD_DIR)/kernel.partial.elf tools/gen_kernel_syms.sh
+	sh tools/gen_kernel_syms.sh $(NM) $< > $@
+
+$(BUILD_DIR)/kernel_syms_fb.c: $(BUILD_DIR)/kernel_fb.partial.elf tools/gen_kernel_syms.sh
+	sh tools/gen_kernel_syms.sh $(NM) $< > $@
+
+$(BUILD_DIR)/kernel_syms.o: $(BUILD_DIR)/kernel_syms.c include/ksym.h Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kernel_syms_fb.o: $(BUILD_DIR)/kernel_syms_fb.c include/ksym.h Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(ISO_DIR)/boot/kernel.elf: $(OBJS) $(BUILD_DIR)/ksym.o $(BUILD_DIR)/kernel_syms.o linker.ld
 	mkdir -p $(ISO_DIR)/boot/grub
-	$(CC) $(LDFLAGS) -o $@ $(OBJS) -lgcc
+	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(BUILD_DIR)/ksym.o $(BUILD_DIR)/kernel_syms.o -lgcc
 	grub-file --is-x86-multiboot2 $@
 
-$(ISO_DIR)/boot/kernel-fb.elf: $(OBJS_FB) linker.ld
+$(ISO_DIR)/boot/kernel-fb.elf: $(OBJS_FB) $(BUILD_DIR)/ksym.o $(BUILD_DIR)/kernel_syms_fb.o linker.ld
 	mkdir -p $(ISO_DIR)/boot/grub
-	$(CC) $(LDFLAGS) -o $@ $(OBJS_FB) -lgcc
+	$(CC) $(LDFLAGS) -o $@ $(OBJS_FB) $(BUILD_DIR)/ksym.o $(BUILD_DIR)/kernel_syms_fb.o -lgcc
 	grub-file --is-x86-multiboot2 $@
 
 $(ISO_NAME): $(ISO_DIR)/boot/kernel.elf $(ISO_DIR)/boot/kernel-fb.elf iso/boot/grub/grub.cfg

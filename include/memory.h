@@ -18,6 +18,7 @@ unsigned long phys_alloc_pages(unsigned long count);
 void phys_free_page(unsigned long phys_addr);
 void phys_free_pages(unsigned long phys_addr, unsigned long count);
 int paging_map_page(unsigned long virt_addr, unsigned long phys_addr, unsigned long flags);
+int paging_set_page_flags(unsigned long virt_addr, unsigned long flags);
 void paging_unmap_page(unsigned long virt_addr);
 unsigned long paging_get_phys(unsigned long virt_addr);
 void *virt_alloc_pages(unsigned long count);

@@ -10,7 +10,7 @@
 #define MEMORY_MAX_PHYS 0x100000000ULL
 #define MEMORY_MAX_PAGES (MEMORY_MAX_PHYS / MEMORY_PAGE_SIZE)
 #define MEMORY_BITMAP_BYTES (MEMORY_MAX_PAGES / 8)
-#define KMALLOC_CHUNK_PAGES 16UL
+#define KMALLOC_HEADER_MAGIC 0x4B4D414C4C4F435FUL
 
 #define PAGE_TABLE_ENTRIES 512UL
 #define PAGE_ADDR_MASK 0x000FFFFFFFFFF000UL
@@ -57,8 +57,14 @@ static unsigned char phys_bitmap[MEMORY_BITMAP_BYTES];
 static unsigned char virt_bitmap[MEMORY_VIRT_BITMAP_BYTES];
 static unsigned long total_page_count = 0;
 static unsigned long free_page_count = 0;
-static unsigned long kmalloc_cursor = 0;
-static unsigned long kmalloc_limit = 0;
+
+struct kmalloc_header
+{
+	unsigned long magic;
+	unsigned long pages;
+	unsigned long size;
+	unsigned long reserved;
+};
 
 static void mem_fill(unsigned char *dst, unsigned char value, unsigned long len)
 {
@@ -242,8 +248,6 @@ void memory_init(unsigned long mb2_info_addr)
 	mem_zero(virt_bitmap, sizeof(virt_bitmap));
 	total_page_count = 0;
 	free_page_count = 0;
-	kmalloc_cursor = 0;
-	kmalloc_limit = 0;
 
 	if (mb2_info_addr == 0) return;
 
@@ -341,6 +345,33 @@ int paging_map_page(unsigned long virt_addr, unsigned long phys_addr, unsigned l
 	entry = &pt[pt_index(virt_addr)];
 	if ((*entry & PAGE_FLAG_PRESENT) != 0) return -1;
 	*entry = (phys_addr & PAGE_ADDR_MASK) | (flags & (PAGE_FLAGS_MASK | PAGE_FLAG_NO_EXECUTE)) | PAGE_FLAG_PRESENT;
+	arch_invlpg((const void *)virt_addr);
+	return 0;
+}
+
+int paging_set_page_flags(unsigned long virt_addr, unsigned long flags)
+{
+	unsigned long *pml4;
+	unsigned long *pdpt;
+	unsigned long *pd;
+	unsigned long *pt;
+	unsigned long *entry;
+	unsigned long phys;
+	if ((virt_addr & (MEMORY_PAGE_SIZE - 1)) != 0) return -1;
+	pml4 = root_page_table();
+	entry = &pml4[pml4_index(virt_addr)];
+	if ((*entry & PAGE_FLAG_PRESENT) == 0) return -1;
+	pdpt = page_table_from_entry(*entry);
+	entry = &pdpt[pdpt_index(virt_addr)];
+	if ((*entry & PAGE_FLAG_PRESENT) == 0) return -1;
+	pd = page_table_from_entry(*entry);
+	entry = &pd[pd_index(virt_addr)];
+	if ((*entry & PAGE_FLAG_PRESENT) == 0 || (*entry & PAGE_FLAG_HUGE) != 0) return -1;
+	pt = page_table_from_entry(*entry);
+	entry = &pt[pt_index(virt_addr)];
+	if ((*entry & PAGE_FLAG_PRESENT) == 0) return -1;
+	phys = *entry & PAGE_ADDR_MASK;
+	*entry = phys | (flags & (PAGE_FLAGS_MASK | PAGE_FLAG_NO_EXECUTE)) | PAGE_FLAG_PRESENT;
 	arch_invlpg((const void *)virt_addr);
 	return 0;
 }
@@ -446,30 +477,42 @@ void virt_free_pages(void *addr, unsigned long count)
 
 void *kmalloc(unsigned long size)
 {
-	unsigned long aligned_size;
+	unsigned long header_size;
+	unsigned long payload_size;
+	unsigned long total_bytes;
+	unsigned long pages;
+	void *base;
+	struct kmalloc_header *hdr;
 	if (size == 0) return (void *)0;
-	aligned_size = align_up(size, 16);
-	if (kmalloc_cursor == 0 || kmalloc_cursor + aligned_size > kmalloc_limit)
-	{
-		unsigned long bytes = aligned_size;
-		unsigned long pages = (bytes + MEMORY_PAGE_SIZE - 1) / MEMORY_PAGE_SIZE;
-		void *chunk;
-		if (pages < KMALLOC_CHUNK_PAGES) pages = KMALLOC_CHUNK_PAGES;
-		chunk = virt_alloc_pages(pages);
-		if (chunk == (void *)0) return (void *)0;
-		kmalloc_cursor = (unsigned long)chunk;
-		kmalloc_limit = kmalloc_cursor + pages * MEMORY_PAGE_SIZE;
-	}
-	{
-		void *out = (void *)kmalloc_cursor;
-		kmalloc_cursor += aligned_size;
-		return out;
-	}
+	header_size = align_up((unsigned long)sizeof(struct kmalloc_header), 16);
+	payload_size = align_up(size, 16);
+	total_bytes = header_size + payload_size;
+	pages = (total_bytes + MEMORY_PAGE_SIZE - 1) / MEMORY_PAGE_SIZE;
+	base = virt_alloc_pages(pages);
+	if (base == (void *)0) return (void *)0;
+	hdr = (struct kmalloc_header *)base;
+	hdr->magic = KMALLOC_HEADER_MAGIC;
+	hdr->pages = pages;
+	hdr->size = size;
+	hdr->reserved = 0;
+	return (void *)((unsigned long)base + header_size);
 }
 
 void kfree(void *ptr)
 {
-	(void)ptr;
+	unsigned long header_size;
+	unsigned long ptr_addr;
+	unsigned long header_addr;
+	struct kmalloc_header *hdr;
+	if (ptr == (void *)0) return;
+	ptr_addr = (unsigned long)ptr;
+	header_size = align_up((unsigned long)sizeof(struct kmalloc_header), 16);
+	if (ptr_addr < MEMORY_VIRT_BASE + header_size || ptr_addr >= MEMORY_VIRT_LIMIT) return;
+	header_addr = ptr_addr - header_size;
+	hdr = (struct kmalloc_header *)header_addr;
+	if (hdr->magic != KMALLOC_HEADER_MAGIC || hdr->pages == 0) return;
+	hdr->magic = 0;
+	virt_free_pages((void *)header_addr, hdr->pages);
 }
 
 unsigned long memory_total_pages(void)

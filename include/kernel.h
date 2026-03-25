@@ -1,7 +1,7 @@
 #ifndef TG11_KERNEL_H
 #define TG11_KERNEL_H
 
-#define TG11_OS_VERSION "v0.0.7"
+#define TG11_OS_VERSION "v0.0.8"
 
 void kernel_main(unsigned long mb2_info_addr);
 

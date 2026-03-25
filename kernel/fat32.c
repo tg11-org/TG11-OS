@@ -1003,6 +1003,56 @@ int fat32_read_file_path(const char *path, unsigned char *out_data, unsigned lon
 	return fat32_read_file_entry(entry, out_data, out_capacity, out_size);
 }
 
+int fat32_stat_path(const char *path, int *out_is_dir, unsigned long *out_size)
+{
+	unsigned int parent;
+	unsigned int dir_cluster;
+	unsigned char name83[11];
+	unsigned char entry[32];
+	const char *p;
+
+	if (!fs.mounted) return -1;
+	p = path;
+	if (p == (void *)0 || p[0] == '\0' || (p[0] == '/' && p[1] == '\0'))
+	{
+		if (out_is_dir != (void *)0) *out_is_dir = 1;
+		if (out_size != (void *)0) *out_size = 0;
+		return 0;
+	}
+	if (fat32_resolve_dir_cluster(path, &dir_cluster) == 0)
+	{
+		if (out_is_dir != (void *)0) *out_is_dir = 1;
+		if (out_size != (void *)0) *out_size = 0;
+		return 0;
+	}
+	if (fat32_resolve_parent_and_leaf(path, &parent, name83) != 0) return -1;
+	if (fat32_find_entry_in_dir(parent, name83, (void *)0, (void *)0, entry) != 0) return -1;
+	if (out_is_dir != (void *)0) *out_is_dir = (entry[11] & FAT32_ATTR_DIRECTORY) ? 1 : 0;
+	if (out_size != (void *)0) *out_size = (entry[11] & FAT32_ATTR_DIRECTORY) ? 0 : rd32(&entry[28]);
+	return 0;
+}
+
+int fat32_get_free_bytes(unsigned long *out_free_bytes)
+{
+	unsigned int total_clusters;
+	unsigned int c;
+	unsigned long free_clusters = 0;
+	unsigned long bytes_per_cluster;
+	if (!fs.mounted || out_free_bytes == (void *)0) return -1;
+
+	total_clusters = ((fs.dev->sector_count - fs.data_start_lba) / fs.sectors_per_cluster) + 2U;
+	for (c = 2; c < total_clusters; c++)
+	{
+		unsigned int next;
+		if (fat32_next_cluster(c, &next) != 0) return -1;
+		if (next == 0) free_clusters++;
+	}
+
+	bytes_per_cluster = (unsigned long)fs.sectors_per_cluster * (unsigned long)fs.bytes_per_sector;
+	*out_free_bytes = free_clusters * bytes_per_cluster;
+	return 0;
+}
+
 int fat32_touch_file_path(const char *path)
 {
 	unsigned int parent;

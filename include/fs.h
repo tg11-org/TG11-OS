@@ -20,5 +20,7 @@ int fs_mv(const char *src_path, const char *dst_path);
 
 void fs_get_pwd(char *buffer, unsigned long buffer_size);
 int fs_ls(const char *path, char names[][FS_NAME_MAX + 2], int types[], int max_entries, int *out_count);
+int fs_stat(const char *path, int *out_is_dir, unsigned long *out_size);
+unsigned long fs_free_bytes(void);
 
 #endif

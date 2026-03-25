@@ -13,6 +13,8 @@
 #include "framebuffer.h"
 #include "memory.h"
 #include "elf.h"
+#include "idt.h"
+#include "task.h"
 
 #define INPUT_BUFFER_SIZE 128
 #define SCANCODE_QUEUE_SIZE 256
@@ -27,6 +29,9 @@
 #define EDITOR_THEME_KEYWORD_MAX 40
 #define EDITOR_THEME_KEYWORD_LEN 16
 #define EDITOR_THEME_CUSTOM_GROUP_MAX 4
+#define COMMAND_ALIAS_MAX 16
+#define COMMAND_ALIAS_NAME_LEN 16
+#define COMMAND_ALIAS_EXPANSION_LEN 96
 #define SYSTEM_THEME_DIR "/themes"
 #define SYSTEM_THEME_CURRENT_PATH "/themes/current"
 #define EDITOR_THEME_DIR "/edit/themes"
@@ -60,7 +65,11 @@ static unsigned long terminal_last_drawn_length = 0;
 static int shift_held   = 0;
 static int caps_lock_on = 0;
 static int ctrl_held    = 0;
+static int alt_held     = 0;
 static int extended_key = 0;
+static int panic_esc_held = 0;
+static int panic_f12_held = 0;
+static int panic_hotkey_fired = 0;
 
 /* ------------------------------------------------------------------ */
 /* History                                                            */
@@ -158,11 +167,17 @@ static int script_depth = 0;
 static int script_var_count = 0;
 static char script_var_names[SCRIPT_VAR_MAX][16];
 static char script_var_values[SCRIPT_VAR_MAX][96];
+static int command_alias_count = 0;
+static char command_alias_names[COMMAND_ALIAS_MAX][COMMAND_ALIAS_NAME_LEN];
+static char command_alias_expansions[COMMAND_ALIAS_MAX][COMMAND_ALIAS_EXPANSION_LEN];
 
 static int string_equals(const char *a, const char *b);
 static int string_equals_ci(const char *a, const char *b);
+static const char *skip_spaces(const char *s);
 static const char *read_token(const char *s, char *out, unsigned long out_size);
 static unsigned long string_length(const char *s);
+static void terminal_putc(char c);
+static int parse_dec_u32(const char *s, unsigned int *out);
 static void terminal_clear_selection(void);
 static void terminal_redraw_input_line(void);
 static int fat_mode_active(void);
@@ -243,8 +258,32 @@ static void cmd_display(const char *args);
 static void cmd_fbfont(const char *args);
 static void cmd_memstat(void);
 static void cmd_pagetest(void);
+static void cmd_pagefault(const char *args);
+static void cmd_gpfault(const char *args);
+static void cmd_udfault(const char *args);
+static void cmd_doublefault(const char *args);
+static void cmd_exceptstat(const char *args);
+static void cmd_dumpstack(const char *args);
+static void cmd_selftest(const char *args);
 static void cmd_exec(const char *args);
+static void cmd_tasks(void);
+static void cmd_tasktest(void);
+static void cmd_taskkill(const char *args);
+static void cmd_elfinfo(const char *args);
+static void cmd_elfsym(const char *args);
+static void cmd_elfaddr(const char *args);
+static void cmd_execstress(const char *args);
+static void cmd_elfselftest(const char *args);
+static void trigger_forced_panic(void);
+static void update_panic_hotkey(void);
+static void cmd_man(const char *args);
+static void cmd_alias(const char *args);
+static void cmd_unalias(const char *args);
+static void cmd_dir(const char *args);
+static void cmd_tree(const char *args);
 static void print_help_commands(const char *args);
+static int print_manual_entry(const char *topic, const char *args);
+static int resolve_command_aliases(const char *in, char *out, unsigned long out_size);
 
 #pragma pack(push, 1)
 struct mb2_tag_header
@@ -320,9 +359,13 @@ static enum boot_display_pref boot_display_preference(unsigned long mb2_info_add
 static void print_help_basic(void)
 {
 	terminal_write_line("Basic commands:");
-	terminal_write_line("  help [basic|fs|disk] - Show help pages");
+	terminal_write_line("  help [topic]         - Show help page or command help");
+	terminal_write_line("  man <topic> [page]   - Show command manual entry");
+	terminal_write_line("  man -k <word>        - Search manual entries by keyword");
+	terminal_write_line("  alias <n> <cmd...>   - Create command alias");
+	terminal_write_line("  unalias <name>       - Remove command alias");
 	terminal_write_line("  version              - Show OS version");
-	terminal_write_line("  echo <text>          - Print text (\\n \\t \\e, §NN colors, §b/§i/§u/§s styles, §r reset)");
+	terminal_write_line("  echo <text>          - Print text (\\n \\t \\e, §NN colors, §l/§i/§u/§s styles, §r reset)");
 	terminal_write_line("  glyph <0xNN>         - Print one CP437 glyph byte");
 	terminal_write_line("  charmap              - Show CP437 alias escapes");
 	terminal_write_line("  color show           - Show current colors");
@@ -339,10 +382,24 @@ static void print_help_basic(void)
 	terminal_write_line("  ethemes [list]       - List editor themes");
 	terminal_write_line("  clear                - Clear screen");
 	terminal_write_line("  reboot               - Reboot the system");
+	terminal_write_line("  panic                - Deliberately trigger kernel panic");
 	terminal_write_line("  shutdown/exit/quit   - Shut down");
 	terminal_write_line("  memmap               - Physical memory map");
 	terminal_write_line("  memstat              - Allocator and paging summary");
 	terminal_write_line("  pagetest             - Paging allocator self-test");
+	terminal_write_line("  pagefault <mode>     - Trigger PF: read|write|exec");
+	terminal_write_line("  gpfault              - Trigger #GP using non-canonical address");
+	terminal_write_line("  udfault              - Trigger #UD via UD2 instruction");
+	terminal_write_line("  doublefault          - Simulate double-fault recovery");
+	terminal_write_line("  exceptstat           - Show exception statistics");
+	terminal_write_line("  dumpstack            - Dump current kernel call stack");
+	terminal_write_line("  selftest exceptions [step] - Guided exception test harness");
+	terminal_write_line("  elfinfo <path>       - Inspect ELF headers and symbol count");
+	terminal_write_line("  elfsym <path> [f]    - List ELF symbols, optional name filter");
+	terminal_write_line("  elfaddr <p> <addr>   - Resolve an address to the nearest ELF symbol");
+	terminal_write_line("  exec <path>          - Load/call one ELF64 binary");
+	terminal_write_line("  execstress <n> <path> - Repeat ELF run and show free-page delta");
+	terminal_write_line("  elfselftest          - Run built-in ELF test matrix");
 	terminal_write_line("  hexdump <a> [n]      - Hex dump memory");
 }
 
@@ -351,6 +408,9 @@ static void print_help_fs(void)
 	terminal_write_line("Filesystem commands:");
 	terminal_write_line("  pwd                  - Print current directory");
 	terminal_write_line("  ls [path]            - List entries");
+	terminal_write_line("  dir [path]           - Windows-style directory listing with sizes");
+	terminal_write_line("  tree [/f] [path]     - DOS-style directory tree (/f includes files)");
+	terminal_write_line("  cls/type/copy/move/del/ren - DOS aliases for clear/cat/cp/mv/rm/mv");
 	terminal_write_line("  cd <path>            - Change directory");
 	terminal_write_line("  mkdir <path>         - Create directory");
 	terminal_write_line("  touch <path>         - Create empty file");
@@ -363,7 +423,11 @@ static void print_help_fs(void)
 	terminal_write_line("  hexedit <path>       - Edit raw bytes in hex");
 	terminal_write_line("  run [-x] <path>      - Run script (-x echoes lines)");
 	terminal_write_line("  basic <path>         - Run Tiny BASIC program");
+	terminal_write_line("  elfinfo <path>       - Inspect ELF headers and symbol tables");
+	terminal_write_line("  elfsym <path> [f]    - List symbols from an ELF image");
+	terminal_write_line("  elfaddr <p> <addr>   - Resolve an address inside an ELF image");
 	terminal_write_line("  exec <path>          - Load and run ELF64 kernel binary");
+	terminal_write_line("  elfselftest          - Validate built-in ELF fixtures");
 	terminal_write_line("  script: foreach i in a,b do echo $(i)");
 	terminal_write_line("  fatmount [0|1]       - Mount FAT32 drive (0=master, 1=slave)");
 	terminal_write_line("  drives               - List detected ATA drives");
@@ -386,32 +450,446 @@ static void print_help_disk(void)
 	terminal_write_line("  writesec <lba> <txt> - Write marker text to one sector");
 }
 
-static void cmd_help(const char *args)
+struct manual_entry
 {
-	char page[16];
-	const char *p = read_token(args, page, sizeof(page));
-	if (p == (void *)0 || page[0] == '\0' || string_equals(page, "basic"))
+	const char *name;
+	const char *summary;
+	const char *syntax;
+	const char *description;
+	const char *examples;
+	const char *see_also;
+	const char *keywords;
+};
+
+static const struct manual_entry manual_entries[] = {
+	{"help", "show built-in help pages and command manuals", "help [basic|fs|disk|commands [page]|<command> [page]]", "Use help without arguments for the summary page. Use help with a section name or command name to jump directly to that topic.", "help\nhelp fs\nhelp echo", "man commands alias", "documentation manual topics sections"},
+	{"man", "show one manual entry or search the manual index", "man <topic> [page]\nman -k <word>", "Manual pages are rendered in sections and split into pages automatically when they exceed the visible terminal height.", "man ls\nman echo 2\nman -k file", "help commands alias", "manual search keyword apropos"},
+	{"alias", "create, update, or list shell command aliases", "alias\nalias <name> <command...>\nalias <name>=<command...>", "Aliases expand before command dispatch. Use them to add alternate names like dir for ls or to prefill arguments.", "alias dir ls\nalias bootinfo memstat\nalias", "unalias help man", "command alias shortcut rename"},
+	{"unalias", "remove a shell command alias", "unalias <name>", "Deletes one alias from the runtime alias table.", "unalias dir", "alias help man", "command alias remove delete"},
+	{"version", "print the TG11-OS version string", "version", "Shows the kernel version constant compiled into the image.", "version", "help", "build version release"},
+	{"echo", "print text with escapes, colors, styles, and CP437 aliases", "echo <text>", "Supports escape sequences like \\n and \\xNN, color bytes with &NN or §NN, and style toggles with &l &i &u &s and uppercase variants to disable.", "echo hello\necho &1Fblue&r\necho &lBold &iItalic&r", "glyph charmap color", "print text color style escape serial framebuffer"},
+	{"glyph", "print one raw CP437 byte", "glyph <0xNN>", "Writes a single CP437 glyph byte directly to the terminal.", "glyph 0xDB", "echo charmap", "cp437 glyph byte"},
+	{"charmap", "list the CP437 alias escapes supported by echo", "charmap", "Shows the named escape aliases that expand into box-drawing and symbol characters.", "charmap", "echo glyph", "cp437 aliases symbols"},
+	{"color", "inspect or change terminal colors", "color show\ncolor preview [text|prompt]\ncolor text <0xNN>\ncolor prompt <0xNN>", "The terminal uses classic VGA attribute bytes for text and prompt coloring in both VGA and framebuffer modes.", "color show\ncolor text 0x1F", "echo serial", "palette attribute vga framebuffer"},
+	{"serial", "configure serial mirroring and compact output", "serial [on|off|show|compact <on|off>|rxecho <on|off>]", "Controls whether terminal output is mirrored to COM1 and whether repeated spaces are compacted for easier reading in serial logs.", "serial show\nserial compact on", "echo display", "com1 mirror debug logging"},
+	{"display", "inspect or switch display modes", "display show\ndisplay vga25|vga50|fb\ndisplay mode <show|list|1080p|900p|768p|720p|WIDTHxHEIGHT[xBPP]>\ndisplay cursor <show|underline|block|bar>", "Switch between VGA text modes and framebuffer output, select explicit framebuffer resolutions, and choose cursor shape.", "display show\ndisplay fb\ndisplay mode 1280x720x32", "fbfont color", "video framebuffer vga mode cursor"},
+	{"fbfont", "inspect or customize the framebuffer font", "fbfont [show|list|style <classic|blocky>|size <small|normal|large>|reset|glyph <ch> <r0..r6>|save <name>|load <name>]", "Manage the built-in framebuffer font, patch glyph rows manually, and persist named font variants under /fonts.", "fbfont list\nfbfont size large\nfbfont save chunky", "display themes", "font framebuffer glyph editor"},
+	{"theme", "apply a system theme", "theme <name>", "Loads a theme from /themes and applies its terminal colors.", "theme ocean", "themes etheme ethemes", "theme palette colors"},
+	{"themes", "list available system themes", "themes [list]", "Enumerates the theme files stored in /themes.", "themes", "theme ethemes", "theme list palette"},
+	{"etheme", "apply or edit an editor theme", "etheme <name>\netheme edit <name>", "Loads an editor theme from /edit/themes or opens that file in the editor for modification.", "etheme amber\netheme edit amber", "ethemes theme edit", "editor theme syntax colors"},
+	{"ethemes", "list available editor themes", "ethemes [list]", "Enumerates editor theme files from /edit/themes.", "ethemes", "etheme theme", "editor theme list"},
+	{"clear", "clear the screen", "clear", "Clears the terminal contents and redraws the prompt.", "clear", "help", "cls clear screen"},
+	{"reboot", "restart the machine", "reboot", "Requests an immediate reboot.", "reboot", "shutdown", "restart reset power"},
+	{"panic", "deliberately trigger a kernel panic", "panic", "Triggers an invalid opcode exception on purpose. Useful for testing panic screen handling and reboot hotkeys like Esc+F12.", "panic", "reboot memstat", "crash panic test debug"},
+	{"shutdown", "shut down the machine", "shutdown\nexit\nquit", "Stops the VM or machine using the supported power-off path.", "shutdown", "reboot", "power off quit exit"},
+	{"pwd", "print the current working directory", "pwd", "Shows the shell's current working directory.", "pwd", "cd ls", "filesystem cwd path"},
+	{"ls", "list directory entries", "ls [path]", "Lists files and directories from the current working directory or the given path.", "ls\nls /scripts", "cd pwd dir", "filesystem list directory"},
+	{"dir", "show a Windows-style directory listing", "dir [/b] [/w] [/s] [path]", "Prints one entry per line with a type column and file sizes, followed by summary totals. /b is bare names, /w is wide names, and /s recursively lists each directory with its own totals plus a grand total.", "dir\ndir /w\ndir /s scripts", "ls tree cd pwd", "filesystem directory size windows dos"},
+	{"tree", "show a DOS-style directory tree", "tree [/f] [path]", "Displays a recursive tree. Add /f to include files in addition to directories.", "tree\ntree /f scripts", "dir ls cd", "filesystem recursive tree dos"},
+	{"cls", "DOS alias for clear", "cls", "Runs clear.", "cls", "clear", "dos compatibility alias"},
+	{"type", "DOS alias for cat", "type <path>", "Runs cat on a file path.", "type readme.txt", "cat", "dos compatibility alias"},
+	{"copy", "DOS alias for cp", "copy <src> <dst>", "Runs cp with the provided arguments.", "copy a.txt b.txt", "cp", "dos compatibility alias"},
+	{"move", "DOS alias for mv", "move <src> <dst>", "Runs mv with the provided arguments.", "move a.txt b.txt", "mv", "dos compatibility alias"},
+	{"del", "DOS alias for rm", "del <path>", "Runs rm with the provided arguments.", "del notes.txt", "rm", "dos compatibility alias"},
+	{"ren", "DOS alias for mv", "ren <old> <new>", "Runs mv for simple rename semantics.", "ren old.txt new.txt", "mv", "dos compatibility alias"},
+	{"cd", "change the current working directory", "cd <path>", "Moves the shell's current directory to another path.", "cd /scripts", "pwd ls", "filesystem cwd change directory"},
+	{"mkdir", "create a directory", "mkdir <path>", "Creates one directory at the given path.", "mkdir /games", "ls touch rm", "filesystem directory create"},
+	{"touch", "create an empty file", "touch <path>", "Creates a zero-length file if it does not already exist.", "touch notes.txt", "write cat rm", "filesystem file create"},
+	{"write", "replace a file with text", "write <path> <text>", "Writes the provided text into a file, replacing any previous contents.", "write note.txt hello", "touch cat edit", "filesystem file write text"},
+	{"cat", "print a file to the terminal", "cat <path>", "Reads a text file and writes it to the terminal.", "cat scripts/tic-tac-toe.bas", "write edit hexedit", "filesystem file read text"},
+	{"rm", "remove a file or directory tree", "rm [-r] [-f] <path>", "Deletes one file or recursively removes a directory tree when -r is supplied. -f suppresses some errors.", "rm note.txt\nrm -r games", "cp mv mkdir", "filesystem delete remove recursive"},
+	{"cp", "copy a file or directory tree", "cp [-r] [-n] [-i] <src> <dst>", "Copies files and optionally full directory trees. -n avoids overwrite, -i asks before overwrite when supported.", "cp note.txt note2.txt\ncp -r src backup", "mv rm", "filesystem copy duplicate"},
+	{"mv", "move or rename a file or directory", "mv [-n] [-i] <src> <dst>", "Renames or moves files and directories. -n avoids overwrite, -i asks before overwrite when supported.", "mv old.txt new.txt", "cp rm", "filesystem move rename"},
+	{"edit", "open the built-in text editor", "edit <path>", "Starts the text editor on the chosen file.", "edit readme.txt", "hexedit write cat", "editor text file"},
+	{"hexedit", "open the built-in hex editor", "hexedit <path>", "Starts the hex editor for raw byte editing.", "hexedit kernel.bin", "edit hexdump", "editor hex bytes file"},
+	{"run", "execute a shell script file", "run [-x] <path>", "Runs one script file through the shell. -x echoes each line before executing it.", "run boot.scr\nrun -x test.scr", "basic edit", "script shell batch"},
+	{"basic", "run a Tiny BASIC program", "basic <path>", "Loads and runs a Tiny BASIC program from the filesystem.", "basic scripts/tic-tac-toe.bas", "run edit", "basic interpreter program"},
+	{"elfinfo", "inspect ELF64 headers and symbol metadata", "elfinfo <path>", "Parses an ELF64 file without executing it and prints header fields, PT_LOAD range, and how many named defined symbols were found.", "elfinfo /app.elf", "elfsym elfaddr exec", "elf symbols debug headers metadata"},
+	{"elfsym", "list named ELF64 symbols", "elfsym <path> [filter]", "Lists named defined symbols from SHT_SYMTAB or SHT_DYNSYM. Supply an optional filter substring to narrow the output.", "elfsym /app.elf\nelfsym /kernel/app.elf start", "elfinfo elfaddr exec", "elf symbols symtab debug lookup"},
+	{"elfaddr", "resolve an address to the nearest ELF64 symbol", "elfaddr <path> <hex-address>", "Looks up the nearest named symbol at or before the given virtual address and reports the offset into that symbol.", "elfaddr /app.elf 0xFFFF900003000000", "elfinfo elfsym exec", "elf address symbol resolve debug"},
+	{"exec", "load and call an ELF64 kernel binary", "exec <path>", "Loads a small ELF64 image into kernel memory, maps its PT_LOAD segments, and calls its entry point directly.", "exec app.elf", "memstat pagetest", "elf executable loader"},
+	{"execstress", "run one ELF repeatedly and check memory delta", "execstress <count> <path>", "Loads, executes, and unloads the same ELF image count times, then reports free-page delta to help detect leaks while iterating on ELF/memory changes.", "execstress 100 app.elf", "exec memstat pagetest", "elf stress test memory leak"},
+	{"elfselftest", "run built-in ELF functional and leak tests", "elfselftest", "Runs /app.elf, /appw.elf, and /app2p.elf checks (return values + load/unload stability) and performs a short stress loop with free-page delta reporting.", "elfselftest", "exec execstress memstat", "elf selftest memory loader"},
+	{"hexdump", "dump memory in hex", "hexdump <address> [count]", "Reads memory starting from a hex address and shows a hex dump.", "hexdump 0x100000 64", "hexedit memmap", "memory dump debug"},
+	{"memmap", "show the physical memory map", "memmap", "Displays the multiboot-provided physical memory map.", "memmap", "memstat pagetest", "memory multiboot map"},
+	{"memstat", "show allocator and paging state", "memstat", "Displays total and free pages, the virtual allocation window, and the active CR3 value.", "memstat", "memmap pagetest exec", "memory paging allocator cr3"},
+	{"pagetest", "exercise the paging allocator", "pagetest", "Allocates pages, writes a pattern, verifies it, unmaps it, and confirms the mapping is gone.", "pagetest", "memstat exec", "paging allocator self test"},
+	{"pagefault", "trigger a controlled page fault", "pagefault <read|write|exec>", "Intentionally faults using an unmapped address. read dereferences it, write stores through it, and exec calls it as code so you can verify decoded #PF bits on the panic screen.", "pagefault read\npagefault write\npagefault exec", "panic pagetest memstat", "page fault pf cr2 panic test"},
+	{"gpfault", "trigger a controlled general-protection fault", "gpfault", "Triggers #GP by dereferencing a non-canonical address in long mode.", "gpfault", "udfault pagefault panic", "general protection fault gp exception test"},
+	{"udfault", "trigger a controlled invalid-opcode fault", "udfault", "Executes UD2 to intentionally trigger #UD.", "udfault", "gpfault pagefault panic", "invalid opcode ud exception test"},
+	{"doublefault", "simulate double-fault recovery", "doublefault", "Simulates a double fault by directly invoking the recovery handler. A double fault occurs when an exception happens while handling another exception.", "doublefault", "udfault gpfault panic", "double fault df exception recovery test"},
+	{"exceptstat", "display exception statistics", "exceptstat", "Shows the count of each exception type that has occurred since system boot. Useful for detecting repeated faults under load.", "exceptstat", "panic udfault gpfault", "exception statistics counter tracking diagnostics"},
+	{"dumpstack", "dump current kernel call stack", "dumpstack", "Walks the RBP chain to display the current function call stack. Useful for runtime diagnostics before intentional faults.", "dumpstack", "exceptstat panic", "stack dump backtrace call chain"},
+	{"selftest", "run guided built-in test suites", "selftest exceptions [pf-read|pf-write|pf-exec|ud|gp|1|2|3|4|5]", "Prints a reboot-friendly exception test plan, or runs one selected step and triggers the expected fault immediately.", "selftest exceptions\nselftest exceptions pf-exec\nselftest exceptions 4", "pagefault gpfault udfault panic", "selftest test harness exceptions diagnostics"},
+	{"ataid", "show ATA identity information", "ataid", "Detects ATA drives and shows the available sector count.", "ataid", "drives readsec writesec", "ata disk identity"},
+	{"readsec", "dump one 512-byte sector", "readsec <lba-hex>", "Reads and dumps one sector from the selected ATA device.", "readsec 0x20", "writesec ataid", "ata sector read"},
+	{"writesec", "write text into one sector", "writesec <lba> <text>", "Writes marker text into a single sector for low-level disk testing.", "writesec 32 hello", "readsec ataid", "ata sector write"},
+	{"drives", "list detected ATA drives", "drives", "Enumerates the ATA drives seen by the kernel.", "drives", "ataid fatmount", "ata disk list"},
+	{"fatmount", "mount a FAT32 drive", "fatmount [0|1]", "Mounts the selected ATA disk as the active FAT32 data drive.", "fatmount 0", "fatunmount drives ramfs", "fat32 mount disk"},
+	{"fatunmount", "unmount the FAT32 drive", "fatunmount", "Detaches the active FAT32 data drive.", "fatunmount", "fatmount ramfs", "fat32 unmount disk"},
+	{"ramfs", "switch generic file commands back to RAM FS", "ramfs", "Makes generic file commands operate on the RAM filesystem again instead of the FAT volume.", "ramfs", "fatmount ramfs2fat", "ramfs filesystem switch"},
+	{"ramfs2fat", "copy the RAM FS tree to FAT32", "ramfs2fat [map]", "Copies the RAM filesystem tree onto the mounted FAT32 volume or prints the filename mapping when map is supplied.", "ramfs2fat\nramfs2fat map", "ramfs fatmount", "ramfs fat32 copy sync"},
+	{"fatls", "list FAT32 directory entries", "fatls", "Lists the contents of the current FAT32 working directory.", "fatls", "fatcat fattouch fatwrite", "fat32 list directory"},
+	{"fatcat", "print one FAT32 file", "fatcat <path>", "Reads and prints a file from the mounted FAT32 volume.", "fatcat /notes.txt", "fatwrite fattouch", "fat32 file read"},
+	{"fattouch", "create an empty FAT32 file", "fattouch <path>", "Creates a zero-length file on the mounted FAT32 volume.", "fattouch /new.txt", "fatwrite fatcat", "fat32 file create"},
+	{"fatwrite", "replace a FAT32 file with text", "fatwrite <path> <text>", "Writes text into a FAT32 file, replacing the previous contents.", "fatwrite /note.txt hello", "fattouch fatcat", "fat32 file write"},
+	{"fatattr", "inspect or modify FAT32 attributes", "fatattr <path> [mods]", "Shows or changes FAT attribute bits like read-only, hidden, system, and archive.", "fatattr /note.txt\nfatattr /note.txt +r", "fatls fatrm", "fat32 attributes readonly hidden"},
+	{"fatrm", "remove a FAT32 file or directory", "fatrm <path>", "Deletes a file or directory from the mounted FAT32 volume.", "fatrm /note.txt", "fatls fatattr", "fat32 remove delete"}
+};
+
+static char ascii_lower(char c)
+{
+	if (c >= 'A' && c <= 'Z') return (char)(c + ('a' - 'A'));
+	return c;
+}
+
+static int string_contains_ci(const char *text, const char *needle)
+{
+	unsigned long i;
+	unsigned long j;
+	if (text == (void *)0 || needle == (void *)0 || needle[0] == '\0') return 0;
+	for (i = 0; text[i] != '\0'; i++)
+	{
+		for (j = 0; needle[j] != '\0'; j++)
+		{
+			if (text[i + j] == '\0') return 0;
+			if (ascii_lower(text[i + j]) != ascii_lower(needle[j])) break;
+		}
+		if (needle[j] == '\0') return 1;
+	}
+	return 0;
+}
+
+static int command_alias_index(const char *name)
+{
+	int i;
+	if (name == (void *)0 || name[0] == '\0') return -1;
+	for (i = 0; i < command_alias_count; i++)
+	{
+		if (string_equals(command_alias_names[i], name)) return i;
+	}
+	return -1;
+}
+
+static const char *command_alias_lookup(const char *name)
+{
+	int i = command_alias_index(name);
+	if (i < 0) return (void *)0;
+	return command_alias_expansions[i];
+}
+
+static const struct manual_entry *find_manual_entry(const char *topic)
+{
+	unsigned long i;
+	for (i = 0; i < sizeof(manual_entries) / sizeof(manual_entries[0]); i++)
+	{
+		if (string_equals(manual_entries[i].name, topic)) return &manual_entries[i];
+	}
+	return (void *)0;
+}
+
+static unsigned int parse_manual_page_arg(const char *args, const char *usage, unsigned int *page_out)
+{
+	char tok[16];
+	const char *rest;
+	unsigned int page = 1;
+	if (page_out == (void *)0) return 0;
+	*page_out = 1;
+	if (args == (void *)0) return 1;
+	args = skip_spaces(args);
+	if (args[0] == '\0') return 1;
+	rest = read_token(args, tok, sizeof(tok));
+	if (rest == (void *)0 || tok[0] == '\0')
+	{
+		terminal_write_line(usage);
+		return 0;
+	}
+	if (parse_dec_u32(tok, &page) != 0 || page == 0 || skip_spaces(rest)[0] != '\0')
+	{
+		terminal_write_line(usage);
+		return 0;
+	}
+	*page_out = page;
+	return 1;
+}
+
+static unsigned int manual_text_line_count(const char *text)
+{
+	unsigned int count = 1;
+	unsigned long i;
+	if (text == (void *)0 || text[0] == '\0') return 0;
+	for (i = 0; text[i] != '\0'; i++) if (text[i] == '\n') count++;
+	return count;
+}
+
+static unsigned int manual_section_line_count(const char *body)
+{
+	if (body == (void *)0 || body[0] == '\0') return 0;
+	return 1 + manual_text_line_count(body) + 1;
+}
+
+static void manual_emit_line(const char *line, unsigned int start, unsigned int end, unsigned int *line_no)
+{
+	if (*line_no >= start && *line_no < end) terminal_write_line(line);
+	(*line_no)++;
+}
+
+static void manual_emit_text_block(const char *text, unsigned int start, unsigned int end, unsigned int *line_no)
+{
+	char line[160];
+	unsigned long i = 0;
+	unsigned long j = 0;
+	if (text == (void *)0 || text[0] == '\0') return;
+	for (;;)
+	{
+		if (text[i] == '\n' || text[i] == '\0')
+		{
+			line[j] = '\0';
+			manual_emit_line(line, start, end, line_no);
+			j = 0;
+			if (text[i] == '\0') break;
+			i++;
+			continue;
+		}
+		if (j + 1 < sizeof(line)) line[j++] = text[i];
+		i++;
+	}
+}
+
+static void manual_emit_section(const char *title, const char *body, unsigned int start, unsigned int end, unsigned int *line_no)
+{
+	if (body == (void *)0 || body[0] == '\0') return;
+	manual_emit_line(title, start, end, line_no);
+	manual_emit_text_block(body, start, end, line_no);
+	manual_emit_line("", start, end, line_no);
+}
+
+static void manual_make_name_line(const char *name, const char *summary, char *out, unsigned long out_size)
+{
+	unsigned long n = 0;
+	unsigned long i = 0;
+	if (out_size == 0) return;
+	while (name[i] != '\0' && n + 1 < out_size) out[n++] = name[i++];
+	if (summary != (void *)0 && summary[0] != '\0' && n + 4 < out_size)
+	{
+		out[n++] = ' ';
+		out[n++] = '-';
+		out[n++] = ' ';
+		i = 0;
+		while (summary[i] != '\0' && n + 1 < out_size) out[n++] = summary[i++];
+	}
+	out[n] = '\0';
+}
+
+static void render_manual_entry_page(const struct manual_entry *entry, const char *topic_name, unsigned int page)
+{
+	char header[96];
+	char name_line[160];
+	char page_buf[16];
+	char total_buf[16];
+	unsigned int per_page;
+	unsigned int total_lines;
+	unsigned int total_pages;
+	unsigned int start;
+	unsigned int end;
+	unsigned int line_no = 0;
+
+	per_page = (unsigned int)screen_get_height();
+	if (per_page < 8) per_page = 12;
+	else per_page -= 3;
+
+	manual_make_name_line(topic_name, entry->summary, name_line, sizeof(name_line));
+	total_lines = 2;
+	total_lines += manual_section_line_count(name_line);
+	total_lines += manual_section_line_count(entry->syntax);
+	total_lines += manual_section_line_count(entry->description);
+	total_lines += manual_section_line_count(entry->examples);
+	total_lines += manual_section_line_count(entry->see_also);
+	if (total_lines == 0) total_lines = 1;
+	total_pages = (total_lines + per_page - 1) / per_page;
+	if (total_pages == 0) total_pages = 1;
+	if (page > total_pages) page = total_pages;
+	start = (page - 1) * per_page;
+	end = start + per_page;
+
+	uint_to_dec((unsigned long)page, page_buf, sizeof(page_buf));
+	uint_to_dec((unsigned long)total_pages, total_buf, sizeof(total_buf));
+	manual_make_name_line("Manual", topic_name, header, sizeof(header));
+	manual_emit_line(header, start, end, &line_no);
+	manual_emit_line("", start, end, &line_no);
+	manual_emit_section("NAME", name_line, start, end, &line_no);
+	manual_emit_section("SYNOPSIS", entry->syntax, start, end, &line_no);
+	manual_emit_section("DESCRIPTION", entry->description, start, end, &line_no);
+	manual_emit_section("EXAMPLES", entry->examples, start, end, &line_no);
+	manual_emit_section("SEE ALSO", entry->see_also, start, end, &line_no);
+
+	if (total_pages > 1)
+	{
+		terminal_write("Page ");
+		terminal_write(page_buf);
+		terminal_write("/");
+		terminal_write_line(total_buf);
+		terminal_write("Use: man ");
+		terminal_write(topic_name);
+		terminal_write_line(" <page>");
+	}
+}
+
+static void render_alias_manual(const char *alias_name, const char *expansion)
+{
+	char target[COMMAND_ALIAS_NAME_LEN];
+	char description[160];
+	char see_also[64];
+	const char *p;
+	const struct manual_entry *entry;
+	unsigned int n = 0;
+	p = read_token(expansion, target, sizeof(target));
+	entry = find_manual_entry(target);
+	manual_emit_line("NAME", 0, 1000, &n);
+	terminal_write("  "); terminal_write(alias_name); terminal_write(" - alias for "); terminal_write_line(expansion);
+	manual_emit_line("", 0, 1000, &n);
+	manual_emit_line("SYNOPSIS", 0, 1000, &n);
+	terminal_write("  "); terminal_write(alias_name); terminal_write_line(" [args...]");
+	manual_emit_line("", 0, 1000, &n);
+	description[0] = '\0';
+	manual_make_name_line("  Expands to", expansion, description, sizeof(description));
+	manual_emit_line("DESCRIPTION", 0, 1000, &n);
+	terminal_write_line(description);
+	if (entry != (void *)0)
+	{
+		terminal_write("  Target summary: ");
+		terminal_write_line(entry->summary);
+	}
+	manual_emit_line("", 0, 1000, &n);
+	see_also[0] = '\0';
+	manual_make_name_line("  alias", "unalias help", see_also, sizeof(see_also));
+	manual_emit_line("SEE ALSO", 0, 1000, &n);
+	terminal_write_line(see_also);
+	(void)p;
+}
+
+static void print_manual_keyword_matches(const char *keyword)
+{
+	unsigned long i;
+	int found = 0;
+	if (keyword == (void *)0 || keyword[0] == '\0')
+	{
+		terminal_write_line("Usage: man -k <word>");
+		return;
+	}
+	for (i = 0; i < sizeof(manual_entries) / sizeof(manual_entries[0]); i++)
+	{
+		if (string_contains_ci(manual_entries[i].name, keyword) ||
+		    string_contains_ci(manual_entries[i].summary, keyword) ||
+		    string_contains_ci(manual_entries[i].description, keyword) ||
+		    string_contains_ci(manual_entries[i].keywords, keyword))
+		{
+			terminal_write("  ");
+			terminal_write(manual_entries[i].name);
+			terminal_write(" - ");
+			terminal_write_line(manual_entries[i].summary);
+			found = 1;
+		}
+	}
+	for (i = 0; i < (unsigned long)command_alias_count; i++)
+	{
+		if (string_contains_ci(command_alias_names[i], keyword) || string_contains_ci(command_alias_expansions[i], keyword))
+		{
+			terminal_write("  ");
+			terminal_write(command_alias_names[i]);
+			terminal_write(" - alias for ");
+			terminal_write_line(command_alias_expansions[i]);
+			found = 1;
+		}
+	}
+	if (!found) terminal_write_line("No manual entries matched.");
+}
+
+static int print_manual_entry(const char *topic, const char *args)
+{
+	unsigned int page = 1;
+	const struct manual_entry *entry;
+	const char *alias_expansion;
+	if (topic == (void *)0 || topic[0] == '\0') return 0;
+
+	if (string_equals(topic, "basic"))
 	{
 		print_help_basic();
-		terminal_write_line("Type 'help fs', 'help disk', or 'help commands'.");
-		return;
+		return 1;
 	}
-	if (string_equals(page, "fs"))
+	if (string_equals(topic, "fs"))
 	{
 		print_help_fs();
-		return;
+		return 1;
 	}
-	if (string_equals(page, "disk"))
+	if (string_equals(topic, "disk"))
 	{
 		print_help_disk();
-		return;
+		return 1;
 	}
-	if (string_equals(page, "commands") || string_equals(page, "cmds"))
+	if (string_equals(topic, "commands") || string_equals(topic, "cmds"))
 	{
-		print_help_commands(p);
+		print_help_commands(args);
+		return 1;
+	}
+
+	alias_expansion = command_alias_lookup(topic);
+	if (alias_expansion != (void *)0)
+	{
+		render_alias_manual(topic, alias_expansion);
+		return 1;
+	}
+
+	entry = find_manual_entry(topic);
+	if (entry == (void *)0) return 0;
+	if (!parse_manual_page_arg(args, "Usage: man <topic> [page]", &page)) return 1;
+	render_manual_entry_page(entry, topic, page);
+	return 1;
+}
+
+static void cmd_help(const char *args)
+{
+	char topic[16];
+	const char *rest = read_token(args, topic, sizeof(topic));
+	if (rest == (void *)0 || topic[0] == '\0' || string_equals(topic, "basic"))
+	{
+		print_help_basic();
+		terminal_write_line("Try 'help fs', 'help disk', 'help commands', 'man echo', or 'man -k file'.");
 		return;
 	}
-	terminal_write_line("Usage: help [basic|fs|disk|commands [page]]");
+	if (print_manual_entry(topic, rest))
+	{
+		return;
+	}
+	terminal_write_line("Usage: help [basic|fs|disk|commands [page]|<command> [page]]");
+}
+
+static void cmd_man(const char *args)
+{
+	char topic[16];
+	const char *rest = read_token(args, topic, sizeof(topic));
+	if (rest == (void *)0 || topic[0] == '\0')
+	{
+		terminal_write_line("Usage: man <topic> [page]");
+		terminal_write_line("Usage: man -k <word>");
+		terminal_write_line("Examples: man ls, man echo 2, man -k file");
+		return;
+	}
+	if (string_equals(topic, "-k"))
+	{
+		char keyword[32];
+		if (read_token(rest, keyword, sizeof(keyword)) == (void *)0 || keyword[0] == '\0')
+		{
+			terminal_write_line("Usage: man -k <word>");
+			return;
+		}
+		print_manual_keyword_matches(keyword);
+		return;
+	}
+	if (!print_manual_entry(topic, rest))
+	{
+		terminal_write_line("No manual entry for that topic.");
+	}
 }
 
 static void terminal_putc(char c)
@@ -1650,19 +2128,14 @@ static void terminal_write_echo_text(const char *text)
 
 	while (text[i] != '\0')
 	{
-		if ((text[i] == (char)0xA7 || text[i] == '&') && hex_nibble(text[i + 1]) >= 0 && hex_nibble(text[i + 2]) >= 0)
-		{
-			unsigned char next_color = (unsigned char)((hex_nibble(text[i + 1]) << 4) | hex_nibble(text[i + 2]));
-			screen_set_color(next_color);
-			i += 3;
-			continue;
-		}
 		if (text[i] == (char)0xA7 || text[i] == '&')
 		{
+			/* Style codes: l/L=bold, i/I=italic, u/U=underline, s/S=strike, r=reset */
+			/* All non-hex letters — no ambiguity with &XX color codes */
 			unsigned char style = screen_get_style();
 			char code = text[i + 1];
-			if (code == 'b') { screen_set_style((unsigned char)(style | SCREEN_STYLE_BOLD)); i += 2; continue; }
-			if (code == 'B') { screen_set_style((unsigned char)(style & (unsigned char)~SCREEN_STYLE_BOLD)); i += 2; continue; }
+			if (code == 'l') { screen_set_style((unsigned char)(style | SCREEN_STYLE_BOLD)); i += 2; continue; }
+			if (code == 'L') { screen_set_style((unsigned char)(style & (unsigned char)~SCREEN_STYLE_BOLD)); i += 2; continue; }
 			if (code == 'i') { screen_set_style((unsigned char)(style | SCREEN_STYLE_ITALIC)); i += 2; continue; }
 			if (code == 'I') { screen_set_style((unsigned char)(style & (unsigned char)~SCREEN_STYLE_ITALIC)); i += 2; continue; }
 			if (code == 'u') { screen_set_style((unsigned char)(style | SCREEN_STYLE_UNDERLINE)); i += 2; continue; }
@@ -1670,6 +2143,14 @@ static void terminal_write_echo_text(const char *text)
 			if (code == 's') { screen_set_style((unsigned char)(style | SCREEN_STYLE_STRIKE)); i += 2; continue; }
 			if (code == 'S') { screen_set_style((unsigned char)(style & (unsigned char)~SCREEN_STYLE_STRIKE)); i += 2; continue; }
 			if (code == 'r') { screen_set_color(base_color); screen_set_style(base_style); i += 2; continue; }
+			/* Hex color: &XX or §XX (two hex digits, not a style code) */
+			if (hex_nibble(text[i + 1]) >= 0 && hex_nibble(text[i + 2]) >= 0)
+			{
+				unsigned char next_color = (unsigned char)((hex_nibble(text[i + 1]) << 4) | hex_nibble(text[i + 2]));
+				screen_set_color(next_color);
+				i += 3;
+				continue;
+			}
 		}
 		if (text[i] == '\\')
 		{
@@ -2734,10 +3215,11 @@ static void handle_arrow_down(void)
 /* ================================================================== */
 
 static const char * const cmd_list[] = {
-	"help", "version", "echo", "glyph", "charmap", "color", "serial", "display", "themes", "theme", "ethemes", "etheme", "clear", "reboot",
+	"help", "man", "alias", "unalias", "version", "echo", "glyph", "charmap", "color", "serial", "display", "themes", "theme", "ethemes", "etheme", "clear", "reboot",
+	"panic",
 	"quit", "exit", "shutdown",
-	"pwd", "ls", "cd", "mkdir", "touch", "write", "cat", "rm", "cp", "mv", "edit", "hexedit", "run", "basic",
-	"hexdump", "memmap", "memstat", "pagetest", "exec", "ataid", "readsec", "writesec", "drives", "fatmount", "ramfs", "ramfs2fat", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatattr", "fatrm", (void *)0
+	"pwd", "ls", "dir", "tree", "cd", "mkdir", "touch", "write", "cat", "type", "rm", "del", "cp", "copy", "mv", "move", "ren", "edit", "hexedit", "run", "basic", "cls",
+	"hexdump", "memmap", "memstat", "pagetest", "pagefault", "gpfault", "udfault", "doublefault", "exceptstat", "dumpstack", "selftest", "elfinfo", "elfsym", "elfaddr", "exec", "execstress", "elfselftest", "tasks", "tasktest", "taskkill", "ataid", "readsec", "writesec", "drives", "fatmount", "ramfs", "ramfs2fat", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatattr", "fatrm", (void *)0
 };
 
 static int parse_dec_u32(const char *s, unsigned int *out)
@@ -2756,10 +3238,214 @@ static int parse_dec_u32(const char *s, unsigned int *out)
 	return 0;
 }
 
+static int read_shell_file_bytes(const char *op, const char *path, unsigned char *buf, unsigned long capacity, unsigned long *out_size)
+{
+	char resolved[128];
+
+	if (path == (void *)0 || path[0] == '\0' || buf == (void *)0 || out_size == (void *)0) return -1;
+	if (fat_mode_active())
+	{
+		if (fat_resolve_path(path, resolved, sizeof(resolved)) != 0)
+		{
+			terminal_write(op);
+			terminal_write_line(": invalid FAT path");
+			return -1;
+		}
+		if (fat32_read_file_path(resolved, buf, capacity, out_size) != 0)
+		{
+			terminal_write(op);
+			terminal_write_line(": read failed");
+			return -1;
+		}
+	}
+	else
+	{
+		if (fs_read_file(path, buf, capacity, out_size) != 0)
+		{
+			terminal_write(op);
+			terminal_write_line(": read failed");
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static const char *elf_type_name(unsigned short type)
+{
+	switch (type)
+	{
+		case 1: return "REL";
+		case 2: return "EXEC";
+		case 3: return "DYN";
+		case 4: return "CORE";
+		default: return "OTHER";
+	}
+}
+
+static const char *elf_symbol_type_name(unsigned char info)
+{
+	switch (info & 0x0Fu)
+	{
+		case 0: return "NOTYPE";
+		case 1: return "OBJECT";
+		case 2: return "FUNC";
+		case 3: return "SECTION";
+		case 4: return "FILE";
+		default: return "OTHER";
+	}
+}
+
+static const char *elf_symbol_bind_name(unsigned char info)
+{
+	switch ((unsigned char)(info >> 4))
+	{
+		case 0: return "LOCAL";
+		case 1: return "GLOBAL";
+		case 2: return "WEAK";
+		default: return "OTHER";
+	}
+}
+
+static const char *elf_phdr_type_name(unsigned int type)
+{
+	switch (type)
+	{
+		case 0: return "NULL";
+		case 1: return "LOAD";
+		case 2: return "DYNAMIC";
+		case 3: return "INTERP";
+		case 4: return "NOTE";
+		case 5: return "SHLIB";
+		case 6: return "PHDR";
+		case 7: return "TLS";
+		default: return "OTHER";
+	}
+}
+
+static const char *elf_section_type_name(unsigned int type)
+{
+	switch (type)
+	{
+		case 0: return "NULL";
+		case 1: return "PROGBITS";
+		case 2: return "SYMTAB";
+		case 3: return "STRTAB";
+		case 4: return "RELA";
+		case 5: return "HASH";
+		case 6: return "DYNAMIC";
+		case 7: return "NOTE";
+		case 8: return "NOBITS";
+		case 9: return "REL";
+		case 11: return "DYNSYM";
+		default: return "OTHER";
+	}
+}
+
+struct elf_symbol_print_ctx
+{
+	const char *filter;
+	unsigned long total;
+	unsigned long matched;
+};
+
+static int print_elf_symbol(const elf_symbol_t *sym, void *ctx)
+{
+	struct elf_symbol_print_ctx *print_ctx = (struct elf_symbol_print_ctx *)ctx;
+	char size_buf[24];
+
+	print_ctx->total++;
+	if (print_ctx->filter != (void *)0 && print_ctx->filter[0] != '\0' && !string_contains_ci(sym->name, print_ctx->filter))
+		return 0;
+
+	print_ctx->matched++;
+	terminal_write("  ");
+	terminal_write(elf_symbol_bind_name(sym->info));
+	terminal_write(" ");
+	terminal_write(elf_symbol_type_name(sym->info));
+	terminal_write(" ");
+	terminal_write_hex64(sym->value);
+	terminal_write(" size=");
+	uint_to_dec(sym->size, size_buf, sizeof(size_buf));
+	terminal_write(size_buf);
+	terminal_write(" ");
+	terminal_write_line(sym->name);
+	return 0;
+}
+
+struct elf_phdr_print_ctx
+{
+	unsigned long count;
+};
+
+struct elf_section_print_ctx
+{
+	unsigned long count;
+};
+
+static int print_elf_phdr(const elf_program_header_info_t *ph, void *ctx)
+{
+	struct elf_phdr_print_ctx *print_ctx = (struct elf_phdr_print_ctx *)ctx;
+	char n[16];
+	char flags[4];
+
+	flags[0] = (ph->flags & 0x4u) ? 'R' : '-';
+	flags[1] = (ph->flags & 0x2u) ? 'W' : '-';
+	flags[2] = (ph->flags & 0x1u) ? 'X' : '-';
+	flags[3] = '\0';
+
+	print_ctx->count++;
+	terminal_write("    [");
+	uint_to_dec(ph->index, n, sizeof(n));
+	terminal_write(n);
+	terminal_write("] ");
+	terminal_write(elf_phdr_type_name(ph->type));
+	terminal_write(" flags=");
+	terminal_write(flags);
+	terminal_write(" vaddr=");
+	terminal_write_hex64(ph->vaddr);
+	terminal_write(" off=");
+	terminal_write_hex64(ph->offset);
+	terminal_write(" filesz=");
+	uint_to_dec(ph->filesz, n, sizeof(n));
+	terminal_write(n);
+	terminal_write(" memsz=");
+	uint_to_dec(ph->memsz, n, sizeof(n));
+	terminal_write_line(n);
+	return 0;
+}
+
+static int print_elf_section(const elf_section_info_t *section, void *ctx)
+{
+	struct elf_section_print_ctx *print_ctx = (struct elf_section_print_ctx *)ctx;
+	char n[16];
+
+	print_ctx->count++;
+	terminal_write("    [");
+	uint_to_dec(section->index, n, sizeof(n));
+	terminal_write(n);
+	terminal_write("] ");
+	if (section->name != (void *)0 && section->name[0] != '\0') terminal_write(section->name);
+	else terminal_write("<noname>");
+	terminal_write(" type=");
+	terminal_write(elf_section_type_name(section->type));
+	terminal_write(" addr=");
+	terminal_write_hex64(section->addr);
+	terminal_write(" off=");
+	terminal_write_hex64(section->offset);
+	terminal_write(" size=");
+	uint_to_dec(section->size, n, sizeof(n));
+	terminal_write(n);
+	terminal_write(" flags=");
+	terminal_write_hex64(section->flags);
+	terminal_putc('\n');
+	return 0;
+}
+
 static void print_help_commands(const char *args)
 {
 	unsigned int page = 1;
 	unsigned int total = 0;
+	unsigned int builtins = 0;
 	unsigned int pages;
 	unsigned int per_page = 12;
 	unsigned int start;
@@ -2778,7 +3464,8 @@ static void print_help_commands(const char *args)
 		}
 	}
 
-	while (cmd_list[total] != (void *)0) total++;
+	while (cmd_list[builtins] != (void *)0) builtins++;
+	total = builtins + (unsigned int)command_alias_count;
 	pages = (total + per_page - 1) / per_page;
 	if (pages == 0) pages = 1;
 	if (page > pages) page = pages;
@@ -2797,20 +3484,215 @@ static void print_help_commands(const char *args)
 	for (i = start; i < end; i++)
 	{
 		terminal_write("  ");
-		terminal_write_line(cmd_list[i]);
+		if (i < builtins)
+		{
+			terminal_write_line(cmd_list[i]);
+		}
+		else
+		{
+			unsigned int alias_index = i - builtins;
+			terminal_write(command_alias_names[alias_index]);
+			terminal_write(" -> ");
+			terminal_write_line(command_alias_expansions[alias_index]);
+		}
 	}
 
 	terminal_write_line("Use: help commands <page>");
 }
 
+static int command_is_builtin_name(const char *name)
+{
+	int i;
+	for (i = 0; cmd_list[i] != (void *)0; i++)
+	{
+		if (string_equals(cmd_list[i], name)) return 1;
+	}
+	return 0;
+}
+
+static void cmd_alias(const char *args)
+{
+	char tok[COMMAND_ALIAS_NAME_LEN + COMMAND_ALIAS_EXPANSION_LEN + 2];
+	char name[COMMAND_ALIAS_NAME_LEN];
+	char expansion[COMMAND_ALIAS_EXPANSION_LEN];
+	const char *p;
+	const char *rest;
+	unsigned long i;
+	int index;
+
+	p = read_token(args, tok, sizeof(tok));
+	if (p == (void *)0 || tok[0] == '\0')
+	{
+		if (command_alias_count == 0)
+		{
+			terminal_write_line("alias: no aliases defined");
+			return;
+		}
+		for (i = 0; i < (unsigned long)command_alias_count; i++)
+		{
+			terminal_write("alias ");
+			terminal_write(command_alias_names[i]);
+			terminal_write("=");
+			terminal_write_line(command_alias_expansions[i]);
+		}
+		return;
+	}
+
+	for (i = 0; tok[i] != '\0' && tok[i] != '=' && i + 1 < sizeof(name); i++) name[i] = tok[i];
+	name[i] = '\0';
+	if (name[0] == '\0' || !token_is_word_only(name))
+	{
+		terminal_write_line("alias: invalid name");
+		return;
+	}
+	if (command_is_builtin_name(name))
+	{
+		terminal_write_line("alias: name collides with a built-in command");
+		return;
+	}
+
+	expansion[0] = '\0';
+	if (tok[i] == '=')
+	{
+		unsigned long j = 0;
+		i++;
+		while (tok[i] != '\0' && j + 1 < sizeof(expansion)) expansion[j++] = tok[i++];
+		rest = skip_spaces(p);
+		if (rest[0] != '\0' && j + 1 < sizeof(expansion))
+		{
+			if (j > 0) expansion[j++] = ' ';
+			for (i = 0; rest[i] != '\0' && j + 1 < sizeof(expansion); i++) expansion[j++] = rest[i];
+		}
+		expansion[j] = '\0';
+	}
+	else
+	{
+		rest = skip_spaces(p);
+		if (rest[0] == '\0')
+		{
+			index = command_alias_index(name);
+			if (index < 0)
+			{
+				terminal_write_line("alias: not found");
+				return;
+			}
+			terminal_write("alias ");
+			terminal_write(command_alias_names[index]);
+			terminal_write("=");
+			terminal_write_line(command_alias_expansions[index]);
+			return;
+		}
+		for (i = 0; rest[i] != '\0' && i + 1 < sizeof(expansion); i++) expansion[i] = rest[i];
+		expansion[i] = '\0';
+	}
+
+	if (expansion[0] == '\0')
+	{
+		terminal_write_line("Usage: alias <name> <command...>");
+		terminal_write_line("Usage: alias <name>=<command...>");
+		return;
+	}
+
+	index = command_alias_index(name);
+	if (index < 0)
+	{
+		if (command_alias_count >= COMMAND_ALIAS_MAX)
+		{
+			terminal_write_line("alias: alias table full");
+			return;
+		}
+		index = command_alias_count++;
+	}
+	for (i = 0; i + 1 < COMMAND_ALIAS_NAME_LEN && name[i] != '\0'; i++) command_alias_names[index][i] = name[i];
+	command_alias_names[index][i] = '\0';
+	for (i = 0; i + 1 < COMMAND_ALIAS_EXPANSION_LEN && expansion[i] != '\0'; i++) command_alias_expansions[index][i] = expansion[i];
+	command_alias_expansions[index][i] = '\0';
+	terminal_write("alias: ");
+	terminal_write(name);
+	terminal_write(" -> ");
+	terminal_write_line(expansion);
+}
+
+static void cmd_unalias(const char *args)
+{
+	char name[COMMAND_ALIAS_NAME_LEN];
+	int index;
+	int i;
+	if (read_token(args, name, sizeof(name)) == (void *)0 || name[0] == '\0')
+	{
+		terminal_write_line("Usage: unalias <name>");
+		return;
+	}
+	index = command_alias_index(name);
+	if (index < 0)
+	{
+		terminal_write_line("unalias: not found");
+		return;
+	}
+	for (i = index; i + 1 < command_alias_count; i++)
+	{
+		unsigned long j;
+		for (j = 0; j < COMMAND_ALIAS_NAME_LEN; j++) command_alias_names[i][j] = command_alias_names[i + 1][j];
+		for (j = 0; j < COMMAND_ALIAS_EXPANSION_LEN; j++) command_alias_expansions[i][j] = command_alias_expansions[i + 1][j];
+	}
+	command_alias_count--;
+	terminal_write("unalias: removed ");
+	terminal_write_line(name);
+}
+
+static int resolve_command_aliases(const char *in, char *out, unsigned long out_size)
+{
+	char current[INPUT_BUFFER_SIZE];
+	char next[INPUT_BUFFER_SIZE];
+	char name[COMMAND_ALIAS_NAME_LEN];
+	const char *p;
+	const char *alias_expansion;
+	const char *rest;
+	unsigned long i;
+	unsigned long n;
+	int depth;
+
+	if (in == (void *)0 || out == (void *)0 || out_size == 0) return -1;
+	for (i = 0; in[i] != '\0' && i + 1 < sizeof(current); i++) current[i] = in[i];
+	current[i] = '\0';
+
+	for (depth = 0; depth < COMMAND_ALIAS_MAX; depth++)
+	{
+		p = read_token(current, name, sizeof(name));
+		if (p == (void *)0) return -1;
+		if (name[0] == '\0') break;
+		alias_expansion = command_alias_lookup(name);
+		if (alias_expansion == (void *)0) break;
+		rest = skip_spaces(p);
+		n = 0;
+		for (i = 0; alias_expansion[i] != '\0' && n + 1 < sizeof(next); i++) next[n++] = alias_expansion[i];
+		if (rest[0] != '\0' && n + 1 < sizeof(next)) next[n++] = ' ';
+		for (i = 0; rest[i] != '\0' && n + 1 < sizeof(next); i++) next[n++] = rest[i];
+		next[n] = '\0';
+		for (i = 0; next[i] != '\0' && i + 1 < sizeof(current); i++) current[i] = next[i];
+		current[i] = '\0';
+	}
+	if (depth == COMMAND_ALIAS_MAX)
+	{
+		terminal_write_line("alias: expansion loop too deep");
+		return -1;
+	}
+	for (i = 0; current[i] != '\0' && i + 1 < out_size; i++) out[i] = current[i];
+	out[i] = '\0';
+	return 0;
+}
+
 static void handle_tab(void)
 {
 	int i, match_count = 0;
+	int alias_index;
 	unsigned long j;
 	const char *last = (void *)0;
 
 	for (i = 0; cmd_list[i]; i++)
 		if (string_starts_with(cmd_list[i], input_buffer)) { match_count++; last = cmd_list[i]; }
+	for (alias_index = 0; alias_index < command_alias_count; alias_index++)
+		if (string_starts_with(command_alias_names[alias_index], input_buffer)) { match_count++; last = command_alias_names[alias_index]; }
 
 	if (match_count == 1)
 	{
@@ -2825,6 +3707,8 @@ static void handle_tab(void)
 		sync_screen_pos(); terminal_putc('\n');
 		for (i = 0; cmd_list[i]; i++)
 			if (string_starts_with(cmd_list[i], input_buffer)) { terminal_write(cmd_list[i]); terminal_putc(' '); }
+		for (alias_index = 0; alias_index < command_alias_count; alias_index++)
+			if (string_starts_with(command_alias_names[alias_index], input_buffer)) { terminal_write(command_alias_names[alias_index]); terminal_putc(' '); }
 		terminal_putc('\n');
 		screen_set_color(terminal_prompt_color); terminal_write("> "); screen_set_color(terminal_text_color);
 		prompt_vga_start = screen_get_pos();
@@ -2928,6 +3812,17 @@ static void handle_backspace(int from_serial)
 	if (!from_serial && serial_ready && serial_mirror_enabled && !serial_compact_enabled) serial_write("\b \b");
 }
 
+static void terminal_abort_input_line(void)
+{
+	input_length = 0;
+	cursor_pos = 0;
+	input_buffer[0] = '\0';
+	terminal_clear_selection();
+	sync_screen_pos();
+	terminal_write_line("^C");
+	terminal_prompt();
+}
+
 /* ================================================================== */
 /* Commands                                                           */
 /* ================================================================== */
@@ -2962,6 +3857,342 @@ static void do_reboot(void)
 	arch_outb(0xCF9, 0x06); /* ACPI / PCH reset control register */
 	arch_outb(0x64, 0xFE);  /* Fallback: 8042 reset line         */
 	for (;;) arch_halt();
+}
+
+static void trigger_forced_panic(void)
+{
+	/* Intentional page fault for panic-path testing. */
+	*((volatile unsigned long *)0) = 0xDEADBEEFUL;
+	for (;;) arch_halt();
+}
+
+static unsigned long pagefault_test_addr(void)
+{
+	unsigned long addr = memory_virtual_limit() + MEMORY_PAGE_SIZE;
+	unsigned int i;
+
+	for (i = 0; i < 64; i++)
+	{
+		if (paging_get_phys(addr) == 0) return addr;
+		addr += MEMORY_PAGE_SIZE;
+	}
+
+	return memory_virtual_limit() + (128UL * MEMORY_PAGE_SIZE);
+}
+
+static void cmd_pagefault(const char *args)
+{
+	char mode[16];
+	const char *p = read_token(args, mode, sizeof(mode));
+	unsigned long fault_addr;
+
+	if (p == (void *)0 || mode[0] == '\0' || skip_spaces(p)[0] != '\0')
+	{
+		terminal_write_line("Usage: pagefault <read|write|exec>");
+		return;
+	}
+
+	terminal_write("[pagefault] mode: ");
+	terminal_write_line(mode);
+	fault_addr = pagefault_test_addr();
+	terminal_write("[pagefault] addr: ");
+	terminal_write_hex64(fault_addr);
+	terminal_putc('\n');
+
+	if (string_equals(mode, "read"))
+	{
+		volatile unsigned long value = *((volatile unsigned long *)fault_addr);
+		(void)value;
+	}
+	else if (string_equals(mode, "write"))
+	{
+		*((volatile unsigned long *)fault_addr) = 0x5046554CUL;
+	}
+	else if (string_equals(mode, "exec"))
+	{
+		typedef void (*pf_exec_t)(void);
+		pf_exec_t fn = (pf_exec_t)fault_addr;
+		fn();
+	}
+	else
+	{
+		terminal_write_line("Usage: pagefault <read|write|exec>");
+		return;
+	}
+
+	for (;;) arch_halt();
+}
+
+static void cmd_gpfault(const char *args)
+{
+	if (skip_spaces(args)[0] != '\0')
+	{
+		terminal_write_line("Usage: gpfault");
+		return;
+	}
+
+	terminal_write_line("[gpfault] using non-canonical address 0x0000800000000000");
+	{
+		volatile unsigned long value = *((volatile unsigned long *)0x0000800000000000UL);
+		(void)value;
+	}
+
+	for (;;) arch_halt();
+}
+
+static void cmd_udfault(const char *args)
+{
+	if (skip_spaces(args)[0] != '\0')
+	{
+		terminal_write_line("Usage: udfault");
+		return;
+	}
+
+	terminal_write_line("[udfault] executing UD2");
+	__asm__ volatile("ud2");
+	for (;;) arch_halt();
+}
+
+static void cmd_doublefault(const char *args)
+{
+	struct exception_frame frame;
+	unsigned long current_rsp;
+
+	if (skip_spaces(args)[0] != '\0')
+	{
+		terminal_write_line("Usage: doublefault");
+		return;
+	}
+
+	terminal_write_line("[doublefault] simulating double fault recovery");
+
+	/* Get current RSP using inline assembly */
+	current_rsp = 0;
+	__asm__ volatile("mov %%rsp, %0" : "=r"(current_rsp));
+
+	/* Build a frame representing a double fault */
+	frame.rax = 0;
+	frame.rbx = 0;
+	frame.rcx = 0;
+	frame.rdx = 0;
+	frame.rsi = 0;
+	frame.rdi = 0;
+	frame.rbp = 0;
+	frame.r8 = 0;
+	frame.r9 = 0;
+	frame.r10 = 0;
+	frame.r11 = 0;
+	frame.r12 = 0;
+	frame.r13 = 0;
+	frame.r14 = 0;
+	frame.r15 = 0;
+	frame.vector = 8;         /* Vector 8 = Double Fault */
+	frame.error_code = 0;
+	frame.rip = (unsigned long)cmd_doublefault;  /* Use function address */
+	frame.cs = 0x08;
+	frame.rflags = 0x202;
+	frame.rsp = current_rsp;
+	frame.ss = 0x10;
+
+	/* Call the double fault handler - this will display the panic screen */
+	double_fault_handler(&frame);
+
+	for (;;) arch_halt();
+}
+
+static void cmd_exceptstat(const char *args)
+{
+	const char *names[] = {
+		"#DE", "#DB", "NMI", "#BP", "#OF", "#BR", "#UD", "#NM",
+		"#DF", "CSO", "#TS", "#NP", "#SS", "#GP", "#PF", "Res",
+		"#MF", "#AC", "#MC", "#XF", "#VE", "#CP", "Res", "Res",
+		"Res", "Res", "Res", "Res", "Res", "Res", "#SX", "Res"
+	};
+	int i;
+	unsigned long total = 0;
+
+	if (skip_spaces(args)[0] != '\0')
+	{
+		terminal_write_line("Usage: exceptstat");
+		return;
+	}
+
+	terminal_write_line("Exception Statistics (since boot):");
+	terminal_write_line("  Vec  Exception  Count");
+	terminal_write_line("  --- ---------- -------");
+
+	for (i = 0; i < 32; i++)
+	{
+		unsigned long count = idt_get_exception_count((unsigned char)i);
+		if (count > 0)
+		{
+			char vec_str[4];
+			char count_str[16];
+			unsigned long temp;
+
+			/* Format vector number */
+			vec_str[0] = ' ';
+			if (i < 10)
+			{
+				vec_str[1] = '0' + i;
+				vec_str[2] = ' ';
+				vec_str[3] = '\0';
+			}
+			else
+			{
+				vec_str[1] = '0' + (i / 10);
+				vec_str[2] = '0' + (i % 10);
+				vec_str[3] = '\0';
+			}
+
+			/* Format count */
+			temp = count;
+			int digits = 0;
+			while (temp > 0) { digits++; temp /= 10; }
+			if (digits == 0) digits = 1;
+			for (int j = digits - 1; j >= 0; j--)
+			{
+				count_str[j] = '0' + (count % 10);
+				count /= 10;
+			}
+			count_str[digits] = '\0';
+
+			terminal_write(vec_str);
+			terminal_write("  ");
+			terminal_write(names[i]);
+			terminal_write(count < 100 ? "        " : count < 1000 ? "       " : "      ");
+			terminal_write(count_str);
+			terminal_write("\n");
+			total += count;
+		}
+	}
+
+	terminal_write_line("  --- ---------- -------");
+	char total_str[16];
+	unsigned long temp = total;
+	int digits = 0;
+	while (temp > 0) { digits++; temp /= 10; }
+	if (digits == 0) digits = 1;
+	for (int j = digits - 1; j >= 0; j--)
+	{
+		total_str[j] = '0' + (total % 10);
+		total /= 10;
+	}
+	total_str[digits] = '\0';
+	terminal_write("  TOTAL COUNT ");
+	terminal_write(total < 1000000 ? "      " : "     ");
+	terminal_write(total_str);
+	terminal_write("\n");
+}
+
+static void cmd_dumpstack(const char *args)
+{
+	unsigned long current_rbp = 0;
+
+	if (skip_spaces(args)[0] != '\0')
+	{
+		terminal_write_line("Usage: dumpstack");
+		return;
+	}
+
+	/* Get current RBP */
+	__asm__ volatile("mov %%rbp, %0" : "=r"(current_rbp));
+
+	terminal_write_line("=== Kernel Stack Dump ===");
+	terminal_write_line("Walking RBP chain from entry point:");
+	idt_display_backtrace(current_rbp);
+	terminal_write_line("=== End Stack Dump ===");
+}
+
+static void cmd_selftest(const char *args)
+{
+	char suite[16];
+	char step[16];
+	const char *p = read_token(args, suite, sizeof(suite));
+
+	if (p == (void *)0 || suite[0] == '\0')
+	{
+		terminal_write_line("Usage: selftest exceptions [pf-read|pf-write|pf-exec|ud|gp|1|2|3|4|5]");
+		return;
+	}
+	if (!string_equals(suite, "exceptions"))
+	{
+		terminal_write_line("selftest: only 'exceptions' suite is available right now");
+		terminal_write_line("Usage: selftest exceptions [pf-read|pf-write|pf-exec|ud|gp|1|2|3|4|5]");
+		return;
+	}
+
+	p = read_token(p, step, sizeof(step));
+	if (p == (void *)0)
+	{
+		terminal_write_line("Usage: selftest exceptions [pf-read|pf-write|pf-exec|ud|gp|1|2|3|4|5]");
+		return;
+	}
+
+	if (step[0] == '\0')
+	{
+		terminal_write_line("selftest exceptions: reboot-friendly plan");
+		terminal_write_line("  1. selftest exceptions pf-read   -> expect #PF vec=0x0E, P=0 W=0 I=0");
+		terminal_write_line("  2. selftest exceptions pf-write  -> expect #PF vec=0x0E, P=0 W=1 I=0");
+		terminal_write_line("  3. selftest exceptions pf-exec   -> expect #PF vec=0x0E, P=0 W=0 I=1");
+		terminal_write_line("  4. selftest exceptions ud        -> expect #UD vec=0x06");
+		terminal_write_line("  5. selftest exceptions gp        -> expect #GP vec=0x0D");
+		terminal_write_line("Run one step at a time; each step intentionally panics.");
+		return;
+	}
+	if (skip_spaces(p)[0] != '\0')
+	{
+		terminal_write_line("Usage: selftest exceptions [pf-read|pf-write|pf-exec|ud|gp|1|2|3|4|5]");
+		return;
+	}
+
+	if (string_equals(step, "pf-read") || string_equals(step, "1"))
+	{
+		terminal_write_line("[selftest] step 1/5: #PF read expected (vec=0x0E, P=0 W=0 I=0)");
+		cmd_pagefault("read");
+		return;
+	}
+	if (string_equals(step, "pf-write") || string_equals(step, "2"))
+	{
+		terminal_write_line("[selftest] step 2/5: #PF write expected (vec=0x0E, P=0 W=1 I=0)");
+		cmd_pagefault("write");
+		return;
+	}
+	if (string_equals(step, "pf-exec") || string_equals(step, "3"))
+	{
+		terminal_write_line("[selftest] step 3/5: #PF exec expected (vec=0x0E, P=0 W=0 I=1)");
+		cmd_pagefault("exec");
+		return;
+	}
+	if (string_equals(step, "ud") || string_equals(step, "4"))
+	{
+		terminal_write_line("[selftest] step 4/5: #UD expected (vec=0x06)");
+		cmd_udfault("");
+		return;
+	}
+	if (string_equals(step, "gp") || string_equals(step, "5"))
+	{
+		terminal_write_line("[selftest] step 5/5: #GP expected (vec=0x0D)");
+		cmd_gpfault("");
+		return;
+	}
+
+	terminal_write_line("Usage: selftest exceptions [pf-read|pf-write|pf-exec|ud|gp|1|2|3|4|5]");
+}
+
+static void update_panic_hotkey(void)
+{
+	if (panic_esc_held && panic_f12_held)
+	{
+		if (!panic_hotkey_fired)
+		{
+			panic_hotkey_fired = 1;
+			terminal_write_line("[SYSTEM] Esc+F12 detected");
+			trigger_forced_panic();
+		}
+		return;
+	}
+	panic_hotkey_fired = 0;
 }
 
 static void cmd_hexdump(const char *args)
@@ -3123,12 +4354,10 @@ static void cmd_pagetest(void)
 static void cmd_exec(const char *args)
 {
 	char path[128];
-	char resolved[128];
 	unsigned char buf[8192];
 	unsigned long size = 0;
 	elf_exec_t prog;
 	int rc;
-	long ret;
 	const char *p = read_token(args, path, sizeof(path));
 
 	if (p == (void *)0 || path[0] == '\0')
@@ -3137,27 +4366,7 @@ static void cmd_exec(const char *args)
 		return;
 	}
 
-	if (fat_mode_active())
-	{
-		if (fat_resolve_path(path, resolved, sizeof(resolved)) != 0)
-		{
-			terminal_write_line("exec: invalid FAT path");
-			return;
-		}
-		if (fat32_read_file_path(resolved, buf, sizeof(buf), &size) != 0)
-		{
-			terminal_write_line("exec: read failed");
-			return;
-		}
-	}
-	else
-	{
-		if (fs_read_file(path, buf, sizeof(buf), &size) != 0)
-		{
-			terminal_write_line("exec: read failed");
-			return;
-		}
-	}
+	if (read_shell_file_bytes("exec", path, buf, sizeof(buf), &size) != 0) return;
 
 	terminal_write("[exec] loading ");
 	terminal_write(path);
@@ -3186,25 +4395,681 @@ static void cmd_exec(const char *args)
 	terminal_putc('\n');
 	terminal_write_line("[exec] calling...");
 
-	ret = elf_call(&prog);
-
-	terminal_write("[exec] returned: ");
 	{
-		char retbuf[32];
-		if (ret < 0)
+#define USER_STACK_TOP   0x800000UL
+#define USER_STACK_PAGES 8
+#define USER_STACK_BASE  (USER_STACK_TOP - (unsigned long)(USER_STACK_PAGES) * 4096UL)
+		unsigned long page;
+		unsigned long phys_pages[USER_STACK_PAGES];
+		int map_ok = 1;
+		int i;
+		unsigned long flags = PAGE_FLAG_PRESENT | PAGE_FLAG_WRITABLE | PAGE_FLAG_USER | PAGE_FLAG_NO_EXECUTE;
+
+		/* Map user stack pages */
+		for (i = 0; i < USER_STACK_PAGES; i++) phys_pages[i] = 0;
+		for (i = 0; i < USER_STACK_PAGES && map_ok; i++)
 		{
-			terminal_putc('-');
-			uint_to_dec((unsigned long)(-ret), retbuf, sizeof(retbuf));
+			page = USER_STACK_BASE + (unsigned long)i * 4096UL;
+			phys_pages[i] = phys_alloc_page();
+			if (phys_pages[i] == 0 || paging_map_page(page, phys_pages[i], flags) != 0)
+			{
+				if (phys_pages[i] != 0) { phys_free_page(phys_pages[i]); phys_pages[i] = 0; }
+				map_ok = 0;
+			}
 		}
-		else
+
+		if (!map_ok)
 		{
-			uint_to_dec((unsigned long)ret, retbuf, sizeof(retbuf));
+			/* Unwind any pages already mapped */
+			for (i = 0; i < USER_STACK_PAGES; i++)
+			{
+				if (phys_pages[i] != 0)
+				{
+					paging_unmap_page(USER_STACK_BASE + (unsigned long)i * 4096UL);
+					phys_free_page(phys_pages[i]);
+				}
+			}
+			terminal_write_line("[exec] failed to map user stack");
+			elf_unload(buf, size);
+			return;
 		}
-		terminal_write_line(retbuf);
+
+		task_exec_user(prog.entry, USER_STACK_TOP);
+
+		/* Unmap user stack pages */
+		for (i = 0; i < USER_STACK_PAGES; i++)
+		{
+			page = USER_STACK_BASE + (unsigned long)i * 4096UL;
+			paging_unmap_page(page);
+			if (phys_pages[i] != 0) phys_free_page(phys_pages[i]);
+		}
 	}
 
 	elf_unload(buf, size);
 	terminal_write_line("[exec] done");
+}
+
+struct task_test_ctx { unsigned int id; };
+static struct task_test_ctx tasktest_ctx_a = { 1 };
+static struct task_test_ctx tasktest_ctx_b = { 2 };
+
+static void task_test_fn(void *arg)
+{
+	struct task_test_ctx *c = (struct task_test_ctx *)arg;
+	unsigned int i;
+	for (i = 0; i < 3; i++)
+	{
+		terminal_write("[tasktest] worker ");
+		terminal_write(c->id == 1 ? "A" : "B");
+		terminal_write(" step ");
+		terminal_write(i == 0 ? "0" : i == 1 ? "1" : "2");
+		terminal_write_line("");
+		task_yield();
+	}
+}
+
+static void cmd_tasks(void)
+{
+	task_print_list();
+}
+
+static void cmd_tasktest(void)
+{
+	if (task_create("ttest-a", task_test_fn, &tasktest_ctx_a) < 0 ||
+	    task_create("ttest-b", task_test_fn, &tasktest_ctx_b) < 0)
+	{
+		terminal_write_line("[tasktest] task_create failed");
+		return;
+	}
+	terminal_write_line("[tasktest] tasks created; yielding to let them run...");
+	{
+		unsigned int n;
+		for (n = 0; n < 10; n++) task_yield();
+	}
+	terminal_write_line("[tasktest] back in kernel shell");
+}
+
+static void cmd_taskkill(const char *args)
+{
+	char tok[16];
+	unsigned int id;
+	int killed = 0;
+
+	if (read_token(args, tok, sizeof(tok)) == (void *)0 || tok[0] == '\0')
+	{
+		terminal_write_line("Usage: taskkill <id>|all");
+		return;
+	}
+
+	if (string_equals(tok, "all"))
+	{
+		killed = task_kill_all();
+		if (killed == 0) terminal_write_line("taskkill: no killable tasks");
+		else terminal_write_line("taskkill: terminated matching tasks");
+		return;
+	}
+
+	if (parse_dec_u32(tok, &id) != 0)
+	{
+		terminal_write_line("Usage: taskkill <id>|all");
+		return;
+	}
+
+	if (task_kill(id) != 0)
+	{
+		terminal_write_line("taskkill: failed (invalid/protected/running task)");
+		return;
+	}
+	terminal_write_line("taskkill: terminated");
+}
+
+static void cmd_elfinfo(const char *args)
+{
+	char path[128];
+	unsigned char buf[8192];
+	unsigned long size = 0;
+	elf_info_t info;
+	struct elf_phdr_print_ctx phdr_ctx;
+	struct elf_section_print_ctx section_ctx;
+	int rc;
+	const char *p = read_token(args, path, sizeof(path));
+
+	if (p == (void *)0 || path[0] == '\0' || skip_spaces(p)[0] != '\0')
+	{
+		terminal_write_line("Usage: elfinfo <path>");
+		return;
+	}
+	if (read_shell_file_bytes("elfinfo", path, buf, sizeof(buf), &size) != 0) return;
+
+	rc = elf_get_info(buf, size, &info);
+	if (rc != ELF_OK)
+	{
+		terminal_write("elfinfo: parse error ");
+		if (rc < 0)
+		{
+			char n[16];
+			terminal_putc('-');
+			uint_to_dec((unsigned long)(-rc), n, sizeof(n));
+			terminal_write_line(n);
+		}
+		else
+		{
+			char n[16];
+			uint_to_dec((unsigned long)rc, n, sizeof(n));
+			terminal_write_line(n);
+		}
+		return;
+	}
+
+	terminal_write("elfinfo: ");
+	terminal_write_line(path);
+	terminal_write("  type: ");
+	terminal_write(elf_type_name(info.type));
+	terminal_write("  machine: ");
+	if (info.machine == 62) terminal_write_line("x86-64");
+	else terminal_write_line("other");
+	terminal_write("  entry: ");
+	terminal_write_hex64(info.entry);
+	terminal_putc('\n');
+	terminal_write("  phnum: ");
+	{
+		char n[16];
+		uint_to_dec(info.phnum, n, sizeof(n));
+		terminal_write(n);
+		terminal_write("  shnum: ");
+		uint_to_dec(info.shnum, n, sizeof(n));
+		terminal_write_line(n);
+	}
+	terminal_write("  load range: ");
+	if (info.load_end > info.load_base)
+	{
+		terminal_write_hex64(info.load_base);
+		terminal_write(" - ");
+		terminal_write_hex64(info.load_end);
+		terminal_putc('\n');
+	}
+	else
+	{
+		terminal_write_line("none");
+	}
+	terminal_write("  symbols: ");
+	{
+		char n[16];
+		uint_to_dec(info.symbol_count, n, sizeof(n));
+		terminal_write_line(n);
+	}
+
+	terminal_write_line("  program headers:");
+	phdr_ctx.count = 0;
+	rc = elf_visit_program_headers(buf, size, print_elf_phdr, &phdr_ctx);
+	if (rc == ELF_ERR_PHDR)
+	{
+		terminal_write_line("    none");
+	}
+	else if (rc != ELF_OK)
+	{
+		terminal_write_line("    <parse failed>");
+	}
+	else if (phdr_ctx.count == 0)
+	{
+		terminal_write_line("    none");
+	}
+
+	terminal_write_line("  sections:");
+	section_ctx.count = 0;
+	rc = elf_visit_sections(buf, size, print_elf_section, &section_ctx);
+	if (rc == ELF_ERR_SHDR)
+	{
+		terminal_write_line("    none");
+	}
+	else if (rc != ELF_OK)
+	{
+		terminal_write_line("    <parse failed>");
+	}
+	else if (section_ctx.count == 0)
+	{
+		terminal_write_line("    none");
+	}
+}
+
+static void cmd_elfsym(const char *args)
+{
+	char path[128];
+	char filter[64];
+	unsigned char buf[8192];
+	unsigned long size = 0;
+	struct elf_symbol_print_ctx ctx;
+	int rc;
+	const char *p = read_token(args, path, sizeof(path));
+
+	if (p == (void *)0 || path[0] == '\0')
+	{
+		terminal_write_line("Usage: elfsym <path> [filter]");
+		return;
+	}
+	p = read_token(p, filter, sizeof(filter));
+	if (p == (void *)0)
+	{
+		terminal_write_line("Usage: elfsym <path> [filter]");
+		return;
+	}
+	if (filter[0] != '\0' && skip_spaces(p)[0] != '\0')
+	{
+		terminal_write_line("Usage: elfsym <path> [filter]");
+		return;
+	}
+	if (read_shell_file_bytes("elfsym", path, buf, sizeof(buf), &size) != 0) return;
+
+	ctx.filter = filter[0] == '\0' ? (void *)0 : filter;
+	ctx.total = 0;
+	ctx.matched = 0;
+
+	terminal_write("elfsym: ");
+	terminal_write_line(path);
+	rc = elf_visit_symbols(buf, size, print_elf_symbol, &ctx);
+	if (rc == ELF_ERR_NOSYM)
+	{
+		terminal_write_line("  no named defined symbols");
+		return;
+	}
+	if (rc != ELF_OK)
+	{
+		terminal_write_line("  parse failed");
+		return;
+	}
+	terminal_write("  matched ");
+	{
+		char n[16];
+		uint_to_dec(ctx.matched, n, sizeof(n));
+		terminal_write(n);
+		terminal_write(" of ");
+		uint_to_dec(ctx.total, n, sizeof(n));
+		terminal_write_line(n);
+	}
+}
+
+static void cmd_elfaddr(const char *args)
+{
+	char path[128];
+	char addr_tok[32];
+	unsigned char buf[8192];
+	unsigned long size = 0;
+	unsigned long addr;
+	unsigned long offset;
+	elf_symbol_t sym;
+	const char *end;
+	const char *p = read_token(args, path, sizeof(path));
+	int rc;
+
+	if (p == (void *)0 || path[0] == '\0')
+	{
+		terminal_write_line("Usage: elfaddr <path> <hex-address>");
+		return;
+	}
+	p = read_token(p, addr_tok, sizeof(addr_tok));
+	if (p == (void *)0 || addr_tok[0] == '\0' || skip_spaces(p)[0] != '\0')
+	{
+		terminal_write_line("Usage: elfaddr <path> <hex-address>");
+		return;
+	}
+	addr = parse_hex(addr_tok, &end);
+	if (*end != '\0')
+	{
+		terminal_write_line("elfaddr: bad hex address");
+		return;
+	}
+	if (read_shell_file_bytes("elfaddr", path, buf, sizeof(buf), &size) != 0) return;
+
+	rc = elf_find_symbol_by_addr(buf, size, addr, &sym, &offset);
+	if (rc == ELF_ERR_NOSYM)
+	{
+		terminal_write_line("elfaddr: no matching symbol");
+		return;
+	}
+	if (rc != ELF_OK)
+	{
+		terminal_write_line("elfaddr: parse failed");
+		return;
+	}
+
+	terminal_write("elfaddr: ");
+	terminal_write_hex64(addr);
+	terminal_write(" -> ");
+	terminal_write(sym.name);
+	terminal_write("+");
+	terminal_write_hex64(offset);
+	terminal_write(" (");
+	terminal_write(elf_symbol_type_name(sym.info));
+	terminal_write(", ");
+	terminal_write(elf_symbol_bind_name(sym.info));
+	terminal_write(")");
+	terminal_putc('\n');
+}
+
+static void cmd_execstress(const char *args)
+{
+	char count_tok[16];
+	char path[128];
+	unsigned char buf[8192];
+	unsigned long size = 0;
+	unsigned int run_count = 0;
+	unsigned long before_free;
+	unsigned long after_free;
+	unsigned long i;
+	unsigned long ok_runs = 0;
+	int last_rc = 0;
+	long last_ret = 0;
+	const char *p = read_token(args, count_tok, sizeof(count_tok));
+
+	if (p == (void *)0 || count_tok[0] == '\0' || parse_dec_u32(count_tok, &run_count) != 0 || run_count == 0)
+	{
+		terminal_write_line("Usage: execstress <count> <path>");
+		return;
+	}
+	p = read_token(p, path, sizeof(path));
+	if (p == (void *)0 || path[0] == '\0' || skip_spaces(p)[0] != '\0')
+	{
+		terminal_write_line("Usage: execstress <count> <path>");
+		return;
+	}
+
+	if (read_shell_file_bytes("execstress", path, buf, sizeof(buf), &size) != 0) return;
+
+	before_free = memory_free_pages();
+	for (i = 0; i < (unsigned long)run_count; i++)
+	{
+		elf_exec_t prog;
+		last_rc = elf_load(buf, size, &prog);
+		if (last_rc != 0) break;
+		last_ret = elf_call(&prog);
+		elf_unload(buf, size);
+		ok_runs++;
+	}
+	after_free = memory_free_pages();
+
+	terminal_write("execstress: requested ");
+	{
+		char n[16];
+		uint_to_dec((unsigned long)run_count, n, sizeof(n));
+		terminal_write(n);
+	}
+	terminal_write(", completed ");
+	{
+		char n[16];
+		uint_to_dec(ok_runs, n, sizeof(n));
+		terminal_write(n);
+	}
+	terminal_putc('\n');
+
+	terminal_write("  free pages before: ");
+	{
+		char n[16];
+		uint_to_dec(before_free, n, sizeof(n));
+		terminal_write_line(n);
+	}
+	terminal_write("  free pages after:  ");
+	{
+		char n[16];
+		uint_to_dec(after_free, n, sizeof(n));
+		terminal_write_line(n);
+	}
+
+	terminal_write("  delta pages: ");
+	if (after_free >= before_free)
+	{
+		char n[16];
+		terminal_putc('+');
+		uint_to_dec(after_free - before_free, n, sizeof(n));
+		terminal_write_line(n);
+	}
+	else
+	{
+		char n[16];
+		terminal_putc('-');
+		uint_to_dec(before_free - after_free, n, sizeof(n));
+		terminal_write_line(n);
+	}
+
+	if (ok_runs < (unsigned long)run_count)
+	{
+		terminal_write("  stopped at run ");
+		{
+			char n[16];
+			uint_to_dec(ok_runs + 1, n, sizeof(n));
+			terminal_write(n);
+		}
+		terminal_write(", elf_load rc=");
+		if (last_rc < 0)
+		{
+			char n[16];
+			terminal_putc('-');
+			uint_to_dec((unsigned long)(-last_rc), n, sizeof(n));
+			terminal_write_line(n);
+		}
+		else
+		{
+			char n[16];
+			uint_to_dec((unsigned long)last_rc, n, sizeof(n));
+			terminal_write_line(n);
+		}
+	}
+	else
+	{
+		terminal_write("  last return: ");
+		if (last_ret < 0)
+		{
+			char n[16];
+			terminal_putc('-');
+			uint_to_dec((unsigned long)(-last_ret), n, sizeof(n));
+			terminal_write_line(n);
+		}
+		else
+		{
+			char n[16];
+			uint_to_dec((unsigned long)last_ret, n, sizeof(n));
+			terminal_write_line(n);
+		}
+	}
+}
+
+static void cmd_elfselftest(const char *args)
+{
+	unsigned long before_free;
+	unsigned long after_free;
+	unsigned long i;
+	unsigned long failures = 0;
+	const struct elf_case {
+		const char *path;
+		long expected_ret;
+	} tests[] = {
+		{"/app.elf", 42},
+		{"/appw.elf", 7},
+		{"/app2p.elf", 99}
+	};
+
+	if (skip_spaces(args)[0] != '\0')
+	{
+		terminal_write_line("Usage: elfselftest");
+		return;
+	}
+
+	terminal_write_line("elfselftest: running built-in ELF matrix...");
+
+	for (i = 0; i < (unsigned long)(sizeof(tests) / sizeof(tests[0])); i++)
+	{
+		unsigned char buf[8192];
+		unsigned long size = 0;
+		elf_exec_t prog;
+		int rc;
+		long ret;
+
+		if (fs_read_file(tests[i].path, buf, sizeof(buf), &size) != 0)
+		{
+			terminal_write("  FAIL "); terminal_write(tests[i].path); terminal_write_line(" : read failed");
+			failures++;
+			continue;
+		}
+		rc = elf_load(buf, size, &prog);
+		if (rc != 0)
+		{
+			terminal_write("  FAIL "); terminal_write(tests[i].path); terminal_write(" : elf_load rc=");
+			if (rc < 0)
+			{
+				char n[16];
+				terminal_putc('-');
+				uint_to_dec((unsigned long)(-rc), n, sizeof(n));
+				terminal_write_line(n);
+			}
+			else
+			{
+				char n[16];
+				uint_to_dec((unsigned long)rc, n, sizeof(n));
+				terminal_write_line(n);
+			}
+			failures++;
+			continue;
+		}
+		ret = elf_call(&prog);
+		elf_unload(buf, size);
+		if (ret != tests[i].expected_ret)
+		{
+			terminal_write("  FAIL "); terminal_write(tests[i].path); terminal_write(" : ret=");
+			if (ret < 0)
+			{
+				char n[16];
+				terminal_putc('-');
+				uint_to_dec((unsigned long)(-ret), n, sizeof(n));
+				terminal_write(n);
+			}
+			else
+			{
+				char n[16];
+				uint_to_dec((unsigned long)ret, n, sizeof(n));
+				terminal_write(n);
+			}
+			terminal_write(" expected=");
+			{
+				char n[16];
+				if (tests[i].expected_ret < 0)
+				{
+					terminal_putc('-');
+					uint_to_dec((unsigned long)(-tests[i].expected_ret), n, sizeof(n));
+				}
+				else
+				{
+					uint_to_dec((unsigned long)tests[i].expected_ret, n, sizeof(n));
+				}
+				terminal_write_line(n);
+			}
+			failures++;
+		}
+		else
+		{
+			terminal_write("  PASS "); terminal_write_line(tests[i].path);
+		}
+	}
+
+	{
+		unsigned char buf[8192];
+		unsigned long size = 0;
+		elf_info_t info;
+		elf_symbol_t sym;
+		unsigned long offset = 0;
+		if (fs_read_file("/app.elf", buf, sizeof(buf), &size) != 0)
+		{
+			terminal_write_line("  FAIL symbols /app.elf : read failed");
+			failures++;
+		}
+		else if (elf_get_info(buf, size, &info) != ELF_OK || info.symbol_count == 0)
+		{
+			terminal_write_line("  FAIL symbols /app.elf : symbol table missing");
+			failures++;
+		}
+		else if (elf_find_symbol_by_addr(buf, size, info.entry, &sym, &offset) != ELF_OK || offset != 0 || !string_equals(sym.name, "_start"))
+		{
+			terminal_write_line("  FAIL symbols /app.elf : entry lookup mismatch");
+			failures++;
+		}
+		else
+		{
+			terminal_write_line("  PASS symbols /app.elf");
+		}
+	}
+
+	/* Short stress pass on multi-page image to catch regressions quickly. */
+	before_free = memory_free_pages();
+	{
+		unsigned char buf[8192];
+		unsigned long size = 0;
+		unsigned long ok_runs = 0;
+		int rc = 0;
+		if (fs_read_file("/app2p.elf", buf, sizeof(buf), &size) != 0)
+		{
+			terminal_write_line("  FAIL stress /app2p.elf : read failed");
+			failures++;
+		}
+		else
+		{
+			for (i = 0; i < 256UL; i++)
+			{
+				elf_exec_t prog;
+				rc = elf_load(buf, size, &prog);
+				if (rc != 0) break;
+				(void)elf_call(&prog);
+				elf_unload(buf, size);
+				ok_runs++;
+			}
+			if (ok_runs != 256UL)
+			{
+				terminal_write("  FAIL stress /app2p.elf at run ");
+				{
+					char n[16];
+					uint_to_dec(ok_runs + 1, n, sizeof(n));
+					terminal_write(n);
+				}
+				terminal_write(" rc=");
+				if (rc < 0)
+				{
+					char n[16];
+					terminal_putc('-');
+					uint_to_dec((unsigned long)(-rc), n, sizeof(n));
+					terminal_write_line(n);
+				}
+				else
+				{
+					char n[16];
+					uint_to_dec((unsigned long)rc, n, sizeof(n));
+					terminal_write_line(n);
+				}
+				failures++;
+			}
+			else
+			{
+				terminal_write_line("  PASS stress /app2p.elf x256");
+			}
+		}
+	}
+
+	after_free = memory_free_pages();
+	terminal_write("  free-page delta: ");
+	if (after_free >= before_free)
+	{
+		char n[16];
+		terminal_putc('+');
+		uint_to_dec(after_free - before_free, n, sizeof(n));
+		terminal_write_line(n);
+	}
+	else
+	{
+		char n[16];
+		terminal_putc('-');
+		uint_to_dec(before_free - after_free, n, sizeof(n));
+		terminal_write_line(n);
+		failures++;
+	}
+
+	if (failures == 0) terminal_write_line("elfselftest: PASSED");
+	else terminal_write_line("elfselftest: FAILED");
 }
 
 static void cmd_pwd(void)
@@ -3274,6 +5139,729 @@ static void cmd_ls(const char *args)
 		(void)types[i];
 		terminal_write_line(names[i]);
 	}
+	}
+}
+
+static int trim_dir_entry_name(const char *name, char *out, unsigned long out_size)
+{
+	unsigned long i = 0;
+	if (out_size == 0) return -1;
+	while (name[i] != '\0' && i + 1 < out_size)
+	{
+		if (name[i] == '/' && name[i + 1] == '\0') break;
+		out[i] = name[i];
+		i++;
+	}
+	out[i] = '\0';
+	return 0;
+}
+
+static int dir_name_compare_ci(const char *a, const char *b)
+{
+	unsigned long i = 0;
+	for (;;)
+	{
+		char ca = ascii_upper(a[i]);
+		char cb = ascii_upper(b[i]);
+		if (ca != cb) return (ca < cb) ? -1 : 1;
+		if (ca == '\0') return 0;
+		i++;
+	}
+}
+
+static void dir_sort_entries(char names[][40], int types[], unsigned long sizes[], int count)
+{
+	int i;
+	int j;
+	for (i = 0; i < count; i++)
+	{
+		for (j = i + 1; j < count; j++)
+		{
+			if (dir_name_compare_ci(names[i], names[j]) > 0)
+			{
+				char tmp_name[40];
+				int tmp_type;
+				unsigned long tmp_size;
+				unsigned long k;
+				for (k = 0; k < sizeof(tmp_name); k++) tmp_name[k] = names[i][k];
+				for (k = 0; k < sizeof(tmp_name); k++) names[i][k] = names[j][k];
+				for (k = 0; k < sizeof(tmp_name); k++) names[j][k] = tmp_name[k];
+				tmp_type = types[i];
+				types[i] = types[j];
+				types[j] = tmp_type;
+				tmp_size = sizes[i];
+				sizes[i] = sizes[j];
+				sizes[j] = tmp_size;
+			}
+		}
+	}
+}
+
+static int build_child_path(const char *base, const char *name, int use_fat, char *out, unsigned long out_size)
+{
+	unsigned long n = 0;
+	unsigned long i = 0;
+	if (out == (void *)0 || out_size == 0) return -1;
+	if (base == (void *)0 || base[0] == '\0' || string_equals(base, "."))
+		base = use_fat ? fat_cwd : "";
+	if (!use_fat && (base[0] == '\0' || string_equals(base, ".")))
+	{
+		while (name[i] != '\0' && n + 1 < out_size) out[n++] = name[i++];
+		out[n] = '\0';
+		return 0;
+	}
+	if (use_fat && base[0] == '\0') base = "/";
+	while (base[n] != '\0' && n + 1 < out_size) { out[n] = base[n]; n++; }
+	if (n == 0 && use_fat) out[n++] = '/';
+	if (n > 0 && out[n - 1] != '/' && n + 1 < out_size) out[n++] = '/';
+	while (name[i] != '\0' && n + 1 < out_size) out[n++] = name[i++];
+	out[n] = '\0';
+	return (name[i] == '\0') ? 0 : -1;
+}
+
+static void dir_print_entry(int is_dir, unsigned long size, const char *name)
+{
+	char num[32];
+	terminal_write("  ");
+	if (is_dir)
+	{
+		terminal_write("<DIR>          ");
+	}
+	else
+	{
+		unsigned long digits;
+		unsigned long pad;
+		uint_to_dec(size, num, sizeof(num));
+		digits = string_length(num);
+		pad = (digits < 13) ? (13 - digits) : 0;
+		while (pad-- > 0) terminal_putc(' ');
+		terminal_write(num);
+		terminal_putc(' ');
+	}
+	terminal_write_line(name);
+}
+
+static void dir_print_totals(unsigned long file_count, unsigned long total_bytes, unsigned long dir_count)
+{
+	char num[32];
+	terminal_write("     ");
+	uint_to_dec(file_count, num, sizeof(num));
+	terminal_write(num);
+	terminal_write_line(" File(s)");
+	terminal_write("  ");
+	uint_to_dec(total_bytes, num, sizeof(num));
+	terminal_write(num);
+	terminal_write_line(" bytes");
+	terminal_write("     ");
+	uint_to_dec(dir_count, num, sizeof(num));
+	terminal_write(num);
+	terminal_write_line(" Dir(s)");
+}
+
+static int dir_collect_entries_for_path(const char *path, int use_fat, char entries[][40], int entry_types[], unsigned long entry_sizes[], int *entry_count)
+{
+	int i;
+	if (entry_count == (void *)0) return -1;
+	*entry_count = 0;
+
+	if (use_fat)
+	{
+		char full_path[128];
+		char fat_names[64][40];
+		int fat_count;
+		if (fat_resolve_path((path == (void *)0 || path[0] == '\0') ? "." : path, full_path, sizeof(full_path)) != 0) return -1;
+		if (fat32_ls_path(full_path, fat_names, 64, &fat_count) != 0) return -1;
+		for (i = 0; i < fat_count; i++)
+		{
+			char child_name[40];
+			char child_path[128];
+			int child_is_dir;
+			unsigned long child_size;
+			trim_dir_entry_name(fat_names[i], child_name, sizeof(child_name));
+			if (build_child_path(full_path, child_name, 1, child_path, sizeof(child_path)) != 0) continue;
+			if (fat32_stat_path(child_path, &child_is_dir, &child_size) != 0) continue;
+			if (*entry_count >= FS_MAX_LIST) break;
+			{
+				unsigned long j = 0;
+				while (child_name[j] != '\0' && j + 1 < sizeof(entries[0])) { entries[*entry_count][j] = child_name[j]; j++; }
+				entries[*entry_count][j] = '\0';
+			}
+			entry_types[*entry_count] = child_is_dir;
+			entry_sizes[*entry_count] = child_size;
+			(*entry_count)++;
+		}
+		return 0;
+	}
+
+	{
+		char names[FS_MAX_LIST][FS_NAME_MAX + 2];
+		int types[FS_MAX_LIST];
+		int count;
+		if (fs_ls((path == (void *)0 || path[0] == '\0') ? (void *)0 : path, names, types, FS_MAX_LIST, &count) != 0) return -1;
+		for (i = 0; i < count; i++)
+		{
+			char child_name[FS_NAME_MAX + 1];
+			char child_path[128];
+			int child_is_dir;
+			unsigned long child_size;
+			trim_dir_entry_name(names[i], child_name, sizeof(child_name));
+			if (build_child_path(path, child_name, 0, child_path, sizeof(child_path)) != 0) continue;
+			if (fs_stat(child_path, &child_is_dir, &child_size) != 0) continue;
+			if (*entry_count >= FS_MAX_LIST) break;
+			{
+				unsigned long j = 0;
+				while (child_name[j] != '\0' && j + 1 < sizeof(entries[0])) { entries[*entry_count][j] = child_name[j]; j++; }
+				entries[*entry_count][j] = '\0';
+			}
+			entry_types[*entry_count] = child_is_dir;
+			entry_sizes[*entry_count] = child_size;
+			(*entry_count)++;
+		}
+	}
+
+	return 0;
+}
+
+static void dir_recursive_walk(const char *path, int use_fat, int opt_bare, int opt_wide, unsigned long *out_files, unsigned long *out_dirs, unsigned long *out_bytes)
+{
+	char entries[FS_MAX_LIST][40];
+	int entry_types[FS_MAX_LIST];
+	unsigned long entry_sizes[FS_MAX_LIST];
+	int entry_count = 0;
+	int i;
+	unsigned long local_files = 0;
+	unsigned long local_dirs = 0;
+	unsigned long local_bytes = 0;
+
+	if (dir_collect_entries_for_path(path, use_fat, entries, entry_types, entry_sizes, &entry_count) != 0) return;
+	dir_sort_entries(entries, entry_types, entry_sizes, entry_count);
+
+	if (!opt_bare)
+	{
+		terminal_putc('\n');
+		terminal_write(" Directory of ");
+		if (path == (void *)0 || path[0] == '\0') terminal_write_line(use_fat ? fat_cwd : ".");
+		else terminal_write_line(path);
+		terminal_putc('\n');
+	}
+
+	if (opt_wide)
+	{
+		int col = 0;
+		for (i = 0; i < entry_count; i++)
+		{
+			char shown[40];
+			unsigned long j = 0;
+			if (entry_types[i])
+			{
+				while (entries[i][j] != '\0' && j + 2 < sizeof(shown)) { shown[j] = entries[i][j]; j++; }
+				shown[j++] = '/';
+				shown[j] = '\0';
+			}
+			else
+			{
+				while (entries[i][j] != '\0' && j + 1 < sizeof(shown)) { shown[j] = entries[i][j]; j++; }
+				shown[j] = '\0';
+			}
+			terminal_write("  ");
+			terminal_write(shown);
+			if (col < 3)
+			{
+				unsigned long w = string_length(shown);
+				while (w++ < 18) terminal_putc(' ');
+			}
+			col++;
+			if (col == 4 || i + 1 == entry_count)
+			{
+				terminal_putc('\n');
+				col = 0;
+			}
+			if (entry_types[i]) local_dirs++;
+			else { local_files++; local_bytes += entry_sizes[i]; }
+		}
+	}
+	else if (opt_bare)
+	{
+		for (i = 0; i < entry_count; i++)
+		{
+			char child_path[128];
+			if (build_child_path(path, entries[i], use_fat, child_path, sizeof(child_path)) == 0) terminal_write_line(child_path);
+			else terminal_write_line(entries[i]);
+			if (entry_types[i]) local_dirs++;
+			else { local_files++; local_bytes += entry_sizes[i]; }
+		}
+	}
+	else
+	{
+		for (i = 0; i < entry_count; i++)
+		{
+			dir_print_entry(entry_types[i], entry_sizes[i], entries[i]);
+			if (entry_types[i]) local_dirs++;
+			else { local_files++; local_bytes += entry_sizes[i]; }
+		}
+	}
+
+	if (!opt_bare)
+	{
+		dir_print_totals(local_files, local_bytes, local_dirs);
+	}
+
+	if (out_files != (void *)0) *out_files += local_files;
+	if (out_dirs != (void *)0) *out_dirs += local_dirs;
+	if (out_bytes != (void *)0) *out_bytes += local_bytes;
+
+	for (i = 0; i < entry_count; i++)
+	{
+		char child_path[128];
+		if (!entry_types[i]) continue;
+		if (build_child_path(path, entries[i], use_fat, child_path, sizeof(child_path)) != 0) continue;
+		dir_recursive_walk(child_path, use_fat, opt_bare, opt_wide, out_files, out_dirs, out_bytes);
+	}
+}
+
+static void cmd_dir(const char *args)
+{
+	char target[128];
+	char tok[32];
+	const char *p = args;
+	int opt_bare = 0;
+	int opt_wide = 0;
+	int opt_recursive = 0;
+	char entries[FS_MAX_LIST][40];
+	int entry_types[FS_MAX_LIST];
+	unsigned long entry_sizes[FS_MAX_LIST];
+	int entry_count = 0;
+	int i;
+	unsigned long file_count = 0;
+	unsigned long dir_count = 0;
+	unsigned long total_bytes = 0;
+	unsigned long free_bytes = 0;
+
+	target[0] = '\0';
+	for (;;)
+	{
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0)
+		{
+			terminal_write_line("dir: argument too long");
+			return;
+		}
+		if (tok[0] == '\0') break;
+		if (tok[0] == '/' || tok[0] == '-')
+		{
+			unsigned long k = 1;
+			while (tok[k] != '\0')
+			{
+				char c = ascii_upper(tok[k]);
+				if (c == 'B') opt_bare = 1;
+				else if (c == 'W') opt_wide = 1;
+				else if (c == 'S') opt_recursive = 1;
+				else { terminal_write_line("dir: unknown option (use /b /w /s)"); return; }
+				k++;
+			}
+			continue;
+		}
+		if (target[0] != '\0')
+		{
+			terminal_write_line("Usage: dir [/b] [/w] [/s] [path]");
+			return;
+		}
+		{
+			unsigned long k = 0;
+			while (tok[k] != '\0' && k + 1 < sizeof(target)) { target[k] = tok[k]; k++; }
+			target[k] = '\0';
+		}
+	}
+
+	if (opt_wide && opt_bare) opt_wide = 0;
+	if (opt_recursive)
+	{
+		int use_fat = fat_mode_active();
+		int is_dir = 0;
+		unsigned long size = 0;
+		char root_path[128];
+		unsigned long total_files = 0;
+		unsigned long total_dirs = 0;
+		unsigned long total_bytes = 0;
+		unsigned long free_bytes = 0;
+
+		if (use_fat)
+		{
+			if (fat_resolve_path(target[0] == '\0' ? "." : target, root_path, sizeof(root_path)) != 0)
+			{
+				terminal_write_line("dir: invalid FAT path");
+				return;
+			}
+			if (fat32_stat_path(root_path, &is_dir, &size) != 0 || !is_dir)
+			{
+				terminal_write_line("dir: path is not a directory");
+				return;
+			}
+			if (fat32_get_free_bytes(&free_bytes) != 0) free_bytes = 0;
+		}
+		else
+		{
+			if (fs_stat(target[0] == '\0' ? (void *)0 : target, &is_dir, &size) != 0 || !is_dir)
+			{
+				terminal_write_line("dir: path is not a directory");
+				return;
+			}
+			if (target[0] == '\0') root_path[0] = '\0';
+			else
+			{
+				unsigned long k = 0;
+				while (target[k] != '\0' && k + 1 < sizeof(root_path)) { root_path[k] = target[k]; k++; }
+				root_path[k] = '\0';
+			}
+			free_bytes = fs_free_bytes();
+		}
+
+		dir_recursive_walk(root_path, use_fat, opt_bare, opt_wide, &total_files, &total_dirs, &total_bytes);
+		if (!opt_bare)
+		{
+			terminal_putc('\n');
+			terminal_write_line("Total files listed:");
+			dir_print_totals(total_files, total_bytes, total_dirs);
+			{
+				char num[32];
+				terminal_write("  ");
+				uint_to_dec(free_bytes, num, sizeof(num));
+				terminal_write(num);
+				terminal_write_line(" bytes free");
+			}
+		}
+		return;
+	}
+
+	if (fat_mode_active())
+	{
+		char full_path[128];
+		int is_dir;
+		unsigned long size;
+		if (fat_resolve_path(target[0] == '\0' ? "." : target, full_path, sizeof(full_path)) != 0)
+		{
+			terminal_write_line("dir: invalid FAT path");
+			return;
+		}
+		if (fat32_stat_path(full_path, &is_dir, &size) != 0)
+		{
+			terminal_write_line("dir: invalid path");
+			return;
+		}
+		if (!is_dir)
+		{
+			char name[40];
+			trim_dir_entry_name(target[0] == '\0' ? full_path : target, name, sizeof(name));
+			if (name[0] == '\0')
+			{
+				unsigned long j = 0;
+				while (full_path[j] != '\0' && j + 1 < sizeof(entries[0])) { entries[0][j] = full_path[j]; j++; }
+				entries[0][j] = '\0';
+			}
+			else
+			{
+				unsigned long j = 0;
+				while (name[j] != '\0' && j + 1 < sizeof(entries[0])) { entries[0][j] = name[j]; j++; }
+				entries[0][j] = '\0';
+			}
+			entry_types[0] = 0;
+			entry_sizes[0] = size;
+			entry_count = 1;
+			if (fat32_get_free_bytes(&free_bytes) != 0) free_bytes = 0;
+		}
+		else
+		{
+			char fat_names[64][40];
+			int fat_count;
+			if (fat32_ls_path(full_path, fat_names, 64, &fat_count) != 0)
+			{
+				terminal_write_line("dir: invalid path");
+				return;
+			}
+			for (i = 0; i < fat_count; i++)
+			{
+				char child_name[40];
+				char child_path[128];
+				int child_is_dir;
+				unsigned long child_size;
+				trim_dir_entry_name(fat_names[i], child_name, sizeof(child_name));
+				if (build_child_path(full_path, child_name, 1, child_path, sizeof(child_path)) != 0) continue;
+				if (fat32_stat_path(child_path, &child_is_dir, &child_size) != 0) continue;
+				if (entry_count >= FS_MAX_LIST) break;
+				{
+					unsigned long j = 0;
+					while (child_name[j] != '\0' && j + 1 < sizeof(entries[0])) { entries[entry_count][j] = child_name[j]; j++; }
+					entries[entry_count][j] = '\0';
+				}
+				entry_types[entry_count] = child_is_dir;
+				entry_sizes[entry_count] = child_size;
+				entry_count++;
+			}
+			if (fat32_get_free_bytes(&free_bytes) != 0) free_bytes = 0;
+		}
+	}
+	else
+	{
+		int is_dir;
+		unsigned long size;
+		if (fs_stat(target[0] == '\0' ? (void *)0 : target, &is_dir, &size) != 0)
+		{
+			terminal_write_line("dir: invalid path");
+			return;
+		}
+		if (!is_dir)
+		{
+			unsigned long j = 0;
+			while (target[j] != '\0' && j + 1 < sizeof(entries[0])) { entries[0][j] = target[j]; j++; }
+			entries[0][j] = '\0';
+			entry_types[0] = 0;
+			entry_sizes[0] = size;
+			entry_count = 1;
+			free_bytes = fs_free_bytes();
+		}
+		else
+		{
+			char names[FS_MAX_LIST][FS_NAME_MAX + 2];
+			int types[FS_MAX_LIST];
+			int count;
+			if (fs_ls(target[0] == '\0' ? (void *)0 : target, names, types, FS_MAX_LIST, &count) != 0)
+			{
+				terminal_write_line("dir: invalid path");
+				return;
+			}
+			for (i = 0; i < count; i++)
+			{
+				char child_name[FS_NAME_MAX + 1];
+				char child_path[128];
+				int child_is_dir;
+				unsigned long child_size;
+				trim_dir_entry_name(names[i], child_name, sizeof(child_name));
+				if (build_child_path(target, child_name, 0, child_path, sizeof(child_path)) != 0) continue;
+				if (fs_stat(child_path, &child_is_dir, &child_size) != 0) continue;
+				if (entry_count >= FS_MAX_LIST) break;
+				{
+					unsigned long j = 0;
+					while (child_name[j] != '\0' && j + 1 < sizeof(entries[0])) { entries[entry_count][j] = child_name[j]; j++; }
+					entries[entry_count][j] = '\0';
+				}
+				entry_types[entry_count] = child_is_dir;
+				entry_sizes[entry_count] = child_size;
+				entry_count++;
+			}
+			free_bytes = fs_free_bytes();
+		}
+	}
+
+	dir_sort_entries(entries, entry_types, entry_sizes, entry_count);
+	if (opt_wide)
+	{
+		int col = 0;
+		for (i = 0; i < entry_count; i++)
+		{
+			char shown[40];
+			char num[3];
+			unsigned long j = 0;
+			if (entry_types[i])
+			{
+				while (entries[i][j] != '\0' && j + 2 < sizeof(shown)) { shown[j] = entries[i][j]; j++; }
+				shown[j++] = '/';
+				shown[j] = '\0';
+			}
+			else
+			{
+				while (entries[i][j] != '\0' && j + 1 < sizeof(shown)) { shown[j] = entries[i][j]; j++; }
+				shown[j] = '\0';
+			}
+			terminal_write("  ");
+			terminal_write(shown);
+			if (col < 3)
+			{
+				unsigned long w = string_length(shown);
+				while (w++ < 18) terminal_putc(' ');
+			}
+			col++;
+			if (col == 4 || i + 1 == entry_count)
+			{
+				terminal_putc('\n');
+				col = 0;
+			}
+			(void)num;
+			if (entry_types[i]) dir_count++;
+			else { file_count++; total_bytes += entry_sizes[i]; }
+		}
+	}
+	else if (opt_bare)
+	{
+		for (i = 0; i < entry_count; i++)
+		{
+			terminal_write_line(entries[i]);
+			if (entry_types[i]) dir_count++;
+			else { file_count++; total_bytes += entry_sizes[i]; }
+		}
+	}
+	else
+	{
+	for (i = 0; i < entry_count; i++)
+	{
+		dir_print_entry(entry_types[i], entry_sizes[i], entries[i]);
+		if (entry_types[i]) dir_count++;
+		else { file_count++; total_bytes += entry_sizes[i]; }
+	}
+	}
+
+	if (!opt_bare)
+	{
+		dir_print_totals(file_count, total_bytes, dir_count);
+		{
+			char num[32];
+			terminal_write("  ");
+			uint_to_dec(free_bytes, num, sizeof(num));
+			terminal_write(num);
+			terminal_write_line(" bytes free");
+		}
+	}
+}
+
+static int tree_collect_entries(const char *path, int use_fat, char names[][40], int types[], int *count)
+{
+	int i;
+	if (use_fat)
+	{
+		char full_path[128];
+		char fat_names[64][40];
+		int fat_count;
+		if (fat_resolve_path(path[0] == '\0' ? "." : path, full_path, sizeof(full_path)) != 0) return -1;
+		if (fat32_ls_path(full_path, fat_names, 64, &fat_count) != 0) return -1;
+		for (i = 0; i < fat_count && i < FS_MAX_LIST; i++)
+		{
+			char child_name[40];
+			char child_path[128];
+			int child_is_dir;
+			unsigned long child_size;
+			trim_dir_entry_name(fat_names[i], child_name, sizeof(child_name));
+			if (build_child_path(full_path, child_name, 1, child_path, sizeof(child_path)) != 0) continue;
+			if (fat32_stat_path(child_path, &child_is_dir, &child_size) != 0) continue;
+			{
+				unsigned long j = 0;
+				while (child_name[j] != '\0' && j + 1 < sizeof(names[0])) { names[*count][j] = child_name[j]; j++; }
+				names[*count][j] = '\0';
+			}
+			types[*count] = child_is_dir;
+			(*count)++;
+			if (*count >= FS_MAX_LIST) break;
+		}
+		return 0;
+	}
+	else
+	{
+		char raw_names[FS_MAX_LIST][FS_NAME_MAX + 2];
+		int raw_types[FS_MAX_LIST];
+		int raw_count;
+		if (fs_ls(path[0] == '\0' ? (void *)0 : path, raw_names, raw_types, FS_MAX_LIST, &raw_count) != 0) return -1;
+		for (i = 0; i < raw_count && i < FS_MAX_LIST; i++)
+		{
+			char child_name[FS_NAME_MAX + 1];
+			trim_dir_entry_name(raw_names[i], child_name, sizeof(child_name));
+			{
+				unsigned long j = 0;
+				while (child_name[j] != '\0' && j + 1 < sizeof(names[0])) { names[*count][j] = child_name[j]; j++; }
+				names[*count][j] = '\0';
+			}
+			types[*count] = raw_types[i] ? 1 : 0;
+			(*count)++;
+			if (*count >= FS_MAX_LIST) break;
+		}
+		return 0;
+	}
+}
+
+static void tree_walk(const char *path, int use_fat, int show_files, int depth)
+{
+	char names[FS_MAX_LIST][40];
+	int types[FS_MAX_LIST];
+	unsigned long dummy_sizes[FS_MAX_LIST];
+	int count = 0;
+	int i;
+	if (tree_collect_entries(path, use_fat, names, types, &count) != 0) return;
+	for (i = 0; i < count; i++) dummy_sizes[i] = 0;
+	dir_sort_entries(names, types, dummy_sizes, count);
+	for (i = 0; i < count; i++)
+	{
+		char child_path[128];
+		int d;
+		if (!show_files && !types[i]) continue;
+		for (d = 0; d < depth; d++) terminal_write("  ");
+		terminal_write("|- ");
+		terminal_write_line(names[i]);
+		if (types[i])
+		{
+			if (build_child_path(path, names[i], use_fat, child_path, sizeof(child_path)) == 0)
+			{
+				tree_walk(child_path, use_fat, show_files, depth + 1);
+			}
+		}
+	}
+}
+
+static void cmd_tree(const char *args)
+{
+	char tok[32];
+	char target[128];
+	const char *p = args;
+	int show_files = 0;
+	int use_fat = fat_mode_active();
+	int is_dir = 0;
+	unsigned long size = 0;
+
+	target[0] = '\0';
+	for (;;)
+	{
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0) { terminal_write_line("tree: argument too long"); return; }
+		if (tok[0] == '\0') break;
+		if (tok[0] == '/' || tok[0] == '-')
+		{
+			unsigned long k = 1;
+			while (tok[k] != '\0')
+			{
+				char c = ascii_upper(tok[k]);
+				if (c == 'F') show_files = 1;
+				else { terminal_write_line("tree: unknown option (use /f)"); return; }
+				k++;
+			}
+			continue;
+		}
+		if (target[0] != '\0') { terminal_write_line("Usage: tree [/f] [path]"); return; }
+		{
+			unsigned long k = 0;
+			while (tok[k] != '\0' && k + 1 < sizeof(target)) { target[k] = tok[k]; k++; }
+			target[k] = '\0';
+		}
+	}
+
+	if (use_fat)
+	{
+		char full_path[128];
+		if (fat_resolve_path(target[0] == '\0' ? "." : target, full_path, sizeof(full_path)) != 0) { terminal_write_line("tree: invalid path"); return; }
+		if (fat32_stat_path(full_path, &is_dir, &size) != 0) { terminal_write_line("tree: invalid path"); return; }
+		terminal_write_line(full_path);
+		if (!is_dir)
+		{
+			if (show_files) terminal_write_line("|- (file)");
+			return;
+		}
+		tree_walk(full_path, 1, show_files, 1);
+	}
+	else
+	{
+		if (fs_stat(target[0] == '\0' ? (void *)0 : target, &is_dir, &size) != 0) { terminal_write_line("tree: invalid path"); return; }
+		if (target[0] == '\0') terminal_write_line("."); else terminal_write_line(target);
+		if (!is_dir)
+		{
+			if (show_files) terminal_write_line("|- (file)");
+			return;
+		}
+		tree_walk(target, 0, show_files, 1);
 	}
 }
 
@@ -6244,7 +8832,7 @@ static void cmd_charmap(void)
 	terminal_write_line("  \\shade1 \\shade2 \\shade3 \\deg \\pm \\dot");
 	terminal_write_line("  \\arru \\arrd \\arrl \\arrr \\tri");
 	terminal_write_line("  \\xNN for raw byte (hex), example: echo \\xDB\\xDB\\xDB");
-	terminal_write_line("  echo styles: §b bold, §i italic, §u underline, §s strike, uppercase disables, §r resets");
+	terminal_write_line("  echo styles: §l bold, §i italic, §u underline, §s strike, uppercase disables, §r resets");
 }
 
 static void cmd_fatls(void)
@@ -6484,6 +9072,7 @@ static void run_command(void)
 {
 	char expanded[INPUT_BUFFER_SIZE];
 	char expanded_glyphs[INPUT_BUFFER_SIZE];
+	char resolved[INPUT_BUFFER_SIZE];
 	unsigned long i;
 
 	if (input_length == 0) { terminal_prompt(); return; }
@@ -6504,11 +9093,18 @@ static void run_command(void)
 		if (!editor_active && !script_mode_active) terminal_prompt();
 		return;
 	}
+	if (resolve_command_aliases(expanded_glyphs, resolved, sizeof(resolved)) != 0)
+	{
+		input_length = 0;
+		input_buffer[0] = '\0';
+		if (!editor_active && !script_mode_active) terminal_prompt();
+		return;
+	}
 
 	i = 0;
-	while (expanded_glyphs[i] != '\0' && i + 1 < sizeof(input_buffer))
+	while (resolved[i] != '\0' && i + 1 < sizeof(input_buffer))
 	{
-		input_buffer[i] = expanded_glyphs[i];
+		input_buffer[i] = resolved[i];
 		i++;
 	}
 	input_buffer[i] = '\0';
@@ -6525,7 +9121,23 @@ static void run_command(void)
 	{
 		if (input_buffer[4] == '\0') cmd_help("");
 		else if (input_buffer[4] == ' ') cmd_help(input_buffer + 5);
-		else terminal_write_line("Usage: help [basic|fs|disk]");
+		else terminal_write_line("Usage: help [basic|fs|disk|commands [page]|<command> [page]]");
+	}
+	else if (string_starts_with(input_buffer, "man"))
+	{
+		if (input_buffer[3] == ' ') cmd_man(input_buffer + 4);
+		else terminal_write_line("Usage: man <topic> [page]");
+	}
+	else if (string_starts_with(input_buffer, "alias"))
+	{
+		if (input_buffer[5] == '\0') cmd_alias("");
+		else if (input_buffer[5] == ' ') cmd_alias(input_buffer + 6);
+		else terminal_write_line("Usage: alias <name> <command...>");
+	}
+	else if (string_starts_with(input_buffer, "unalias"))
+	{
+		if (input_buffer[7] == ' ') cmd_unalias(input_buffer + 8);
+		else terminal_write_line("Usage: unalias <name>");
 	}
 	else if (string_equals(input_buffer, "version"))
 	{
@@ -6539,6 +9151,18 @@ static void run_command(void)
 	{
 		if (input_buffer[2] == '\0' || input_buffer[2] == ' ') cmd_ls(input_buffer + 2);
 		else terminal_write_line("Usage: ls [path]");
+	}
+	else if (string_starts_with(input_buffer, "dir"))
+	{
+		if (input_buffer[3] == '\0') cmd_dir("");
+		else if (input_buffer[3] == ' ') cmd_dir(input_buffer + 4);
+		else terminal_write_line("Usage: dir [/b] [/w] [/s] [path]");
+	}
+	else if (string_starts_with(input_buffer, "tree"))
+	{
+		if (input_buffer[4] == '\0') cmd_tree("");
+		else if (input_buffer[4] == ' ') cmd_tree(input_buffer + 5);
+		else terminal_write_line("Usage: tree [/f] [path]");
 	}
 	else if (string_starts_with(input_buffer, "cd"))
 	{
@@ -6565,20 +9189,45 @@ static void run_command(void)
 		if (input_buffer[3] == ' ') cmd_cat(input_buffer + 4);
 		else terminal_write_line("Usage: cat <path>");
 	}
+	else if (string_starts_with(input_buffer, "type"))
+	{
+		if (input_buffer[4] == ' ') cmd_cat(input_buffer + 5);
+		else terminal_write_line("Usage: type <path>");
+	}
 	else if (string_starts_with(input_buffer, "rm"))
 	{
 		if (input_buffer[2] == ' ') cmd_rm(input_buffer + 3);
 		else terminal_write_line("Usage: rm [-r] [-f] <path>");
+	}
+	else if (string_starts_with(input_buffer, "del"))
+	{
+		if (input_buffer[3] == ' ') cmd_rm(input_buffer + 4);
+		else terminal_write_line("Usage: del <path>");
 	}
 	else if (string_starts_with(input_buffer, "cp"))
 	{
 		if (input_buffer[2] == ' ') cmd_cp(input_buffer + 3);
 		else terminal_write_line("Usage: cp [-r] [-n] [-i] <src> <dst>");
 	}
+	else if (string_starts_with(input_buffer, "copy"))
+	{
+		if (input_buffer[4] == ' ') cmd_cp(input_buffer + 5);
+		else terminal_write_line("Usage: copy <src> <dst>");
+	}
 	else if (string_starts_with(input_buffer, "mv"))
 	{
 		if (input_buffer[2] == ' ') cmd_mv(input_buffer + 3);
 		else terminal_write_line("Usage: mv [-n] [-i] <src> <dst>");
+	}
+	else if (string_starts_with(input_buffer, "move"))
+	{
+		if (input_buffer[4] == ' ') cmd_mv(input_buffer + 5);
+		else terminal_write_line("Usage: move <src> <dst>");
+	}
+	else if (string_starts_with(input_buffer, "ren"))
+	{
+		if (input_buffer[3] == ' ') cmd_mv(input_buffer + 4);
+		else terminal_write_line("Usage: ren <old> <new>");
 	}
 	else if (string_starts_with(input_buffer, "edit"))
 	{
@@ -6607,6 +9256,13 @@ static void run_command(void)
 		if (!script_mode_active) terminal_prompt();
 		return;
 	}
+	else if (string_equals(input_buffer, "cls"))
+	{
+		input_length = 0; input_buffer[0] = '\0';
+		screen_clear();
+		if (!script_mode_active) terminal_prompt();
+		return;
+	}
 	else if (string_equals(input_buffer, "memmap"))
 	{
 		memmap_print();
@@ -6619,10 +9275,77 @@ static void run_command(void)
 	{
 		cmd_pagetest();
 	}
+	else if (string_starts_with(input_buffer, "pagefault"))
+	{
+		if (input_buffer[9] == ' ') cmd_pagefault(input_buffer + 10);
+		else terminal_write_line("Usage: pagefault <read|write|exec>");
+	}
+	else if (string_equals(input_buffer, "gpfault"))
+	{
+		cmd_gpfault("");
+	}
+	else if (string_equals(input_buffer, "udfault"))
+	{
+		cmd_udfault("");
+	}
+	else if (string_equals(input_buffer, "doublefault"))
+	{
+		cmd_doublefault("");
+	}
+	else if (string_equals(input_buffer, "exceptstat"))
+	{
+		cmd_exceptstat("");
+	}
+	else if (string_equals(input_buffer, "dumpstack"))
+	{
+		cmd_dumpstack("");
+	}
+	else if (string_starts_with(input_buffer, "selftest"))
+	{
+		if (input_buffer[8] == ' ') cmd_selftest(input_buffer + 9);
+		else terminal_write_line("Usage: selftest exceptions [pf-read|pf-write|pf-exec|ud|gp|1|2|3|4|5]");
+	}
+	else if (string_equals(input_buffer, "elfselftest"))
+	{
+		cmd_elfselftest("");
+	}
+	else if (string_starts_with(input_buffer, "elfinfo"))
+	{
+		if (input_buffer[7] == ' ') cmd_elfinfo(input_buffer + 8);
+		else terminal_write_line("Usage: elfinfo <path>");
+	}
+	else if (string_starts_with(input_buffer, "elfsym"))
+	{
+		if (input_buffer[6] == ' ') cmd_elfsym(input_buffer + 7);
+		else terminal_write_line("Usage: elfsym <path> [filter]");
+	}
+	else if (string_starts_with(input_buffer, "elfaddr"))
+	{
+		if (input_buffer[7] == ' ') cmd_elfaddr(input_buffer + 8);
+		else terminal_write_line("Usage: elfaddr <path> <hex-address>");
+	}
+	else if (string_starts_with(input_buffer, "execstress"))
+	{
+		if (input_buffer[10] == ' ') cmd_execstress(input_buffer + 11);
+		else terminal_write_line("Usage: execstress <count> <path>");
+	}
 	else if (string_starts_with(input_buffer, "exec"))
 	{
 		if (input_buffer[4] == ' ') cmd_exec(input_buffer + 5);
 		else terminal_write_line("Usage: exec <path>");
+	}
+	else if (string_equals(input_buffer, "tasks"))
+	{
+		cmd_tasks();
+	}
+	else if (string_equals(input_buffer, "tasktest"))
+	{
+		cmd_tasktest();
+	}
+	else if (string_starts_with(input_buffer, "taskkill"))
+	{
+		if (input_buffer[8] == ' ') cmd_taskkill(input_buffer + 9);
+		else terminal_write_line("Usage: taskkill <id>|all");
 	}
 	else if (string_starts_with(input_buffer, "hexdump"))
 	{
@@ -6764,6 +9487,11 @@ static void run_command(void)
 	{
 		do_reboot();
 	}
+	else if (string_equals(input_buffer, "panic"))
+	{
+		terminal_write_line("[SYSTEM] deliberate panic requested");
+		trigger_forced_panic();
+	}
 	else if (string_equals(input_buffer, "quit") ||
 	         string_equals(input_buffer, "exit") ||
 	         string_equals(input_buffer, "shutdown"))
@@ -6822,6 +9550,8 @@ static void editor_handle_scancode(unsigned char scancode)
 		if (editor_find_active) return;
 		if (scancode == 0x1D) { ctrl_held = 1; return; }
 		if (scancode == 0x9D) { ctrl_held = 0; return; }
+		if (scancode == 0x38) { alt_held = 1; return; }
+		if (scancode == 0xB8) { alt_held = 0; return; }
 		if (editor_hex_mode)
 		{
 			unsigned long row_start = (editor_cursor / EDITOR_HEX_BYTES_PER_ROW) * EDITOR_HEX_BYTES_PER_ROW;
@@ -7017,6 +9747,13 @@ static void editor_handle_scancode(unsigned char scancode)
 	if (scancode == 0xAA || scancode == 0xB6) { shift_held = 0; return; }
 	if (scancode == 0x1D) { ctrl_held = 1; return; }
 	if (scancode == 0x9D) { ctrl_held = 0; return; }
+	if (scancode == 0x38) { alt_held = 1; return; }
+	if (scancode == 0xB8) { alt_held = 0; return; }
+	if (scancode == 0x3E && alt_held) { editor_close(0, 0); return; } /* Alt+F4 */
+	if (scancode == 0x01) { panic_esc_held = 1; update_panic_hotkey(); return; }
+	if (scancode == 0x81) { panic_esc_held = 0; update_panic_hotkey(); return; }
+	if (scancode == 0x58) { panic_f12_held = 1; update_panic_hotkey(); return; }
+	if (scancode == 0xD8) { panic_f12_held = 0; update_panic_hotkey(); return; }
 	if (scancode == 0x3A) { caps_lock_on = !caps_lock_on; return; }
 	if (scancode & 0x80) return;
 
@@ -7306,6 +10043,9 @@ static void handle_scancode(unsigned char scancode)
 		extended_key = 0;
 		if (scancode == 0x1D) { ctrl_held = 1; return; }
 		if (scancode == 0x9D) { ctrl_held = 0; return; }
+		if (scancode == 0x38) { alt_held = 1; return; }
+		if (scancode == 0xB8) { alt_held = 0; return; }
+		if (scancode == 0x53 && ctrl_held && alt_held) { do_reboot(); return; } /* Ctrl+Alt+Del */
 		if (scancode == 0x1C) { submit_current_line(); return; } /* Keypad Enter */
 		if (scancode == 0x35) { c = '/'; goto insert_character; } /* Keypad / */
 		if (scancode == 0x48) { handle_arrow_up(); return; }
@@ -7355,6 +10095,13 @@ static void handle_scancode(unsigned char scancode)
 	if (scancode == 0xAA || scancode == 0xB6) { shift_held = 0; return; }
 	if (scancode == 0x1D) { ctrl_held = 1; return; }
 	if (scancode == 0x9D) { ctrl_held = 0; return; }
+	if (scancode == 0x38) { alt_held = 1; return; }
+	if (scancode == 0xB8) { alt_held = 0; return; }
+	if (scancode == 0x3E && alt_held) { terminal_shutdown(); return; } /* Alt+F4 */
+	if (scancode == 0x01) { panic_esc_held = 1; update_panic_hotkey(); return; }
+	if (scancode == 0x81) { panic_esc_held = 0; update_panic_hotkey(); return; }
+	if (scancode == 0x58) { panic_f12_held = 1; update_panic_hotkey(); return; }
+	if (scancode == 0xD8) { panic_f12_held = 0; update_panic_hotkey(); return; }
 	if (scancode == 0x3A) { caps_lock_on = !caps_lock_on; return; }
 	if (scancode == 0x0F) { handle_tab(); return; }
 	if (scancode & 0x80)  return;
@@ -7363,6 +10110,7 @@ static void handle_scancode(unsigned char scancode)
 
 	if (ctrl_held)
 	{
+		if (scancode == 0x2E) { terminal_abort_input_line(); return; } /* Ctrl+C */
 		if (scancode == 0x1E)
 		{
 			terminal_selection_active = 1;
@@ -7483,6 +10231,12 @@ static void handle_serial_input_char(char c)
 	{
 		if (serial_ready) serial_write("\r\n");
 		submit_current_line();
+		return;
+	}
+	if (c == 0x03)
+	{
+		terminal_abort_input_line();
+		if (serial_ready) serial_write("^C\r\n");
 		return;
 	}
 	if (c == 0x08 || c == 0x7F)

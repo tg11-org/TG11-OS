@@ -21,5 +21,7 @@ int fat32_mkdir_path(const char *path);
 int fat32_remove_path(const char *path);
 int fat32_get_attr_path(const char *path, unsigned char *out_attr);
 int fat32_set_attr_path(const char *path, unsigned char set_mask, unsigned char clear_mask, unsigned char *out_attr);
+int fat32_stat_path(const char *path, int *out_is_dir, unsigned long *out_size);
+int fat32_get_free_bytes(unsigned long *out_free_bytes);
 
 #endif

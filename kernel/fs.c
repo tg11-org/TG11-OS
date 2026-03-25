@@ -17,6 +17,190 @@ struct fs_node
 static struct fs_node nodes[FS_MAX_NODES];
 static int cwd_node = 0;
 
+static void wr16_le(unsigned char *p, unsigned int v)
+{
+	p[0] = (unsigned char)(v & 0xFFu);
+	p[1] = (unsigned char)((v >> 8) & 0xFFu);
+}
+
+static void wr32_le(unsigned char *p, unsigned long v)
+{
+	p[0] = (unsigned char)(v & 0xFFu);
+	p[1] = (unsigned char)((v >> 8) & 0xFFu);
+	p[2] = (unsigned char)((v >> 16) & 0xFFu);
+	p[3] = (unsigned char)((v >> 24) & 0xFFu);
+}
+
+static void wr64_le(unsigned char *p, unsigned long v)
+{
+	unsigned long i;
+	for (i = 0; i < 8; i++) p[i] = (unsigned char)((v >> (i * 8)) & 0xFFu);
+}
+
+static unsigned long align_up_value(unsigned long v, unsigned long align)
+{
+	if (align == 0) return v;
+	return (v + align - 1) & ~(align - 1);
+}
+
+static int seed_builtin_elf(const char *path, unsigned long base_vaddr, unsigned int p_flags,
+	const unsigned char *code, unsigned long code_size, unsigned long seg_filesz, unsigned long seg_memsz)
+{
+	unsigned char buf[FS_MAX_FILE_SIZE];
+	unsigned long image_size;
+	unsigned long i;
+
+	if (path == (void *)0 || code == (void *)0 || code_size == 0) return -1;
+	if (seg_filesz < code_size) seg_filesz = code_size;
+	if (seg_memsz < seg_filesz) seg_memsz = seg_filesz;
+	if (seg_filesz == 0 || seg_memsz == 0) return -1;
+	if (seg_filesz > (FS_MAX_FILE_SIZE - 0x100UL)) return -1;
+
+	image_size = 0x100UL + seg_filesz;
+	for (i = 0; i < image_size; i++) buf[i] = 0;
+
+	/* ELF64 header */
+	buf[0] = 0x7F; buf[1] = 'E'; buf[2] = 'L'; buf[3] = 'F';
+	buf[4] = 2;    /* EI_CLASS: ELF64 */
+	buf[5] = 1;    /* EI_DATA: little-endian */
+	buf[6] = 1;    /* EI_VERSION */
+	wr16_le(&buf[16], 2);      /* ET_EXEC */
+	wr16_le(&buf[18], 62);     /* EM_X86_64 */
+	wr32_le(&buf[20], 1);      /* EV_CURRENT */
+	wr64_le(&buf[24], base_vaddr); /* e_entry */
+	wr64_le(&buf[32], 0x40);   /* e_phoff */
+	wr16_le(&buf[52], 0x40);   /* e_ehsize */
+	wr16_le(&buf[54], 0x38);   /* e_phentsize */
+	wr16_le(&buf[56], 1);      /* e_phnum */
+
+	/* One PT_LOAD program header at offset 0x40 */
+	wr32_le(&buf[0x40], 1);            /* PT_LOAD */
+	wr32_le(&buf[0x44], p_flags);      /* PF_R/PF_W/PF_X */
+	wr64_le(&buf[0x48], 0x100);        /* p_offset */
+	wr64_le(&buf[0x50], base_vaddr);   /* p_vaddr */
+	wr64_le(&buf[0x58], 0);            /* p_paddr (unused) */
+	wr64_le(&buf[0x60], seg_filesz);   /* p_filesz */
+	wr64_le(&buf[0x68], seg_memsz);    /* p_memsz */
+	wr64_le(&buf[0x70], 0x1000);       /* p_align */
+
+	for (i = 0; i < code_size; i++) buf[0x100UL + i] = code[i];
+
+	return fs_write_file(path, buf, image_size);
+}
+
+static int seed_builtin_elf_with_symbols(const char *path, unsigned long base_vaddr, unsigned int p_flags,
+	const unsigned char *code, unsigned long code_size, unsigned long seg_filesz, unsigned long seg_memsz,
+	const char *symbol_name)
+{
+	unsigned char buf[FS_MAX_FILE_SIZE];
+	static const char shstrtab[] = "\0.shstrtab\0.text\0.strtab\0.symtab\0";
+	unsigned long payload_off = 0x100UL;
+	unsigned long shstrtab_off;
+	unsigned long shstrtab_size = sizeof(shstrtab);
+	unsigned long strtab_off;
+	unsigned long strtab_size;
+	unsigned long symtab_off;
+	unsigned long symtab_size = 3UL * 24UL;
+	unsigned long shoff;
+	unsigned long image_size;
+	unsigned long sym_name_off = 1;
+	unsigned long i;
+
+	if (path == (void *)0 || code == (void *)0 || symbol_name == (void *)0 || symbol_name[0] == '\0') return -1;
+	if (seg_filesz < code_size) seg_filesz = code_size;
+	if (seg_memsz < seg_filesz) seg_memsz = seg_filesz;
+	if (seg_filesz == 0 || seg_memsz == 0) return -1;
+
+	strtab_size = 2;
+	while (symbol_name[strtab_size - 1] != '\0') strtab_size++;
+	/* Include both leading and trailing NUL in .strtab size. */
+	strtab_size++;
+
+	shstrtab_off = align_up_value(payload_off + seg_filesz, 8UL);
+	strtab_off = align_up_value(shstrtab_off + shstrtab_size, 8UL);
+	symtab_off = align_up_value(strtab_off + strtab_size, 8UL);
+	shoff = align_up_value(symtab_off + symtab_size, 8UL);
+	image_size = shoff + (5UL * 64UL);
+
+	if (image_size > FS_MAX_FILE_SIZE) return -1;
+
+	for (i = 0; i < image_size; i++) buf[i] = 0;
+
+	buf[0] = 0x7F; buf[1] = 'E'; buf[2] = 'L'; buf[3] = 'F';
+	buf[4] = 2;
+	buf[5] = 1;
+	buf[6] = 1;
+	wr16_le(&buf[16], 2);
+	wr16_le(&buf[18], 62);
+	wr32_le(&buf[20], 1);
+	wr64_le(&buf[24], base_vaddr);
+	wr64_le(&buf[32], 0x40);
+	wr64_le(&buf[40], shoff);
+	wr16_le(&buf[52], 0x40);
+	wr16_le(&buf[54], 0x38);
+	wr16_le(&buf[56], 1);
+	wr16_le(&buf[58], 0x40);
+	wr16_le(&buf[60], 5);
+	wr16_le(&buf[62], 1);
+
+	wr32_le(&buf[0x40], 1);
+	wr32_le(&buf[0x44], p_flags);
+	wr64_le(&buf[0x48], payload_off);
+	wr64_le(&buf[0x50], base_vaddr);
+	wr64_le(&buf[0x58], 0);
+	wr64_le(&buf[0x60], seg_filesz);
+	wr64_le(&buf[0x68], seg_memsz);
+	wr64_le(&buf[0x70], 0x1000);
+
+	for (i = 0; i < code_size; i++) buf[payload_off + i] = code[i];
+	for (i = 0; i < shstrtab_size; i++) buf[shstrtab_off + i] = (unsigned char)shstrtab[i];
+	buf[strtab_off] = '\0';
+	for (i = 0; symbol_name[i] != '\0'; i++) buf[strtab_off + sym_name_off + i] = (unsigned char)symbol_name[i];
+	buf[strtab_off + sym_name_off + i] = '\0';
+
+	buf[symtab_off + 24UL + 4] = 0x03;
+	wr16_le(&buf[symtab_off + 24UL + 6], 2);
+	wr64_le(&buf[symtab_off + 24UL + 8], base_vaddr);
+	wr64_le(&buf[symtab_off + 24UL + 16], code_size);
+
+	wr32_le(&buf[symtab_off + 48UL], sym_name_off);
+	buf[symtab_off + 48UL + 4] = 0x12;
+	wr16_le(&buf[symtab_off + 48UL + 6], 2);
+	wr64_le(&buf[symtab_off + 48UL + 8], base_vaddr);
+	wr64_le(&buf[symtab_off + 48UL + 16], code_size);
+
+	wr32_le(&buf[shoff + 64UL + 0], 1);
+	wr32_le(&buf[shoff + 64UL + 4], 3);
+	wr64_le(&buf[shoff + 64UL + 24], shstrtab_off);
+	wr64_le(&buf[shoff + 64UL + 32], shstrtab_size);
+	wr64_le(&buf[shoff + 64UL + 48], 1);
+
+	wr32_le(&buf[shoff + 128UL + 0], 11);
+	wr32_le(&buf[shoff + 128UL + 4], 1);
+	wr64_le(&buf[shoff + 128UL + 8], (p_flags & 0x1u) ? 0x6UL : 0x2UL);
+	wr64_le(&buf[shoff + 128UL + 16], base_vaddr);
+	wr64_le(&buf[shoff + 128UL + 24], payload_off);
+	wr64_le(&buf[shoff + 128UL + 32], code_size);
+	wr64_le(&buf[shoff + 128UL + 48], 16);
+
+	wr32_le(&buf[shoff + 192UL + 0], 17);
+	wr32_le(&buf[shoff + 192UL + 4], 3);
+	wr64_le(&buf[shoff + 192UL + 24], strtab_off);
+	wr64_le(&buf[shoff + 192UL + 32], strtab_size);
+	wr64_le(&buf[shoff + 192UL + 48], 1);
+
+	wr32_le(&buf[shoff + 256UL + 0], 25);
+	wr32_le(&buf[shoff + 256UL + 4], 2);
+	wr64_le(&buf[shoff + 256UL + 24], symtab_off);
+	wr64_le(&buf[shoff + 256UL + 32], symtab_size);
+	wr32_le(&buf[shoff + 256UL + 40], 3);
+	wr32_le(&buf[shoff + 256UL + 44], 2);
+	wr64_le(&buf[shoff + 256UL + 48], 8);
+	wr64_le(&buf[shoff + 256UL + 56], 24);
+
+	return fs_write_file(path, buf, image_size);
+}
+
 static unsigned long str_len(const char *s)
 {
 	unsigned long n = 0;
@@ -242,6 +426,39 @@ void fs_init(void)
 	nodes[0].name[0] = '/';
 	nodes[0].name[1] = '\0';
 	cwd_node = 0;
+
+	/* Seed built-in ELF fixtures for exec/execstress/elfselftest. */
+	{
+		static const unsigned char app_code[] = {
+			/* mov eax,42; ret */
+			0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3
+		};
+		static const unsigned char appw_code[] = {
+			/* mov eax,7; mov [rip+6],eax; mov eax,[rip+0]; ret; dd 0 */
+			0xB8,0x07,0x00,0x00,0x00,
+			/* store to data dword after ret: target offset 18 from next RIP(11) => +7 */
+			0x89,0x05,0x07,0x00,0x00,0x00,
+			/* load from same dword: target offset 18 from next RIP(17) => +1 */
+			0x8B,0x05,0x01,0x00,0x00,0x00,
+			0xC3,
+			0x00,0x00,0x00,0x00
+		};
+		static const unsigned char app2p_code[] = {
+			/* mov eax,99; ret */
+			0xB8, 0x63, 0x00, 0x00, 0x00, 0xC3
+		};
+		static const unsigned char panic_code[] = {
+			/* push rbp; mov rbp,rsp; ud2 */
+			0x55,
+			0x48, 0x89, 0xE5,
+			0x0F, 0x0B
+		};
+
+		(void)seed_builtin_elf_with_symbols("/app.elf",  0xFFFF900003000000UL, 0x5u, app_code,  sizeof(app_code),  sizeof(app_code),  sizeof(app_code), "_start");
+		(void)seed_builtin_elf("/appw.elf", 0xFFFF900003010000UL, 0x7u, appw_code, sizeof(appw_code), sizeof(appw_code), sizeof(appw_code));
+		(void)seed_builtin_elf("/app2p.elf",0xFFFF900003020000UL, 0x5u, app2p_code, sizeof(app2p_code), 0x1100UL, 0x1800UL);
+		(void)seed_builtin_elf_with_symbols("/panic.elf",0xFFFF900003030000UL, 0x5u, panic_code, sizeof(panic_code), sizeof(panic_code), sizeof(panic_code), "_crash");
+	}
 }
 
 int fs_mkdir(const char *path)
@@ -460,4 +677,36 @@ int fs_ls(const char *path, char names[][FS_NAME_MAX + 2], int types[], int max_
 
 	*out_count = count;
 	return 0;
+}
+
+int fs_stat(const char *path, int *out_is_dir, unsigned long *out_size)
+{
+	int node = resolve_path(path);
+	if (node < 0) return -1;
+	if (out_is_dir != (void *)0) *out_is_dir = nodes[node].is_dir;
+	if (out_size != (void *)0) *out_size = nodes[node].is_dir ? 0 : nodes[node].size;
+	return 0;
+}
+
+unsigned long fs_free_bytes(void)
+{
+	unsigned long i;
+	unsigned long dir_nodes = 0;
+	unsigned long used_file_bytes = 0;
+	unsigned long per_file_cap = (unsigned long)(FS_MAX_FILE_SIZE - 1);
+	unsigned long total_slots = (unsigned long)(FS_MAX_NODES - 1);
+
+	for (i = 1; i < FS_MAX_NODES; i++)
+	{
+		if (!nodes[i].used) continue;
+		if (nodes[i].is_dir) dir_nodes++;
+		else used_file_bytes += nodes[i].size;
+	}
+
+	if (dir_nodes >= total_slots) return 0;
+	{
+		unsigned long total_file_capacity = (total_slots - dir_nodes) * per_file_cap;
+		if (used_file_bytes >= total_file_capacity) return 0;
+		return total_file_capacity - used_file_bytes;
+	}
 }

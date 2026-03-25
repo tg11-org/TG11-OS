@@ -62,6 +62,11 @@ arch_lgdt:
     lgdt [rdi]
     ret
 
+.global arch_read_cr2
+arch_read_cr2:
+    mov rax, cr2
+    ret
+
 .global arch_read_cr3
 arch_read_cr3:
     mov rax, cr3
@@ -75,6 +80,31 @@ arch_write_cr3:
 .global arch_invlpg
 arch_invlpg:
     invlpg [rdi]
+    ret
+
+/* arch_wrmsr(unsigned long msr, unsigned long value) */
+.global arch_wrmsr
+arch_wrmsr:
+    mov  ecx, edi          /* msr number (low 32 bits of rdi) */
+    mov  rax, rsi          /* value low 32 bits in eax */
+    mov  rdx, rsi
+    shr  rdx, 32           /* value high 32 bits in edx */
+    wrmsr
+    ret
+
+/* unsigned long arch_rdmsr(unsigned long msr) */
+.global arch_rdmsr
+arch_rdmsr:
+    mov  ecx, edi
+    rdmsr                  /* result: edx:eax */
+    shl  rdx, 32
+    or   rax, rdx
+    ret
+
+/* arch_ltr(unsigned short selector) */
+.global arch_ltr
+arch_ltr:
+    ltr  di
     ret
 
 .global exception_hang_stub
@@ -100,6 +130,27 @@ isr_ignore_stub:
     push r10
     push r11
     push r12
+    push r13
+    push r14
+    push r15
+    cld
+    call isr_default_handler
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
 
 .global irq12_stub
 .extern mouse_interrupt_handler
@@ -118,31 +169,10 @@ irq12_stub:
     push r12
     push r13
     push r14
+
     push r15
     cld
     call mouse_interrupt_handler
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rbp
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-    iretq
-
-    push r13
-    push r14
-    push r15
-    cld
-    call isr_default_handler
     pop r15
     pop r14
     pop r13
@@ -232,7 +262,7 @@ EXCEPTION_NO_ERROR   4   /* #OF Overflow                  */
 EXCEPTION_NO_ERROR   5   /* #BR BOUND Range Exceeded      */
 EXCEPTION_NO_ERROR   6   /* #UD Invalid Opcode            */
 EXCEPTION_NO_ERROR   7   /* #NM Device Not Available      */
-EXCEPTION_WITH_ERROR 8   /* #DF Double Fault              */
+/* Vector 8 (Double Fault) has a custom handler -- see below */
 EXCEPTION_NO_ERROR   9   /* Coprocessor Segment Overrun   */
 EXCEPTION_WITH_ERROR 10  /* #TS Invalid TSS               */
 EXCEPTION_WITH_ERROR 11  /* #NP Segment Not Present       */
@@ -256,6 +286,42 @@ EXCEPTION_NO_ERROR   28  /* Reserved                      */
 EXCEPTION_NO_ERROR   29  /* Reserved                      */
 EXCEPTION_WITH_ERROR 30  /* #SX Security Exception        */
 EXCEPTION_NO_ERROR   31  /* Reserved                      */
+
+/* ---------------------------------------------------------------
+ * Custom Double Fault Handler
+ * 
+ * Double faults are critical - they occur when an exception happens
+ * while handling another exception. This dedicated handler ensures
+ * we can still display diagnostic info even if the exception handler
+ * itself has faulted.
+ * --------------------------------------------------------------- */
+.global double_fault_stub
+.extern double_fault_handler
+double_fault_stub:
+    push 0              /* fake error code for consistency */
+    push 8              /* vector 8 = double fault */
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cld
+    mov rdi, rsp        /* first arg = pointer to exception_frame */
+    call double_fault_handler
+double_fault_halt:
+    cli
+    hlt
+    jmp double_fault_halt
 
 /* Common handler: save all GPRs, pass frame pointer to C */
 .extern exception_handler
