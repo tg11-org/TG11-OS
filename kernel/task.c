@@ -7,11 +7,15 @@
 #include "terminal.h"
 #include "memory.h"
 #include "arch.h"
+#include "serial.h"
 
 /* ── Storage ─────────────────────────────────────────────────────── */
 
 static task_t tasks[TASK_MAX];
 static task_t *current_task;
+/* 0=default policy, 1=force protected, 2=force unprotected */
+static unsigned char task_protect_mode[TASK_MAX];
+static int task_event_log_on = 1;
 
 /*
  * Kernel stack used during syscalls and for TSS RSP0 (interrupt
@@ -42,6 +46,76 @@ static task_t *find_task_by_id(unsigned int id)
     return (void *)0;
 }
 
+static int str_eq(const char *a, const char *b)
+{
+    while (*a != '\0' && *b != '\0') {
+        if (*a != *b) return 0;
+        a++;
+        b++;
+    }
+    return *a == *b;
+}
+
+static unsigned int task_slot_index(const task_t *t)
+{
+    return (unsigned int)(t - tasks);
+}
+
+static void serial_write_uint(unsigned int v)
+{
+    char buf[12];
+    unsigned int i = 0;
+    if (v == 0) { serial_write("0"); return; }
+    while (v > 0) { buf[i++] = (char)('0' + v % 10); v /= 10; }
+    {
+        unsigned int lo = 0, hi = i - 1;
+        while (lo < hi) { char t = buf[lo]; buf[lo] = buf[hi]; buf[hi] = t; lo++; hi--; }
+    }
+    buf[i] = '\0';
+    serial_write(buf);
+}
+
+static void task_log_event(const char *op, const task_t *t)
+{
+    if (!task_event_log_on) return;
+    if (op == (void *)0 || t == (void *)0) return;
+    serial_write("[task] ");
+    serial_write(op);
+    serial_write(" id=");
+    serial_write_uint(t->id);
+    serial_write(" name=");
+    serial_write(t->name[0] != '\0' ? t->name : "<none>");
+    serial_write("\r\n");
+}
+
+static const char *task_class_name(const task_t *t)
+{
+    if (t == (void *)0) return "USER";
+    /* Core infrastructure tasks are system-owned. */
+    if (str_eq(t->name, "kernel") || str_eq(t->name, "shell") ||
+        str_eq(t->name, "terminal") || str_eq(t->name, "serial"))
+        return "SYS";
+    return "USER";
+}
+
+static int is_protected_task(const task_t *t)
+{
+    unsigned int idx;
+    if (t == (void *)0) return 0;
+    idx = task_slot_index(t);
+    if (idx < TASK_MAX)
+    {
+        if (task_protect_mode[idx] == 1) return 1;
+        if (task_protect_mode[idx] == 2) return 0;
+    }
+    /* task0 is the kernel idle task and must never be removed/stopped. */
+    if (t == &tasks[0]) return 1;
+    /* Shell and serial rescue console must stay available for recovery actions. */
+    if (str_eq(t->name, "shell")) return 1;
+    if (str_eq(t->name, "serial")) return 1;
+    return 0;
+}
+
 static void unlink_task(task_t *t)
 {
     task_t *p;
@@ -58,6 +132,7 @@ static void unlink_task(task_t *t)
 
 static void reclaim_task_slot(task_t *t)
 {
+    unsigned int idx;
     if (t == (void *)0 || t == &tasks[0]) return;
     if (t->stack_base != (void *)0) {
         virt_free_pages(t->stack_base, TASK_STACK_PAGES);
@@ -70,6 +145,33 @@ static void reclaim_task_slot(task_t *t)
     t->arg        = (void *)0;
     t->name[0]    = '\0';
     t->next       = (void *)0;
+    idx = task_slot_index(t);
+    if (idx < TASK_MAX) task_protect_mode[idx] = 0;
+}
+
+void task_reap_zombies(void)
+{
+    unsigned int i;
+    arch_disable_interrupts();
+    for (i = 1; i < TASK_MAX; i++) {
+        if (&tasks[i] == current_task) continue;
+        if (tasks[i].id == 0) continue;
+        if (tasks[i].state != TASK_STATE_ZOMBIE) continue;
+        unlink_task(&tasks[i]);
+        reclaim_task_slot(&tasks[i]);
+    }
+    arch_enable_interrupts();
+}
+
+void task_preempt_tick(void)
+{
+    /*
+     * IRQ-time context switching is unsafe with the current switch path.
+     * Keep the timer hook for accounting and future scheduler work, but do
+     * not switch tasks directly from the interrupt handler.
+     */
+    (void)current_task;
+    (void)user_task_saved_rsp;
 }
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
@@ -150,6 +252,7 @@ void task_init(void)
         tasks[i].arg        = (void *)0;
         tasks[i].name[0]    = '\0';
         tasks[i].next       = (void *)0;
+        task_protect_mode[i] = 0;
     }
 
     /* task 0 — the main kernel thread (uses the existing kernel stack) */
@@ -224,10 +327,13 @@ int task_create(const char *name, void (*entry)(void *), void *arg)
     t->entry = entry;
     t->arg   = arg;
     copy_name(t->name, name != (void *)0 ? name : "task", sizeof(t->name));
+    task_protect_mode[task_slot_index(t)] = 0;
 
     /* Insert after task0 so the round-robin visits new tasks quickly. */
     t->next          = tasks[0].next;
     tasks[0].next    = t;
+
+    task_log_event("create", t);
 
     return (int)t->id;
 }
@@ -262,6 +368,7 @@ void task_exit(void)
         /* Keep task0 alive; it's the shell/idle anchor. */
         return;
     }
+    task_log_event("exit", current_task);
     current_task->state = TASK_STATE_ZOMBIE;
     do_switch_to_next(current_task);
     for (;;) arch_halt(); /* should never reach here */
@@ -272,10 +379,92 @@ task_t *task_current(void)
     return current_task;
 }
 
+int task_find_id_by_name(const char *name)
+{
+    unsigned int i;
+    int found = -1;
+    if (name == (void *)0 || name[0] == '\0') return -1;
+
+    arch_disable_interrupts();
+    for (i = 0; i < TASK_MAX; i++) {
+        if (tasks[i].id == 0) continue;
+        if (tasks[i].state == TASK_STATE_ZOMBIE) continue;
+        if (!str_eq(tasks[i].name, name)) continue;
+        found = (int)tasks[i].id;
+        break;
+    }
+    arch_enable_interrupts();
+    return found;
+}
+
+int task_set_protection_by_id(unsigned int id, int enabled)
+{
+    task_t *t;
+    unsigned int idx;
+    if (id == 0) return -1;
+    arch_disable_interrupts();
+    t = find_task_by_id(id);
+    if (t == (void *)0 || t == &tasks[0])
+    {
+        arch_enable_interrupts();
+        return -1;
+    }
+    idx = task_slot_index(t);
+    if (idx >= TASK_MAX)
+    {
+        arch_enable_interrupts();
+        return -1;
+    }
+    task_protect_mode[idx] = enabled ? 1 : 2;
+    arch_enable_interrupts();
+    task_log_event(enabled ? "protect-on" : "protect-off", t);
+    return 0;
+}
+
+int task_set_protection_by_name(const char *name, int enabled)
+{
+    unsigned int i;
+    int rc = -1;
+    if (name == (void *)0 || name[0] == '\0') return -1;
+    arch_disable_interrupts();
+    for (i = 0; i < TASK_MAX; i++) {
+        if (tasks[i].id == 0) continue;
+        if (&tasks[i] == &tasks[0]) continue;
+        if (!str_eq(tasks[i].name, name)) continue;
+        task_protect_mode[i] = enabled ? 1 : 2;
+        rc = 0;
+        break;
+    }
+    arch_enable_interrupts();
+    if (rc == 0) task_log_event(enabled ? "protect-on" : "protect-off", &tasks[i]);
+    return rc;
+}
+
+int task_is_protected_id(unsigned int id)
+{
+    task_t *t;
+    int protected = 0;
+    arch_disable_interrupts();
+    t = find_task_by_id(id);
+    if (t != (void *)0) protected = is_protected_task(t);
+    arch_enable_interrupts();
+    return protected;
+}
+
+void task_set_event_log(int enabled)
+{
+    task_event_log_on = enabled ? 1 : 0;
+}
+
+int task_event_log_enabled(void)
+{
+    return task_event_log_on;
+}
+
 void task_print_list(void)
 {
     unsigned int i;
-    terminal_write_line("  ID  State    Name");
+    terminal_write_line("  ID  State    Class Prot Name");
     for (i = 0; i < TASK_MAX; i++) {
         if (tasks[i].id == 0) continue;
         terminal_write("  ");
@@ -283,20 +472,61 @@ void task_print_list(void)
         terminal_write("   ");
         if (tasks[i].state == TASK_STATE_RUNNING)     terminal_write("RUNNING  ");
         else if (tasks[i].state == TASK_STATE_READY)  terminal_write("READY    ");
+        else if (tasks[i].state == TASK_STATE_STOPPED) terminal_write("STOPPED  ");
         else                                           terminal_write("ZOMBIE   ");
+        terminal_write(task_class_name(&tasks[i]));
+        if (str_eq(task_class_name(&tasks[i]), "SYS")) terminal_write("   ");
+        else terminal_write("  ");
+        terminal_write(is_protected_task(&tasks[i]) ? "Y    " : "N    ");
         terminal_write_line(tasks[i].name);
+    }
+}
+
+void task_print_list_serial(void)
+{
+    unsigned int i;
+    serial_write("  ID  State    Class Prot Name\r\n");
+    for (i = 0; i < TASK_MAX; i++) {
+        char buf[12];
+        unsigned int v, j;
+        if (tasks[i].id == 0) continue;
+        serial_write("  ");
+        /* write ID */
+        v = tasks[i].id; j = 0;
+        if (v == 0) { buf[j++] = '0'; }
+        else { while (v > 0) { buf[j++] = (char)('0' + v % 10); v /= 10; }
+               { unsigned int lo = 0, hi = j - 1;
+                 while (lo < hi) { char t = buf[lo]; buf[lo] = buf[hi]; buf[hi] = t; lo++; hi--; } } }
+        buf[j] = '\0';
+        serial_write(buf);
+        serial_write("   ");
+        if (tasks[i].state == TASK_STATE_RUNNING)      serial_write("RUNNING  ");
+        else if (tasks[i].state == TASK_STATE_READY)   serial_write("READY    ");
+        else if (tasks[i].state == TASK_STATE_STOPPED) serial_write("STOPPED  ");
+        else                                            serial_write("ZOMBIE   ");
+        serial_write(task_class_name(&tasks[i]));
+        if (str_eq(task_class_name(&tasks[i]), "SYS")) serial_write("   ");
+        else serial_write("  ");
+        serial_write(is_protected_task(&tasks[i]) ? "Y    " : "N    ");
+        serial_write(tasks[i].name);
+        serial_write("\r\n");
     }
 }
 
 int task_kill(unsigned int id)
 {
-    task_t *t = find_task_by_id(id);
-    if (t == (void *)0) return -1;
-    if (t == &tasks[0]) return -1;
-    if (t == current_task) return -1;
-
+    task_t *t;
+    arch_disable_interrupts();
+    t = find_task_by_id(id);
+    if (t == (void *)0 || is_protected_task(t) || t == current_task)
+    {
+        arch_enable_interrupts();
+        return -1;
+    }
+    task_log_event("kill", t);
     unlink_task(t);
     reclaim_task_slot(t);
+    arch_enable_interrupts();
     return 0;
 }
 
@@ -304,14 +534,51 @@ int task_kill_all(void)
 {
     unsigned int i;
     int killed = 0;
+    arch_disable_interrupts();
     for (i = 1; i < TASK_MAX; i++) {
         if (&tasks[i] == current_task) continue;
         if (tasks[i].id == 0) continue;
+        if (is_protected_task(&tasks[i])) continue;
+        task_log_event("kill", &tasks[i]);
         unlink_task(&tasks[i]);
         reclaim_task_slot(&tasks[i]);
         killed++;
     }
+    arch_enable_interrupts();
     return killed;
+}
+
+int task_stop(unsigned int id)
+{
+    task_t *t;
+    arch_disable_interrupts();
+    t = find_task_by_id(id);
+    if (t == (void *)0 || is_protected_task(t) || t == current_task ||
+        (t->state != TASK_STATE_READY && t->state != TASK_STATE_RUNNING))
+    {
+        arch_enable_interrupts();
+        return -1;
+    }
+    t->state = TASK_STATE_STOPPED;
+    arch_enable_interrupts();
+    task_log_event("stop", t);
+    return 0;
+}
+
+int task_continue(unsigned int id)
+{
+    task_t *t;
+    arch_disable_interrupts();
+    t = find_task_by_id(id);
+    if (t == (void *)0 || t->state != TASK_STATE_STOPPED)
+    {
+        arch_enable_interrupts();
+        return -1;
+    }
+    t->state = TASK_STATE_READY;
+    arch_enable_interrupts();
+    task_log_event("cont", t);
+    return 0;
 }
 
 /*

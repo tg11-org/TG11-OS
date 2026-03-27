@@ -15,6 +15,7 @@
 #include "elf.h"
 #include "idt.h"
 #include "task.h"
+#include "timer.h"
 
 #define INPUT_BUFFER_SIZE 128
 #define SCANCODE_QUEUE_SIZE 256
@@ -37,6 +38,17 @@
 #define EDITOR_THEME_DIR "/edit/themes"
 #define EDITOR_THEME_CURRENT_PATH "/edit/themes/current"
 #define FBFONT_DIR "/fonts"
+#define ETC_DIR "/etc"
+#define MOTD_PATH "/etc/motd.txt"
+#define AUTORUN_PATH "/etc/autorun.sh"
+#define AUTORUN_MODE_PATH "/etc/autorun.mode"
+#define AUTORUN_ONCE_STATE_PATH "/etc/autorun.once_state"
+#define AUTORUN_DELAY_PATH "/etc/autorun.delay"
+#define FAT_AUTORUN_PATH "/autorun.sh"
+#define FAT_AUTORUN_MODE_PATH "/autorun.mod"
+#define FAT_AUTORUN_ONCE_STATE_PATH "/autorun.onc"
+#define FAT_AUTORUN_DELAY_PATH "/autorun.dly"
+#define AUTORUN_DEFAULT_DELAY_SECONDS 8UL
 #define MB2_TAG_END 0
 #define MB2_TAG_CMDLINE 1
 #define EDITOR_SCREEN_SNAPSHOT_MAX_CELLS (256UL * 144UL)
@@ -67,6 +79,8 @@ static int caps_lock_on = 0;
 static int ctrl_held    = 0;
 static int alt_held     = 0;
 static int extended_key = 0;
+static int control_poll_extended = 0;
+static volatile int terminal_cancel_requested = 0;
 static int panic_esc_held = 0;
 static int panic_f12_held = 0;
 static int panic_hotkey_fired = 0;
@@ -170,6 +184,8 @@ static char script_var_values[SCRIPT_VAR_MAX][96];
 static int command_alias_count = 0;
 static char command_alias_names[COMMAND_ALIAS_MAX][COMMAND_ALIAS_NAME_LEN];
 static char command_alias_expansions[COMMAND_ALIAS_MAX][COMMAND_ALIAS_EXPANSION_LEN];
+static int autorun_boot_pending = 0;
+static unsigned long autorun_boot_deadline = 0;
 
 static int string_equals(const char *a, const char *b);
 static int string_equals_ci(const char *a, const char *b);
@@ -183,7 +199,6 @@ static void terminal_redraw_input_line(void);
 static int fat_mode_active(void);
 static int fat_resolve_path(const char *input, char *out, unsigned long out_size);
 static void editor_handle_scancode(unsigned char scancode);
-static void editor_handle_serial_char(char c);
 static void run_command(void);
 static int eval_script_condition(const char *expr);
 static int execute_substitution_command(const char *raw_cmd, char *out, unsigned long out_size);
@@ -226,6 +241,8 @@ static void editor_begin_selection_if_needed(void);
 static void editor_finish_selection_move(void);
 static void editor_delete_range(unsigned long start, unsigned long end);
 static void editor_delete_selection(void);
+static void terminal_shutdown(void);
+static void do_reboot(void);
 static void editor_copy_selection(int cut);
 static int editor_insert_text(const char *text, unsigned long len);
 static int parse_color_token(const char *s, unsigned char *out);
@@ -268,7 +285,17 @@ static void cmd_selftest(const char *args);
 static void cmd_exec(const char *args);
 static void cmd_tasks(void);
 static void cmd_tasktest(void);
+static void cmd_taskspin(void);
+static void cmd_shellspawn(void);
+static void cmd_taskprotect(const char *args);
+static void cmd_shellwatch(const char *args);
+static void cmd_tasklog(const char *args);
+static void cmd_motd(void);
+static void cmd_autorun(const char *args);
 static void cmd_taskkill(const char *args);
+static void cmd_taskstop(const char *args);
+static void cmd_taskcont(const char *args);
+static void cmd_ticks(void);
 static void cmd_elfinfo(const char *args);
 static void cmd_elfsym(const char *args);
 static void cmd_elfaddr(const char *args);
@@ -279,11 +306,27 @@ static void update_panic_hotkey(void);
 static void cmd_man(const char *args);
 static void cmd_alias(const char *args);
 static void cmd_unalias(const char *args);
+static void cmd_run(const char *args);
 static void cmd_dir(const char *args);
 static void cmd_tree(const char *args);
 static void print_help_commands(const char *args);
 static int print_manual_entry(const char *topic, const char *args);
 static int resolve_command_aliases(const char *in, char *out, unsigned long out_size);
+static void terminal_auto_fatmount(void);
+static int terminal_try_mount_boot_fat(void);
+static int terminal_write_fat_text(const char *path, const char *text);
+static int terminal_get_autorun_mode(void);
+static void terminal_set_autorun_mode(int mode);
+static int terminal_autorun_once_done(void);
+static void terminal_set_autorun_once_done(int done);
+static unsigned long terminal_get_autorun_delay_seconds(void);
+static void terminal_set_autorun_delay_seconds(unsigned long seconds);
+static int terminal_run_autorun_script_now(void);
+static int terminal_autorun_should_run_on_boot(void);
+static void terminal_schedule_boot_autorun(void);
+static void terminal_poll_boot_autorun(void);
+static void terminal_print_motd(void);
+static void terminal_run_boot_autorun(void);
 
 #pragma pack(push, 1)
 struct mb2_tag_header
@@ -1645,9 +1688,39 @@ static void ensure_theme_files(void)
 	const char *existing;
 	fs_mkdir(SYSTEM_THEME_DIR);
 	fs_mkdir(FBFONT_DIR);
+	fs_mkdir(ETC_DIR);
 	fs_mkdir("/scripts");
 	fs_mkdir("/edit");
 	fs_mkdir(EDITOR_THEME_DIR);
+
+	if (fs_read_text(MOTD_PATH, &existing) != 0)
+	{
+		fs_write_text(MOTD_PATH,
+			"Welcome to TG11-OS!\n"
+			"Type 'help' to list commands.\n"
+			"Type 'man <topic>' for details.\n");
+	}
+	if (fs_read_text(AUTORUN_PATH, &existing) != 0)
+	{
+		fs_write_text(AUTORUN_PATH,
+			"# TG11 boot autorun script\n"
+			"# one command per line, same syntax as manual shell scripts\n"
+			"# examples:\n"
+			"# theme synthwave\n"
+			"# shellwatch on\n");
+	}
+	if (fs_read_text(AUTORUN_MODE_PATH, &existing) != 0)
+	{
+		fs_write_text(AUTORUN_MODE_PATH, "off\n");
+	}
+	if (fs_read_text(AUTORUN_ONCE_STATE_PATH, &existing) != 0)
+	{
+		fs_write_text(AUTORUN_ONCE_STATE_PATH, "0\n");
+	}
+	if (fs_read_text(AUTORUN_DELAY_PATH, &existing) != 0)
+	{
+		fs_write_text(AUTORUN_DELAY_PATH, "8\n");
+	}
 
 	if (fs_read_text(SYSTEM_THEME_DIR "/default.theme", &existing) != 0)
 	{
@@ -3219,7 +3292,7 @@ static const char * const cmd_list[] = {
 	"panic",
 	"quit", "exit", "shutdown",
 	"pwd", "ls", "dir", "tree", "cd", "mkdir", "touch", "write", "cat", "type", "rm", "del", "cp", "copy", "mv", "move", "ren", "edit", "hexedit", "run", "basic", "cls",
-	"hexdump", "memmap", "memstat", "pagetest", "pagefault", "gpfault", "udfault", "doublefault", "exceptstat", "dumpstack", "selftest", "elfinfo", "elfsym", "elfaddr", "exec", "execstress", "elfselftest", "tasks", "tasktest", "taskkill", "ataid", "readsec", "writesec", "drives", "fatmount", "ramfs", "ramfs2fat", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatattr", "fatrm", (void *)0
+	"hexdump", "memmap", "memstat", "pagetest", "pagefault", "gpfault", "udfault", "doublefault", "exceptstat", "dumpstack", "selftest", "elfinfo", "elfsym", "elfaddr", "exec", "execstress", "elfselftest", "tasks", "tasktest", "taskspin", "shellspawn", "shellwatch", "taskprotect", "tasklog", "taskkill", "taskstop", "taskcont", "ticks", "motd", "autorun", "ataid", "readsec", "writesec", "drives", "fatmount", "ramfs", "ramfs2fat", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatattr", "fatrm", (void *)0
 };
 
 static int parse_dec_u32(const char *s, unsigned int *out)
@@ -3810,6 +3883,61 @@ static void handle_backspace(int from_serial)
 	sync_screen_pos();
 	screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
 	if (!from_serial && serial_ready && serial_mirror_enabled && !serial_compact_enabled) serial_write("\b \b");
+}
+
+static void terminal_request_cancel(void)
+{
+	terminal_cancel_requested = 1;
+}
+
+static int terminal_take_cancel_request(void)
+{
+	if (!terminal_cancel_requested) return 0;
+	terminal_cancel_requested = 0;
+	return 1;
+}
+
+/*
+ * Poll only emergency controls while a command loop is running.
+ * This intentionally avoids full line-editing/command submission,
+ * preventing recursive run_command() calls.
+ */
+static void terminal_poll_control_hotkeys(void)
+{
+	while (scancode_queue_tail != scancode_queue_head)
+	{
+		unsigned char sc = scancode_queue[scancode_queue_tail];
+		scancode_queue_tail = (scancode_queue_tail + 1) % SCANCODE_QUEUE_SIZE;
+
+		if (sc == 0xE0) { control_poll_extended = 1; continue; }
+		if (control_poll_extended)
+		{
+			control_poll_extended = 0;
+			if (sc == 0x1D) { ctrl_held = 1; continue; }
+			if (sc == 0x9D) { ctrl_held = 0; continue; }
+			if (sc == 0x38) { alt_held = 1; continue; }
+			if (sc == 0xB8) { alt_held = 0; continue; }
+			if (sc == 0x13 && ctrl_held && shift_held) { do_reboot(); return; } /* Ctrl+Shift+R */
+			continue;
+		}
+
+		if (sc == 0x1D) { ctrl_held = 1; continue; }
+		if (sc == 0x9D) { ctrl_held = 0; continue; }
+		if (sc == 0x38) { alt_held = 1; continue; }
+		if (sc == 0xB8) { alt_held = 0; continue; }
+
+		if (sc == 0x2E && ctrl_held)
+		{
+			terminal_request_cancel();
+			terminal_write_line("^C");
+			continue;
+		}
+		if (sc == 0x10 && ctrl_held && shift_held)
+		{
+			terminal_shutdown();
+			return;
+		}
+	}
 }
 
 static void terminal_abort_input_line(void)
@@ -4489,6 +4617,280 @@ static void cmd_tasktest(void)
 	terminal_write_line("[tasktest] back in kernel shell");
 }
 
+static volatile unsigned long taskspin_counter = 0;
+
+static void task_spin_fn(void *arg)
+{
+	(void)arg;
+	for (;;)
+	{
+		taskspin_counter++;
+		if ((taskspin_counter & 0x3FFFUL) == 0) task_yield();
+	}
+}
+
+static void cmd_taskspin(void)
+{
+	int id = task_create("spin", task_spin_fn, (void *)0);
+	if (id < 0)
+	{
+		terminal_write_line("taskspin: task_create failed");
+		return;
+	}
+	terminal_write("taskspin: started task ");
+	{
+		char n[16];
+		uint_to_dec((unsigned long)id, n, sizeof(n));
+		terminal_write_line(n);
+	}
+}
+
+static void cmd_shellspawn(void)
+{
+	int id = kernel_ensure_shell_task();
+	if (id < 0)
+	{
+		terminal_write_line("shellspawn: failed to start shell task");
+		return;
+	}
+	terminal_write("shellspawn: shell task id ");
+	{
+		char n[16];
+		uint_to_dec((unsigned long)id, n, sizeof(n));
+		terminal_write_line(n);
+	}
+}
+
+static void cmd_taskprotect(const char *args)
+{
+	char target[24];
+	char mode[8];
+	unsigned int id;
+	const char *rest = read_token(args, target, sizeof(target));
+
+	if (rest == (void *)0 || target[0] == '\0')
+	{
+		terminal_write_line("Usage: taskprotect <id|name> <on|off>");
+		terminal_write_line("Usage: taskprotect <id> status");
+		return;
+	}
+
+	if (read_token(rest, mode, sizeof(mode)) == (void *)0 || mode[0] == '\0')
+	{
+		terminal_write_line("Usage: taskprotect <id|name> <on|off>");
+		terminal_write_line("Usage: taskprotect <id> status");
+		return;
+	}
+
+	if (parse_dec_u32(target, &id) == 0)
+	{
+		if (string_equals(mode, "status"))
+		{
+			terminal_write("taskprotect: ");
+			terminal_write(task_is_protected_id(id) ? "ON" : "OFF");
+			terminal_putc('\n');
+			return;
+		}
+		if (string_equals(mode, "on") || string_equals(mode, "off"))
+		{
+			if (task_set_protection_by_id(id, string_equals(mode, "on")) != 0)
+			{
+				terminal_write_line("taskprotect: failed");
+				return;
+			}
+			terminal_write_line("taskprotect: updated");
+			return;
+		}
+	}
+	else
+	{
+		if (string_equals(mode, "on") || string_equals(mode, "off"))
+		{
+			if (task_set_protection_by_name(target, string_equals(mode, "on")) != 0)
+			{
+				terminal_write_line("taskprotect: failed");
+				return;
+			}
+			terminal_write_line("taskprotect: updated");
+			return;
+		}
+	}
+
+	terminal_write_line("Usage: taskprotect <id|name> <on|off>");
+	terminal_write_line("Usage: taskprotect <id> status");
+}
+
+static void cmd_shellwatch(const char *args)
+{
+	char tok[8];
+	if (read_token(args, tok, sizeof(tok)) == (void *)0 || tok[0] == '\0' || string_equals(tok, "show"))
+	{
+		terminal_write("shellwatch: ");
+		terminal_write_line(kernel_shell_watchdog_enabled() ? "on" : "off");
+		return;
+	}
+	if (string_equals(tok, "on"))
+	{
+		kernel_set_shell_watchdog(1);
+		terminal_write_line("shellwatch: enabled");
+		return;
+	}
+	if (string_equals(tok, "off"))
+	{
+		kernel_set_shell_watchdog(0);
+		terminal_write_line("shellwatch: disabled");
+		return;
+	}
+	terminal_write_line("Usage: shellwatch [on|off|show]");
+}
+
+static void cmd_tasklog(const char *args)
+{
+	char tok[8];
+	if (read_token(args, tok, sizeof(tok)) == (void *)0 || tok[0] == '\0' || string_equals(tok, "show"))
+	{
+		terminal_write("tasklog: ");
+		terminal_write_line(task_event_log_enabled() ? "on" : "off");
+		return;
+	}
+	if (string_equals(tok, "on"))
+	{
+		task_set_event_log(1);
+		terminal_write_line("tasklog: enabled");
+		return;
+	}
+	if (string_equals(tok, "off"))
+	{
+		task_set_event_log(0);
+		terminal_write_line("tasklog: disabled");
+		return;
+	}
+	terminal_write_line("Usage: tasklog [on|off|show]");
+}
+
+static void cmd_motd(void)
+{
+	terminal_print_motd();
+}
+
+static void cmd_autorun(const char *args)
+{
+	char tok[16];
+	const char *rest;
+	int mode;
+
+	rest = read_token(args, tok, sizeof(tok));
+	if (rest == (void *)0 || tok[0] == '\0' || string_equals(tok, "show"))
+	{
+		char n[16];
+		unsigned long delay_seconds = terminal_get_autorun_delay_seconds();
+		mode = terminal_get_autorun_mode();
+		terminal_write("autorun: mode=");
+		if (mode == 0) terminal_write("off");
+		else if (mode == 2) terminal_write("once");
+		else terminal_write("always");
+		terminal_write(" delay=");
+		uint_to_dec(delay_seconds, n, sizeof(n));
+		terminal_write(n);
+		terminal_write("s");
+		if (mode == 2)
+		{
+			terminal_write(" state=");
+			terminal_write(terminal_autorun_once_done() ? "done" : "armed");
+		}
+		if (autorun_boot_pending)
+		{
+			unsigned long now = timer_ticks();
+			terminal_write(" pending=");
+			if (now < autorun_boot_deadline)
+			{
+				char n[16];
+				unsigned long left = (autorun_boot_deadline - now + 99UL) / 100UL;
+				uint_to_dec(left, n, sizeof(n));
+				terminal_write(n);
+				terminal_write("s");
+			}
+			else terminal_write("ready");
+		}
+		terminal_putc('\n');
+		return;
+	}
+	if (string_equals(tok, "delay"))
+	{
+		char n[16];
+		char value_tok[16];
+		unsigned int seconds;
+
+		if (read_token(rest, value_tok, sizeof(value_tok)) == (void *)0 || value_tok[0] == '\0' ||
+			string_equals(value_tok, "show"))
+		{
+			uint_to_dec(terminal_get_autorun_delay_seconds(), n, sizeof(n));
+			terminal_write("autorun: delay=");
+			terminal_write(n);
+			terminal_write_line("s");
+			return;
+		}
+
+		if (parse_dec_u32(value_tok, &seconds) != 0 || seconds > 3600U)
+		{
+			terminal_write_line("Usage: autorun delay <0..3600>");
+			return;
+		}
+
+		terminal_set_autorun_delay_seconds((unsigned long)seconds);
+		if (autorun_boot_pending) terminal_schedule_boot_autorun();
+		uint_to_dec((unsigned long)seconds, n, sizeof(n));
+		terminal_write("autorun: delay set to ");
+		terminal_write(n);
+		terminal_write_line("s");
+		return;
+	}
+
+	if (string_equals(tok, "off"))
+	{
+		terminal_set_autorun_mode(0);
+		autorun_boot_pending = 0;
+		terminal_write_line("autorun: mode off");
+		return;
+	}
+	if (string_equals(tok, "always") || string_equals(tok, "on"))
+	{
+		terminal_set_autorun_mode(1);
+		terminal_schedule_boot_autorun();
+		terminal_write_line("autorun: mode always");
+		return;
+	}
+	if (string_equals(tok, "once"))
+	{
+		terminal_set_autorun_mode(2);
+		terminal_set_autorun_once_done(0);
+		terminal_schedule_boot_autorun();
+		terminal_write_line("autorun: mode once (armed)");
+		return;
+	}
+	if (string_equals(tok, "rearm"))
+	{
+		terminal_set_autorun_once_done(0);
+		terminal_schedule_boot_autorun();
+		terminal_write_line("autorun: once state re-armed");
+		return;
+	}
+	if (string_equals(tok, "stop"))
+	{
+		autorun_boot_pending = 0;
+		terminal_write_line("autorun: canceled for this boot");
+		return;
+	}
+	if (string_equals(tok, "run"))
+	{
+		if (terminal_run_autorun_script_now()) terminal_write_line("autorun: executed");
+		else terminal_write_line("autorun: no script found");
+		return;
+	}
+
+	terminal_write_line("Usage: autorun [show|off|always|once|rearm|stop|run|delay <0..3600>]");
+}
+
 static void cmd_taskkill(const char *args)
 {
 	char tok[16];
@@ -4521,6 +4923,48 @@ static void cmd_taskkill(const char *args)
 		return;
 	}
 	terminal_write_line("taskkill: terminated");
+}
+
+static void cmd_taskstop(const char *args)
+{
+	char tok[16];
+	unsigned int id;
+	if (read_token(args, tok, sizeof(tok)) == (void *)0 || tok[0] == '\0' || parse_dec_u32(tok, &id) != 0)
+	{
+		terminal_write_line("Usage: taskstop <id>");
+		return;
+	}
+	if (task_stop(id) != 0)
+	{
+		terminal_write_line("taskstop: failed");
+		return;
+	}
+	terminal_write_line("taskstop: stopped");
+}
+
+static void cmd_taskcont(const char *args)
+{
+	char tok[16];
+	unsigned int id;
+	if (read_token(args, tok, sizeof(tok)) == (void *)0 || tok[0] == '\0' || parse_dec_u32(tok, &id) != 0)
+	{
+		terminal_write_line("Usage: taskcont <id>");
+		return;
+	}
+	if (task_continue(id) != 0)
+	{
+		terminal_write_line("taskcont: failed");
+		return;
+	}
+	terminal_write_line("taskcont: resumed");
+}
+
+static void cmd_ticks(void)
+{
+	char n[24];
+	uint_to_dec(timer_ticks(), n, sizeof(n));
+	terminal_write("ticks: ");
+	terminal_write_line(n);
 }
 
 static void cmd_elfinfo(const char *args)
@@ -4774,11 +5218,18 @@ static void cmd_execstress(const char *args)
 	}
 
 	if (read_shell_file_bytes("execstress", path, buf, sizeof(buf), &size) != 0) return;
+	terminal_take_cancel_request(); /* clear stale request */
 
 	before_free = memory_free_pages();
 	for (i = 0; i < (unsigned long)run_count; i++)
 	{
 		elf_exec_t prog;
+		terminal_poll_control_hotkeys();
+		if (terminal_take_cancel_request())
+		{
+			terminal_write_line("execstress: canceled by user");
+			break;
+		}
 		last_rc = elf_load(buf, size, &prog);
 		if (last_rc != 0) break;
 		last_ret = elf_call(&prog);
@@ -4894,6 +5345,7 @@ static void cmd_elfselftest(const char *args)
 	}
 
 	terminal_write_line("elfselftest: running built-in ELF matrix...");
+	terminal_take_cancel_request(); /* clear stale request */
 
 	for (i = 0; i < (unsigned long)(sizeof(tests) / sizeof(tests[0])); i++)
 	{
@@ -4902,6 +5354,13 @@ static void cmd_elfselftest(const char *args)
 		elf_exec_t prog;
 		int rc;
 		long ret;
+
+		terminal_poll_control_hotkeys();
+		if (terminal_take_cancel_request())
+		{
+			terminal_write_line("elfselftest: canceled by user");
+			break;
+		}
 
 		if (fs_read_file(tests[i].path, buf, sizeof(buf), &size) != 0)
 		{
@@ -7081,6 +7540,243 @@ static int eval_script_condition(const char *expr)
 	return 0;
 }
 
+static int terminal_try_mount_boot_fat(void)
+{
+	struct block_device *dev;
+	if (fat32_is_mounted()) return 1;
+	dev = blockdev_get_primary();
+	if (dev != (void *)0 && dev->present && fat32_mount(dev) == 0) return 1;
+	dev = blockdev_get_secondary();
+	if (dev != (void *)0 && dev->present && fat32_mount(dev) == 0) return 1;
+	return 0;
+}
+
+static void terminal_auto_fatmount(void)
+{
+	if (!terminal_try_mount_boot_fat()) return;
+	vfs_prefer_fat_root = 1;
+	fat_cwd[0] = '/';
+	fat_cwd[1] = '\0';
+}
+
+static int terminal_write_fat_text(const char *path, const char *text)
+{
+	unsigned long len = string_length(text);
+	if (fat32_write_file_path(path, (const unsigned char *)text, len) == 0) return 0;
+	if (fat32_touch_file_path(path) != 0) return -1;
+	return fat32_write_file_path(path, (const unsigned char *)text, len);
+}
+
+static int terminal_get_autorun_mode(void)
+{
+	const char *text;
+	unsigned char fat_buf[32];
+	unsigned long fat_size = 0;
+
+	if (terminal_try_mount_boot_fat() &&
+		fat32_read_file_path(FAT_AUTORUN_MODE_PATH, fat_buf, sizeof(fat_buf) - 1, &fat_size) == 0)
+	{
+		fat_buf[fat_size] = '\0';
+		text = (const char *)fat_buf;
+	}
+	else if (fs_read_text(AUTORUN_MODE_PATH, &text) != 0)
+	{
+		return 1;
+	}
+
+	if (string_starts_with(text, "off")) return 0;
+	if (string_starts_with(text, "once")) return 2;
+	return 1;
+}
+
+static void terminal_set_autorun_mode(int mode)
+{
+	const char *text;
+	if (mode == 0) text = "off\n";
+	else if (mode == 2) text = "once\n";
+	else text = "always\n";
+	fs_write_text(AUTORUN_MODE_PATH, text);
+	if (terminal_try_mount_boot_fat()) terminal_write_fat_text(FAT_AUTORUN_MODE_PATH, text);
+}
+
+static int terminal_autorun_once_done(void)
+{
+	const char *text;
+	unsigned char fat_buf[8];
+	unsigned long fat_size = 0;
+
+	if (terminal_try_mount_boot_fat() &&
+		fat32_read_file_path(FAT_AUTORUN_ONCE_STATE_PATH, fat_buf, sizeof(fat_buf) - 1, &fat_size) == 0)
+	{
+		fat_buf[fat_size] = '\0';
+		text = (const char *)fat_buf;
+	}
+	else if (fs_read_text(AUTORUN_ONCE_STATE_PATH, &text) != 0)
+	{
+		return 0;
+	}
+
+	return (text[0] == '1') ? 1 : 0;
+}
+
+static void terminal_set_autorun_once_done(int done)
+{
+	const char *text = done ? "1\n" : "0\n";
+	fs_write_text(AUTORUN_ONCE_STATE_PATH, text);
+	if (terminal_try_mount_boot_fat()) terminal_write_fat_text(FAT_AUTORUN_ONCE_STATE_PATH, text);
+}
+
+static unsigned long terminal_get_autorun_delay_seconds(void)
+{
+	const char *text;
+	char token[16];
+	unsigned int seconds = (unsigned int)AUTORUN_DEFAULT_DELAY_SECONDS;
+	unsigned char fat_buf[32];
+	unsigned long fat_size = 0;
+
+	if (terminal_try_mount_boot_fat() &&
+		fat32_read_file_path(FAT_AUTORUN_DELAY_PATH, fat_buf, sizeof(fat_buf) - 1, &fat_size) == 0)
+	{
+		fat_buf[fat_size] = '\0';
+		if (read_token((const char *)fat_buf, token, sizeof(token)) != (void *)0 && token[0] != '\0' &&
+			parse_dec_u32(token, &seconds) == 0)
+		{
+			return (unsigned long)seconds;
+		}
+	}
+
+	if (fs_read_text(AUTORUN_DELAY_PATH, &text) == 0 &&
+		read_token(text, token, sizeof(token)) != (void *)0 && token[0] != '\0' &&
+		parse_dec_u32(token, &seconds) == 0)
+	{
+		return (unsigned long)seconds;
+	}
+
+	return AUTORUN_DEFAULT_DELAY_SECONDS;
+}
+
+static void terminal_set_autorun_delay_seconds(unsigned long seconds)
+{
+	char value[16];
+	uint_to_dec(seconds, value, sizeof(value));
+	fs_write_text(AUTORUN_DELAY_PATH, value);
+	if (terminal_try_mount_boot_fat()) terminal_write_fat_text(FAT_AUTORUN_DELAY_PATH, value);
+}
+
+static int terminal_run_autorun_script_now(void)
+{
+	const char *text;
+	int old_fat_mode;
+
+	if (terminal_try_mount_boot_fat())
+	{
+		unsigned char probe[2];
+		unsigned long probe_size = 0;
+		if (fat32_read_file_path(FAT_AUTORUN_PATH, probe, sizeof(probe), &probe_size) == 0)
+		{
+			old_fat_mode = vfs_prefer_fat_root;
+			vfs_prefer_fat_root = 1;
+			cmd_run(FAT_AUTORUN_PATH);
+			vfs_prefer_fat_root = old_fat_mode;
+			return 1;
+		}
+	}
+
+	if (fs_read_text(AUTORUN_PATH, &text) != 0) return 0;
+	if (text[0] == '\0') return 0;
+	cmd_run(AUTORUN_PATH);
+	return 1;
+}
+
+static int terminal_autorun_should_run_on_boot(void)
+{
+	int mode = terminal_get_autorun_mode();
+	if (mode == 0) return 0;
+	if (mode == 2 && terminal_autorun_once_done()) return 0;
+	return 1;
+}
+
+static void terminal_schedule_boot_autorun(void)
+{
+	unsigned long delay_seconds;
+	unsigned long delay_ticks;
+	char n[16];
+
+	if (!terminal_autorun_should_run_on_boot())
+	{
+		autorun_boot_pending = 0;
+		return;
+	}
+	delay_seconds = terminal_get_autorun_delay_seconds();
+	delay_ticks = delay_seconds * 100UL;
+	autorun_boot_pending = 1;
+	autorun_boot_deadline = timer_ticks() + delay_ticks;
+	terminal_write("autorun: scheduled in ");
+	uint_to_dec(delay_seconds, n, sizeof(n));
+	terminal_write(n);
+	terminal_write_line("s (type 'autorun stop' to skip this boot)");
+}
+
+static void terminal_poll_boot_autorun(void)
+{
+	int mode;
+	int ran;
+	if (!autorun_boot_pending) return;
+	if (timer_ticks() < autorun_boot_deadline) return;
+	if (editor_active || script_mode_active || terminal_capture_mode) return;
+	if (input_length != 0) return;
+
+	autorun_boot_pending = 0;
+	mode = terminal_get_autorun_mode();
+	ran = terminal_run_autorun_script_now();
+	if (!ran)
+	{
+		terminal_write_line("autorun: no script found");
+		return;
+	}
+	if (mode == 2) terminal_set_autorun_once_done(1);
+}
+
+static void terminal_print_motd(void)
+{
+	const char *text;
+	unsigned char fat_buf[1024];
+	unsigned long fat_size = 0;
+	unsigned long i = 0;
+
+	if (terminal_try_mount_boot_fat() &&
+		fat32_read_file_path("/motd.txt", fat_buf, sizeof(fat_buf) - 1, &fat_size) == 0)
+	{
+		fat_buf[fat_size] = '\0';
+		text = (const char *)fat_buf;
+	}
+	else
+	{
+	if (fs_read_text(MOTD_PATH, &text) != 0) return;
+	}
+	if (text[0] == '\0') return;
+
+	while (text[i] != '\0')
+	{
+		char line[INPUT_BUFFER_SIZE];
+		unsigned long n = 0;
+		while (text[i] != '\0' && text[i] != '\n' && n + 1 < sizeof(line))
+		{
+			if (text[i] != '\r') line[n++] = text[i];
+			i++;
+		}
+		line[n] = '\0';
+		terminal_write_echo_text(line);
+		terminal_putc('\n');
+		if (text[i] == '\n') i++;
+	}
+}
+
+static void terminal_run_boot_autorun(void)
+{
+	terminal_schedule_boot_autorun();
+}
+
 static void cmd_run(const char *args)
 {
 	struct run_if_state
@@ -8613,6 +9309,7 @@ static void ramfs_copy_to_fat_r(const char *rpath, const char *fpath, int *copie
 	int i;
 
 	if (depth > 16) return;
+	if (terminal_cancel_requested) return;
 	count = 0;
 	if (fs_ls(rpath, names, types, 64, &count) != 0) return;
 
@@ -8640,6 +9337,9 @@ static void ramfs_copy_to_fat_r(const char *rpath, const char *fpath, int *copie
 
 	for (i = 0; i < count; i++)
 	{
+		terminal_poll_control_hotkeys();
+		if (terminal_take_cancel_request()) return;
+
 		char name_clean[FS_NAME_MAX + 1];
 		char fat_base[9];
 		char fat_ext[4];
@@ -8775,7 +9475,13 @@ static void cmd_ramfs2fat(const char *args)
 	{
 		terminal_write_line("ramfs2fat: copying RAM FS tree to FAT ...");
 	}
+	terminal_take_cancel_request(); /* clear stale request */
 	ramfs_copy_to_fat_r("/", "/", &copied, &errors, 0, map_only);
+	if (terminal_take_cancel_request())
+	{
+		terminal_write_line("ramfs2fat: canceled by user");
+		return;
+	}
 
 	uint_to_dec((unsigned long)copied, num, sizeof(num));
 	terminal_write("ramfs2fat: ");
@@ -9342,10 +10048,59 @@ static void run_command(void)
 	{
 		cmd_tasktest();
 	}
+	else if (string_equals(input_buffer, "taskspin"))
+	{
+		cmd_taskspin();
+	}
+	else if (string_equals(input_buffer, "shellspawn"))
+	{
+		cmd_shellspawn();
+	}
+	else if (string_starts_with(input_buffer, "shellwatch"))
+	{
+		if (input_buffer[10] == '\0') cmd_shellwatch("show");
+		else if (input_buffer[10] == ' ') cmd_shellwatch(input_buffer + 11);
+		else terminal_write_line("Usage: shellwatch [on|off|show]");
+	}
+	else if (string_starts_with(input_buffer, "taskprotect"))
+	{
+		if (input_buffer[11] == ' ') cmd_taskprotect(input_buffer + 12);
+		else terminal_write_line("Usage: taskprotect <id|name> <on|off>");
+	}
+	else if (string_starts_with(input_buffer, "tasklog"))
+	{
+		if (input_buffer[7] == '\0') cmd_tasklog("show");
+		else if (input_buffer[7] == ' ') cmd_tasklog(input_buffer + 8);
+		else terminal_write_line("Usage: tasklog [on|off|show]");
+	}
 	else if (string_starts_with(input_buffer, "taskkill"))
 	{
 		if (input_buffer[8] == ' ') cmd_taskkill(input_buffer + 9);
 		else terminal_write_line("Usage: taskkill <id>|all");
+	}
+	else if (string_starts_with(input_buffer, "taskstop"))
+	{
+		if (input_buffer[8] == ' ') cmd_taskstop(input_buffer + 9);
+		else terminal_write_line("Usage: taskstop <id>");
+	}
+	else if (string_starts_with(input_buffer, "taskcont"))
+	{
+		if (input_buffer[8] == ' ') cmd_taskcont(input_buffer + 9);
+		else terminal_write_line("Usage: taskcont <id>");
+	}
+	else if (string_equals(input_buffer, "ticks"))
+	{
+		cmd_ticks();
+	}
+	else if (string_equals(input_buffer, "motd"))
+	{
+		cmd_motd();
+	}
+	else if (string_starts_with(input_buffer, "autorun"))
+	{
+		if (input_buffer[7] == '\0') cmd_autorun("show");
+		else if (input_buffer[7] == ' ') cmd_autorun(input_buffer + 8);
+		else terminal_write_line("Usage: autorun [show|off|always|once|rearm|stop|run|delay <0..3600>]");
 	}
 	else if (string_starts_with(input_buffer, "hexdump"))
 	{
@@ -9504,6 +10259,7 @@ static void run_command(void)
 	}
 
 	input_length = 0; input_buffer[0] = '\0';
+	task_reap_zombies();
 	if (!editor_active && !script_mode_active)
 	{
 		terminal_prompt();
@@ -9749,7 +10505,7 @@ static void editor_handle_scancode(unsigned char scancode)
 	if (scancode == 0x9D) { ctrl_held = 0; return; }
 	if (scancode == 0x38) { alt_held = 1; return; }
 	if (scancode == 0xB8) { alt_held = 0; return; }
-	if (scancode == 0x3E && alt_held) { editor_close(0, 0); return; } /* Alt+F4 */
+	if (scancode == 0x11 && ctrl_held && shift_held) { editor_close(0, 0); return; } /* Ctrl+Shift+W */
 	if (scancode == 0x01) { panic_esc_held = 1; update_panic_hotkey(); return; }
 	if (scancode == 0x81) { panic_esc_held = 0; update_panic_hotkey(); return; }
 	if (scancode == 0x58) { panic_f12_held = 1; update_panic_hotkey(); return; }
@@ -9941,87 +10697,6 @@ static void editor_handle_scancode(unsigned char scancode)
 	else editor_render();
 }
 
-static void editor_handle_serial_char(char c)
-{
-	unsigned long i;
-
-	if (editor_find_active)
-	{
-		if (c == 0x1B)
-		{
-			editor_find_cancel();
-			return;
-		}
-		if (c == 0x08 || c == 0x7F)
-		{
-			if (editor_find_query_length > 0)
-			{
-				editor_find_query_length--;
-				editor_find_query[editor_find_query_length] = '\0';
-			}
-			editor_render();
-			return;
-		}
-		if (c == '\r' || c == '\n')
-		{
-			editor_find_active = 0;
-			editor_find_next(editor_find_match_valid ? 1 : 0);
-			return;
-		}
-		if (c >= 0x20 && c <= 0x7E && editor_find_query_length + 1 < sizeof(editor_find_query))
-		{
-			editor_find_query[editor_find_query_length++] = c;
-			editor_find_query[editor_find_query_length] = '\0';
-			editor_render();
-		}
-		return;
-	}
-
-	if (editor_hex_mode)
-	{
-		if (c == 0x08 || c == 0x7F)
-		{
-			if (editor_cursor > 0)
-			{
-				editor_cursor--;
-				for (i = editor_cursor; i + 1 < editor_length; i++) editor_buffer[i] = editor_buffer[i + 1];
-				editor_length--;
-				editor_dirty = 1;
-				editor_find_invalidate_match();
-				editor_hex_nibble = 0;
-				editor_render();
-			}
-		}
-		return;
-	}
-
-	if (c == 0x08 || c == 0x7F)
-	{
-		if (editor_has_selection())
-		{
-			editor_delete_selection();
-			editor_render();
-		}
-		else if (editor_cursor > 0)
-		{
-			for (i = editor_cursor - 1; i < editor_length - 1; i++) editor_buffer[i] = editor_buffer[i + 1];
-			editor_cursor--;
-			editor_length--;
-			editor_buffer[editor_length] = '\0';
-			editor_dirty = 1;
-			editor_find_invalidate_match();
-			editor_clear_selection();
-			editor_render();
-		}
-		return;
-	}
-
-	if (c == '\r' || c == '\n') c = '\n';
-	if (!(c == '\n' || c == '\t' || (c >= 0x20 && c <= 0x7E))) return;
-	if (!editor_insert_text(&c, 1)) editor_status_line("[editor] buffer full");
-	else editor_render();
-}
-
 /* ================================================================== */
 /* Scancode dispatcher                                                */
 /* ================================================================== */
@@ -10045,7 +10720,7 @@ static void handle_scancode(unsigned char scancode)
 		if (scancode == 0x9D) { ctrl_held = 0; return; }
 		if (scancode == 0x38) { alt_held = 1; return; }
 		if (scancode == 0xB8) { alt_held = 0; return; }
-		if (scancode == 0x53 && ctrl_held && alt_held) { do_reboot(); return; } /* Ctrl+Alt+Del */
+		if (scancode == 0x13 && ctrl_held && shift_held) { do_reboot(); return; } /* Ctrl+Shift+R */
 		if (scancode == 0x1C) { submit_current_line(); return; } /* Keypad Enter */
 		if (scancode == 0x35) { c = '/'; goto insert_character; } /* Keypad / */
 		if (scancode == 0x48) { handle_arrow_up(); return; }
@@ -10097,7 +10772,7 @@ static void handle_scancode(unsigned char scancode)
 	if (scancode == 0x9D) { ctrl_held = 0; return; }
 	if (scancode == 0x38) { alt_held = 1; return; }
 	if (scancode == 0xB8) { alt_held = 0; return; }
-	if (scancode == 0x3E && alt_held) { terminal_shutdown(); return; } /* Alt+F4 */
+	if (scancode == 0x10 && ctrl_held && shift_held) { terminal_shutdown(); return; } /* Ctrl+Shift+Q */
 	if (scancode == 0x01) { panic_esc_held = 1; update_panic_hotkey(); return; }
 	if (scancode == 0x81) { panic_esc_held = 0; update_panic_hotkey(); return; }
 	if (scancode == 0x58) { panic_f12_held = 1; update_panic_hotkey(); return; }
@@ -10110,7 +10785,19 @@ static void handle_scancode(unsigned char scancode)
 
 	if (ctrl_held)
 	{
-		if (scancode == 0x2E) { terminal_abort_input_line(); return; } /* Ctrl+C */
+		if (scancode == 0x2E)
+		{
+			if (input_length == 0)
+			{
+				terminal_request_cancel();
+				terminal_write_line("^C");
+			}
+			else
+			{
+				terminal_abort_input_line();
+			}
+			return;
+		}
 		if (scancode == 0x1E)
 		{
 			terminal_selection_active = 1;
@@ -10140,118 +10827,6 @@ static void handle_scancode(unsigned char scancode)
 insert_character:
 	if (input_length >= (INPUT_BUFFER_SIZE - 1) && !terminal_has_selection()) return;
 	terminal_insert_text(&c, 1);
-}
-
-static void handle_serial_input_char(char c)
-{
-	static int esc_state = 0; /* 0=normal, 1=ESC, 2=CSI/SS3 */
-
-	/* Redraw current input line on the serial console using ANSI escapes. */
-	/* This keeps serial editing visible without relying on VGA mirror noise. */
-	#define SERIAL_REDRAW() \
-		do { \
-			if (serial_ready) { \
-				char numbuf[16]; \
-				serial_write("\r\x1B[2K> "); \
-				serial_write(input_buffer); \
-				serial_write("\r"); \
-				uint_to_dec((unsigned long)(cursor_pos + 2), numbuf, sizeof(numbuf)); \
-				serial_write("\x1B["); \
-				serial_write(numbuf); \
-				serial_write("C"); \
-			} \
-		} while (0)
-
-	if (editor_active)
-	{
-		editor_handle_serial_char(c);
-		return;
-	}
-	if (script_mode_active) return;
-
-	if (esc_state == 1)
-	{
-		if (c == '[' || c == 'O')
-		{
-			esc_state = 2;
-			return;
-		}
-		esc_state = 0;
-		return;
-	}
-	if (esc_state == 2)
-	{
-		esc_state = 0;
-		if (c == 'A') { handle_arrow_up(); SERIAL_REDRAW(); return; }
-		if (c == 'B') { handle_arrow_down(); SERIAL_REDRAW(); return; }
-		if (c == 'D')
-		{
-			if (cursor_pos > 0)
-			{
-				cursor_pos--;
-				screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-			}
-			SERIAL_REDRAW();
-			return;
-		}
-		if (c == 'C')
-		{
-			if (cursor_pos < input_length)
-			{
-				cursor_pos++;
-				screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-			}
-			SERIAL_REDRAW();
-			return;
-		}
-		if (c == 'H')
-		{
-			cursor_pos = 0;
-			screen_set_hw_cursor(prompt_vga_start);
-			SERIAL_REDRAW();
-			return;
-		}
-		if (c == 'F')
-		{
-			cursor_pos = input_length;
-			screen_set_hw_cursor((unsigned short)(prompt_vga_start + cursor_pos));
-			SERIAL_REDRAW();
-			return;
-		}
-		return;
-	}
-
-	if (c == 0x1B)
-	{
-		esc_state = 1;
-		return;
-	}
-
-	if (c == '\r' || c == '\n')
-	{
-		if (serial_ready) serial_write("\r\n");
-		submit_current_line();
-		return;
-	}
-	if (c == 0x03)
-	{
-		terminal_abort_input_line();
-		if (serial_ready) serial_write("^C\r\n");
-		return;
-	}
-	if (c == 0x08 || c == 0x7F)
-	{
-		handle_backspace(1);
-		SERIAL_REDRAW();
-		return;
-	}
-
-	if (c < 0x20 || c > 0x7E) return;
-	if (input_length >= (INPUT_BUFFER_SIZE - 1) && !terminal_has_selection()) return;
-	if (!terminal_insert_text(&c, 1)) return;
-	SERIAL_REDRAW();
-
-	#undef SERIAL_REDRAW
 }
 
 /* ================================================================== */
@@ -10292,6 +10867,7 @@ void terminal_init(unsigned long mb2_info_addr)
 	screen_set_color(terminal_text_color);
 	serial_ready = serial_init();
 	memmap_init(mb2_info_addr);
+	terminal_auto_fatmount();
 	screen_set_style(SCREEN_STYLE_BOLD);
 	terminal_write_colored("TG11 OS (64-bit)", color_bold_variant(terminal_text_color));
 	screen_set_style(0);
@@ -10336,6 +10912,8 @@ void terminal_init(unsigned long mb2_info_addr)
 		}
 	}
 	else if (boot_fb_fallback) terminal_write_line("display: boot framebuffer unavailable; using VGA text");
+	terminal_print_motd();
+	terminal_run_boot_autorun();
 	terminal_write("Type ");
 	terminal_write_colored("help", 0x06);
 	terminal_write_line(" to view available commands.");
@@ -10344,26 +10922,13 @@ void terminal_init(unsigned long mb2_info_addr)
 
 void terminal_poll(void)
 {
-	static int last_was_cr = 0;
-	char ch;
-
-	while (serial_ready && serial_try_read(&ch))
-	{
-		if (last_was_cr && ch == '\n')
-		{
-			last_was_cr = 0;
-			continue;
-		}
-		last_was_cr = (ch == '\r');
-		handle_serial_input_char(ch);
-	}
-
 	while (scancode_queue_tail != scancode_queue_head)
 	{
 		unsigned char sc = scancode_queue[scancode_queue_tail];
 		scancode_queue_tail = (scancode_queue_tail + 1) % SCANCODE_QUEUE_SIZE;
 		handle_scancode(sc);
 	}
+	terminal_poll_boot_autorun();
 }
 
 int terminal_read_line(char *out, unsigned long out_size)

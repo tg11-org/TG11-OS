@@ -18,6 +18,7 @@
 #define TASK_STATE_READY   0
 #define TASK_STATE_RUNNING 1
 #define TASK_STATE_ZOMBIE  2
+#define TASK_STATE_STOPPED 3
 
 typedef struct task {
     /* CRITICAL: rsp must remain at offset 0 — task_switch.s reads [rdi+0] */
@@ -50,10 +51,22 @@ task_t *task_current(void);
 
 /* Print a summary table of all tasks to the terminal.                       */
 void  task_print_list(void);
+/* Same as task_print_list but sends output to the serial port.               */
+void  task_print_list_serial(void);
 
 /* Kill a task by ID (except the kernel shell task). Returns 0 on success. */
 int   task_kill(unsigned int id);
 int   task_kill_all(void);
+int   task_stop(unsigned int id);
+int   task_continue(unsigned int id);
+int   task_find_id_by_name(const char *name);
+int   task_set_protection_by_id(unsigned int id, int enabled);
+int   task_set_protection_by_name(const char *name, int enabled);
+int   task_is_protected_id(unsigned int id);
+void  task_set_event_log(int enabled);
+int   task_event_log_enabled(void);
+void  task_reap_zombies(void);
+void  task_preempt_tick(void);
 
 /* Run an already-loaded ELF user program in ring 3.  Blocks until the user
  * program exits via SYS_EXIT.  The ELF's pages must already be mapped with

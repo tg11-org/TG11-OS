@@ -1,9 +1,12 @@
 #ifndef TG11_KERNEL_H
 #define TG11_KERNEL_H
 
-#define TG11_OS_VERSION "v0.0.8"
+#define TG11_OS_VERSION "v0.0.9"
 
 void kernel_main(unsigned long mb2_info_addr);
+int  kernel_ensure_shell_task(void);
+void kernel_set_shell_watchdog(int enabled);
+int  kernel_shell_watchdog_enabled(void);
 
 #endif
 // Copyright (C) 2026 TG11

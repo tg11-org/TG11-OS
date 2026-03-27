@@ -24,7 +24,7 @@ BUILD_DIR := build
 ISO_DIR := iso
 ISO_NAME := TG11-OS.iso
 BOOT_DISK_NAME := TG11-DISK.img
-DATA_DISK_NAME := TG11-DATA.img
+DATA_DISK_NAME := TG11-DATA.vhd
 OVMF_CODE := /usr/share/OVMF/OVMF_CODE.fd
 
 CORE_OBJS := \
@@ -41,6 +41,7 @@ CORE_OBJS := \
 	$(BUILD_DIR)/mouse.o \
 	$(BUILD_DIR)/memmap.o \
 	$(BUILD_DIR)/memory.o \
+	$(BUILD_DIR)/timer.o \
 	$(BUILD_DIR)/elf.o \
 	$(BUILD_DIR)/framebuffer.o \
 	$(BUILD_DIR)/fs.o \
@@ -48,6 +49,7 @@ CORE_OBJS := \
 	$(BUILD_DIR)/basic.o \
 	$(BUILD_DIR)/task_switch.o \
 	$(BUILD_DIR)/task.o \
+	$(BUILD_DIR)/serial_console.o \
 	$(BUILD_DIR)/syscall_asm.o \
 	$(BUILD_DIR)/syscall.o
 
@@ -113,6 +115,9 @@ $(BUILD_DIR)/memmap.o: kernel/memmap.c Makefile | $(BUILD_DIR)
 $(BUILD_DIR)/memory.o: kernel/memory.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/timer.o: kernel/timer.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/elf.o: kernel/elf.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -120,6 +125,9 @@ $(BUILD_DIR)/task_switch.o: arch/x86_64/task_switch.s Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/task.o: kernel/task.c Makefile | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/serial_console.o: kernel/serial_console.c Makefile | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/syscall_asm.o: arch/x86_64/syscall.s Makefile | $(BUILD_DIR)
@@ -260,6 +268,17 @@ run-disk-uefi-hires-serial: $(BOOT_DISK_NAME) prepare-data-disk
 	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
 
 clean:
-	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_DIR)/boot/kernel-fb.elf $(ISO_NAME) $(BOOT_DISK_NAME) $(DATA_DISK_NAME) QEMU.log
+	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_DIR)/boot/kernel-fb.elf $(ISO_NAME) $(BOOT_DISK_NAME) QEMU.log
+	@if [ "$(CLEAN_DATA)" = "1" ]; then \
+		rm -f $(DATA_DISK_NAME); \
+		echo "removed $(DATA_DISK_NAME) (CLEAN_DATA=1)"; \
+	else \
+		echo "preserved $(DATA_DISK_NAME) (set CLEAN_DATA=1 to remove)"; \
+	fi
 
-.PHONY: all run run-big run-debug run-disk run-disk-big run-disk-debug run-disk-serial run-safe run-disk-safe run-disk-safe-serial run-hires run-disk-hires run-disk-hires-serial run-uefi-hires run-disk-uefi-hires run-disk-uefi-hires-serial prepare-data-disk format-data-disk clean
+clean-data:
+	rm -f $(DATA_DISK_NAME)
+
+distclean: clean clean-data
+
+.PHONY: all run run-big run-debug run-disk run-disk-big run-disk-debug run-disk-serial run-safe run-disk-safe run-disk-safe-serial run-hires run-disk-hires run-disk-hires-serial run-uefi-hires run-disk-uefi-hires run-disk-uefi-hires-serial prepare-data-disk format-data-disk clean clean-data distclean

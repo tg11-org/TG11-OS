@@ -25,6 +25,8 @@
 #include "elf.h"
 #include "ksym.h"
 #include "memory.h"
+#include "task.h"
+#include "timer.h"
 
 #define IDT_ENTRIES 256
 #define PIC1_COMMAND 0x20
@@ -39,6 +41,7 @@
 #define ICW4_8086 0x01
 #define IRQ_BASE 0x20
 #define IRQ_KEYBOARD_VECTOR (IRQ_BASE + 1)
+#define IRQ_TIMER_VECTOR    (IRQ_BASE + 0)
 #define IRQ_MOUSE_VECTOR    (IRQ_BASE + 12)
 
 #pragma pack(push, 1)
@@ -71,6 +74,7 @@ extern void exception_hang_stub(void);
 extern void isr_ignore_stub(void);
 extern void irq1_stub(void);
 extern void irq12_stub(void);
+extern void irq0_stub(void);
 
 extern void exception_stub_0(void);
 extern void exception_stub_1(void);
@@ -147,10 +151,10 @@ static void pic_remap(void)
 	arch_outb(PIC2_DATA, slave_mask);
 }
 
-static void pic_unmask_keyboard(void)
+static void pic_unmask_irqs(void)
 {
-	/* Master: enable IRQ1 (keyboard) + IRQ2 (cascade to slave) */
-	arch_outb(PIC1_DATA, 0xF9);
+	/* Master: enable IRQ0 (timer), IRQ1 (keyboard), IRQ2 (cascade to slave) */
+	arch_outb(PIC1_DATA, 0xF8);
 	/* Slave: enable IRQ12 (mouse) */
 	arch_outb(PIC2_DATA, 0xEF);
 }
@@ -796,6 +800,13 @@ void keyboard_interrupt_handler(void)
 	pic_send_eoi(1);
 }
 
+void timer_interrupt_handler(void)
+{
+	timer_tick_handle_irq();
+	pic_send_eoi(0);
+	task_preempt_tick();
+}
+
 void mouse_interrupt_handler(void)
 {
 	mouse_handle_byte(arch_inb(0x60));
@@ -846,6 +857,7 @@ void idt_init(void)
 		idt_set_gate(index, isr_ignore_stub);
 	}
 
+	idt_set_gate(IRQ_TIMER_VECTOR, irq0_stub);
 	idt_set_gate(IRQ_KEYBOARD_VECTOR, irq1_stub);
 	idt_set_gate(IRQ_MOUSE_VECTOR, irq12_stub);
 
@@ -855,7 +867,7 @@ void idt_init(void)
 	arch_lidt(&idtr);
 
 	pic_remap();
-	pic_unmask_keyboard();
+	pic_unmask_irqs();
 }
 
 unsigned long idt_get_exception_count(unsigned char vector)
