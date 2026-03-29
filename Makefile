@@ -25,7 +25,25 @@ ISO_DIR := iso
 ISO_NAME := TG11-OS.iso
 BOOT_DISK_NAME := TG11-DISK.img
 DATA_DISK_NAME := TG11-DATA.vhd
+DATA_DISK1_NAME := TG11-DATA-1.vhd
+DATA_DISK2_NAME := TG11-DATA-2.vhd
+DATA_DISK3_NAME := TG11-DATA-3.vhd
 OVMF_CODE := /usr/share/OVMF/OVMF_CODE.fd
+BOOT_DISK_PATH := $(abspath $(BOOT_DISK_NAME))
+DATA_DISK_PATH := $(abspath $(DATA_DISK_NAME))
+DATA_DISK1_PATH := $(abspath $(DATA_DISK1_NAME))
+DATA_DISK2_PATH := $(abspath $(DATA_DISK2_NAME))
+DATA_DISK3_PATH := $(abspath $(DATA_DISK3_NAME))
+QEMU_DRIVE_CACHE := cache=writethrough
+QEMU_DATA_DRIVE_ISO := -drive file=$(DATA_DISK_PATH),format=raw,if=ide,index=0,media=disk,$(QEMU_DRIVE_CACHE)
+QEMU_DATA1_DRIVE_ISO := -drive file=$(DATA_DISK1_PATH),format=raw,if=ide,index=1,media=disk,$(QEMU_DRIVE_CACHE)
+QEMU_DATA2_DRIVE_ISO := -drive file=$(DATA_DISK2_PATH),format=raw,if=ide,index=2,media=disk,$(QEMU_DRIVE_CACHE)
+QEMU_DATA3_DRIVE_ISO := -drive file=$(DATA_DISK3_PATH),format=raw,if=ide,index=3,media=disk,$(QEMU_DRIVE_CACHE)
+QEMU_DATA_DRIVES_ISO_4 := $(QEMU_DATA_DRIVE_ISO) $(QEMU_DATA1_DRIVE_ISO) $(QEMU_DATA2_DRIVE_ISO) $(QEMU_DATA3_DRIVE_ISO)
+QEMU_CDROM_AHCI := -drive file=$(ISO_NAME),format=raw,if=none,id=cdrom4,media=cdrom -device ahci,id=ahci4 -device ide-cd,drive=cdrom4,bus=ahci4.0
+QEMU_BOOT_DISK_AHCI := -drive file=$(BOOT_DISK_PATH),format=raw,if=none,id=bootdisk4,media=disk,$(QEMU_DRIVE_CACHE) -device ahci,id=ahci_boot4 -device ide-hd,drive=bootdisk4,bus=ahci_boot4.0,bootindex=0
+QEMU_BOOT_DRIVE := -drive file=$(BOOT_DISK_PATH),format=raw,if=ide,index=0,media=disk,$(QEMU_DRIVE_CACHE)
+QEMU_DATA_DRIVE_DISK := -drive file=$(DATA_DISK_PATH),format=raw,if=ide,index=1,media=disk,$(QEMU_DRIVE_CACHE)
 
 CORE_OBJS := \
 	$(BUILD_DIR)/longmode64.o \
@@ -199,86 +217,133 @@ prepare-data-disk:
 	@if ! command -v mkfs.fat >/dev/null 2>&1; then echo "mkfs.fat not found (install dosfstools)"; exit 1; fi
 	@if ! file $(DATA_DISK_NAME) | grep -qi "FAT"; then mkfs.fat -F 32 $(DATA_DISK_NAME); fi
 
+prepare-data-disks: prepare-data-disk
+	@if [ ! -f $(DATA_DISK1_NAME) ]; then truncate -s 64M $(DATA_DISK1_NAME); fi
+	@if [ ! -f $(DATA_DISK2_NAME) ]; then truncate -s 64M $(DATA_DISK2_NAME); fi
+	@if [ ! -f $(DATA_DISK3_NAME) ]; then truncate -s 64M $(DATA_DISK3_NAME); fi
+	@if ! command -v mkfs.fat >/dev/null 2>&1; then echo "mkfs.fat not found (install dosfstools)"; exit 1; fi
+	@if ! file $(DATA_DISK1_NAME) | grep -qi "FAT"; then mkfs.fat -F 32 $(DATA_DISK1_NAME); fi
+	@if ! file $(DATA_DISK2_NAME) | grep -qi "FAT"; then mkfs.fat -F 32 $(DATA_DISK2_NAME); fi
+	@if ! file $(DATA_DISK3_NAME) | grep -qi "FAT"; then mkfs.fat -F 32 $(DATA_DISK3_NAME); fi
+
 format-data-disk:
 	@if [ ! -f $(DATA_DISK_NAME) ]; then truncate -s 64M $(DATA_DISK_NAME); fi
 	@if ! command -v mkfs.fat >/dev/null 2>&1; then echo "mkfs.fat not found (install dosfstools)"; exit 1; fi
 	mkfs.fat -F 32 $(DATA_DISK_NAME)
 
+format-data-disks:
+	@if [ ! -f $(DATA_DISK1_NAME) ]; then truncate -s 64M $(DATA_DISK1_NAME); fi
+	@if [ ! -f $(DATA_DISK2_NAME) ]; then truncate -s 64M $(DATA_DISK2_NAME); fi
+	@if [ ! -f $(DATA_DISK3_NAME) ]; then truncate -s 64M $(DATA_DISK3_NAME); fi
+	mkfs.fat -F 32 $(DATA_DISK1_NAME)
+	mkfs.fat -F 32 $(DATA_DISK2_NAME)
+	mkfs.fat -F 32 $(DATA_DISK3_NAME)
+
+fatcheck-data-disk:
+	@if [ ! -f $(DATA_DISK_NAME) ]; then echo "$(DATA_DISK_NAME) not found"; exit 1; fi
+	@if ! command -v fsck.fat >/dev/null 2>&1; then echo "fsck.fat not found (install dosfstools)"; exit 1; fi
+	fsck.fat -vn $(DATA_DISK_NAME)
+
+fatcheck-data-disks:
+	@if [ ! -f $(DATA_DISK1_NAME) ]; then echo "$(DATA_DISK1_NAME) not found"; exit 1; fi
+	@if [ ! -f $(DATA_DISK2_NAME) ]; then echo "$(DATA_DISK2_NAME) not found"; exit 1; fi
+	@if [ ! -f $(DATA_DISK3_NAME) ]; then echo "$(DATA_DISK3_NAME) not found"; exit 1; fi
+	@if ! command -v fsck.fat >/dev/null 2>&1; then echo "fsck.fat not found (install dosfstools)"; exit 1; fi
+	fsck.fat -vn $(DATA_DISK1_NAME)
+	fsck.fat -vn $(DATA_DISK2_NAME)
+	fsck.fat -vn $(DATA_DISK3_NAME)
+
 run: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -boot d -cdrom $(ISO_NAME) $(QEMU_DATA_DRIVE_ISO) -d int,cpu_reset >> QEMU.log 2>&1
 
 run-big: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -boot d -display gtk,zoom-to-fit=on -full-screen -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -boot d -display gtk,zoom-to-fit=on -full-screen -cdrom $(ISO_NAME) $(QEMU_DATA_DRIVE_ISO) -d int,cpu_reset >> QEMU.log 2>&1
 
 run-debug: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -no-reboot -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -no-reboot -boot d -cdrom $(ISO_NAME) $(QEMU_DATA_DRIVE_ISO) -d int,cpu_reset >> QEMU.log 2>&1
+
+run-4drives: $(ISO_NAME) prepare-data-disks
+	rm -f QEMU.log
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -boot d $(QEMU_CDROM_AHCI) $(QEMU_DATA_DRIVES_ISO_4) -d int,cpu_reset >> QEMU.log 2>&1
+
+run-4drives-debug: $(ISO_NAME) prepare-data-disks
+	rm -f QEMU.log
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -no-reboot -boot d $(QEMU_CDROM_AHCI) $(QEMU_DATA_DRIVES_ISO_4) -d int,cpu_reset >> QEMU.log 2>&1
 
 run-disk: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -D QEMU.log -d cpu_reset
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -D QEMU.log -d cpu_reset
 
 run-disk-big: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -display gtk,zoom-to-fit=on -full-screen -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -D QEMU.log -d cpu_reset
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -display gtk,zoom-to-fit=on -full-screen $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -D QEMU.log -d cpu_reset
 
 run-disk-debug: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -no-reboot -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -no-reboot -boot c $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -d int,cpu_reset >> QEMU.log 2>&1
+
+run-disk-4drives: $(BOOT_DISK_NAME) prepare-data-disks
+	rm -f QEMU.log
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1280 -global VGA.yres=800 -global VGA.xmax=1920 -global VGA.ymax=1080 -boot c $(QEMU_BOOT_DISK_AHCI) $(QEMU_DATA_DRIVES_ISO_4) -d int,cpu_reset >> QEMU.log 2>&1
+
+run-disk-4drives-debug: $(BOOT_DISK_NAME) prepare-data-disks
+	rm -f QEMU.log
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -global VGA.xres=1920 -global VGA.yres=1080 -global VGA.xmax=1920 -global VGA.ymax=1080 -no-reboot -boot c $(QEMU_BOOT_DISK_AHCI) $(QEMU_DATA_DRIVES_ISO_4) -d int,cpu_reset >> QEMU.log 2>&1
 
 run-disk-serial: $(BOOT_DISK_NAME) prepare-data-disk
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
 
 run-safe: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -D QEMU.log -d cpu_reset
+	qemu-system-x86_64 -vga std -boot d -cdrom $(ISO_NAME) $(QEMU_DATA_DRIVE_ISO) -D QEMU.log -d cpu_reset
 
 run-disk-safe: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -D QEMU.log -d cpu_reset
+	qemu-system-x86_64 -vga std -boot c $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -D QEMU.log -d cpu_reset
 
 run-disk-safe-serial: $(BOOT_DISK_NAME) prepare-data-disk
-	qemu-system-x86_64 -vga std -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
+	qemu-system-x86_64 -vga std -boot c $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
 
 run-hires: $(ISO_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -D QEMU.log -d cpu_reset
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot d -cdrom $(ISO_NAME) $(QEMU_DATA_DRIVE_ISO) -D QEMU.log -d cpu_reset
 
 run-disk-hires: $(BOOT_DISK_NAME) prepare-data-disk
 	rm -f QEMU.log
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -D QEMU.log -d cpu_reset
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -D QEMU.log -d cpu_reset
 
 run-disk-hires-serial: $(BOOT_DISK_NAME) prepare-data-disk
-	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
+	qemu-system-x86_64 -vga std -global VGA.vgamem_mb=64 -boot c $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
 
 run-uefi-hires: $(ISO_NAME) prepare-data-disk
 	@if [ ! -f $(OVMF_CODE) ]; then echo "error: OVMF firmware not found at $(OVMF_CODE)"; echo "install package: ovmf"; exit 1; fi
 	rm -f QEMU.log
-	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot d -cdrom $(ISO_NAME) -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=0,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot d -cdrom $(ISO_NAME) $(QEMU_DATA_DRIVE_ISO) -d int,cpu_reset >> QEMU.log 2>&1
 
 run-disk-uefi-hires: $(BOOT_DISK_NAME) prepare-data-disk
 	@if [ ! -f $(OVMF_CODE) ]; then echo "error: OVMF firmware not found at $(OVMF_CODE)"; echo "install package: ovmf"; exit 1; fi
 	rm -f QEMU.log
-	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -d int,cpu_reset >> QEMU.log 2>&1
+	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot c $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -d int,cpu_reset >> QEMU.log 2>&1
 
 run-disk-uefi-hires-serial: $(BOOT_DISK_NAME) prepare-data-disk
 	@if [ ! -f $(OVMF_CODE) ]; then echo "error: OVMF firmware not found at $(OVMF_CODE)"; echo "install package: ovmf"; exit 1; fi
-	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot c -drive file=$(BOOT_DISK_NAME),format=raw,if=ide,index=0,media=disk -drive file=$(DATA_DISK_NAME),format=raw,if=ide,index=1,media=disk -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
+	qemu-system-x86_64 -machine q35 -bios $(OVMF_CODE) -vga none -device virtio-vga,xres=1920,yres=1080,max_outputs=1 -boot c $(QEMU_BOOT_DRIVE) $(QEMU_DATA_DRIVE_DISK) -serial stdio || { code=$$?; echo "qemu exited with $$code (interactive run target, ignoring)"; true; }
 
 clean:
 	rm -rf $(BUILD_DIR) $(ISO_DIR)/boot/kernel.elf $(ISO_DIR)/boot/kernel-fb.elf $(ISO_NAME) $(BOOT_DISK_NAME) QEMU.log
 	@if [ "$(CLEAN_DATA)" = "1" ]; then \
-		rm -f $(DATA_DISK_NAME); \
-		echo "removed $(DATA_DISK_NAME) (CLEAN_DATA=1)"; \
+		rm -f $(DATA_DISK_NAME) $(DATA_DISK1_NAME) $(DATA_DISK2_NAME) $(DATA_DISK3_NAME); \
+		echo "removed data disks (CLEAN_DATA=1)"; \
 	else \
-		echo "preserved $(DATA_DISK_NAME) (set CLEAN_DATA=1 to remove)"; \
+		echo "preserved data disks (set CLEAN_DATA=1 to remove)"; \
 	fi
 
 clean-data:
-	rm -f $(DATA_DISK_NAME)
+	rm -f $(DATA_DISK_NAME) $(DATA_DISK1_NAME) $(DATA_DISK2_NAME) $(DATA_DISK3_NAME)
 
 distclean: clean clean-data
 
-.PHONY: all run run-big run-debug run-disk run-disk-big run-disk-debug run-disk-serial run-safe run-disk-safe run-disk-safe-serial run-hires run-disk-hires run-disk-hires-serial run-uefi-hires run-disk-uefi-hires run-disk-uefi-hires-serial prepare-data-disk format-data-disk clean clean-data distclean
+.PHONY: all run run-big run-debug run-4drives run-4drives-debug run-disk run-disk-4drives run-disk-4drives-debug run-disk-big run-disk-debug run-disk-serial run-safe run-disk-safe run-disk-safe-serial run-hires run-disk-hires run-disk-hires-serial run-uefi-hires run-disk-uefi-hires run-disk-uefi-hires-serial prepare-data-disk prepare-data-disks format-data-disk format-data-disks fatcheck-data-disk fatcheck-data-disks clean clean-data distclean

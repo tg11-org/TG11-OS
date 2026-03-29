@@ -93,6 +93,7 @@ make run-disk-serial
 - FAT currently expects 8.3-compatible path components.
 - FAT-mode `cp`/`mv` currently use an internal 4 KiB transfer buffer.
 - Base RAMFS includes example scripts under `/scripts`.
+- Do not mount `TG11-DATA.vhd` in Windows while QEMU is running; attach it only after the guest is shut down to avoid host-side caching/coherency issues.
 
 ## Bundled Demo Scripts
 

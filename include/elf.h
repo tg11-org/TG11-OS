@@ -13,6 +13,8 @@
 #define ELF_ERR_RANGE      -8   /* segment out of supported range */
 #define ELF_ERR_SHDR       -9   /* bad / missing section headers */
 #define ELF_ERR_NOSYM     -10   /* no usable symbol table present */
+#define ELF_ERR_OVERLAP   -11   /* PT_LOAD page windows overlap */
+#define ELF_ERR_ENTRY     -12   /* entry point not inside a loadable segment */
 
 /* elf_exec_t –– describes a loaded image ready to call */
 typedef struct

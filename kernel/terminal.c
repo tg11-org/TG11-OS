@@ -44,11 +44,24 @@
 #define AUTORUN_MODE_PATH "/etc/autorun.mode"
 #define AUTORUN_ONCE_STATE_PATH "/etc/autorun.once_state"
 #define AUTORUN_DELAY_PATH "/etc/autorun.delay"
+#define AUTORUN_SAFE_MODE_PATH "/etc/autorun.safe"
+#define AUTORUN_CLEAN_PATH "/etc/autorun.clean"
+#define AUTORUN_LAST_STATUS_PATH "/etc/autorun.last"
+#define AUTORUN_LAST_SOURCE_PATH "/etc/autorun.src"
 #define FAT_AUTORUN_PATH "/autorun.sh"
 #define FAT_AUTORUN_MODE_PATH "/autorun.mod"
 #define FAT_AUTORUN_ONCE_STATE_PATH "/autorun.onc"
 #define FAT_AUTORUN_DELAY_PATH "/autorun.dly"
+#define FAT_AUTORUN_SAFE_MODE_PATH "/autorun.saf"
+#define FAT_AUTORUN_CLEAN_PATH "/autorun.cln"
+#define FAT_AUTORUN_LAST_STATUS_PATH "/autorun.lst"
+#define FAT_AUTORUN_LAST_SOURCE_PATH "/autorun.src"
 #define AUTORUN_DEFAULT_DELAY_SECONDS 8UL
+#define AUTORUN_SAFE_BOOT_WINDOW_TICKS (15UL * 100UL)
+#define SCRIPT_DEFAULT_TIMEOUT_TICKS (30UL * 100UL)
+#define RAMFS2FAT_BATCH_MAX 64
+#define RAMFS2FAT_USED_MAX 128
+#define FATSTRESS_MAX_PAYLOAD 4096
 #define MB2_TAG_END 0
 #define MB2_TAG_CMDLINE 1
 #define EDITOR_SCREEN_SNAPSHOT_MAX_CELLS (256UL * 144UL)
@@ -110,6 +123,10 @@ static unsigned long terminal_capture_out_size = 0;
 static int display_mode = 0; /* 0=vga25, 1=vga50, 2=framebuffer */
 static int vfs_prefer_fat_root = 0;
 static char fat_cwd[128] = "/";
+static int fat_mounted_drive_index = -1;
+static int fat_active_drive_index = -1;  /* user's context drive; changes only via cd/fatmount */
+static unsigned int fat_registered_drive_mask = 0;
+static char fat_drive_cwd[BLOCKDEV_MAX_DRIVES][128] = {"/", "/", "/", "/"};
 static unsigned char terminal_text_color = 0x0F;
 static unsigned char terminal_prompt_color = 0x0B;
 static unsigned char editor_header_color = 0x0F;
@@ -154,6 +171,8 @@ static unsigned long editor_selection_anchor = 0;
 static char editor_clipboard[EDITOR_BUFFER_SIZE];
 static unsigned long editor_clipboard_length = 0;
 static unsigned long editor_view_top = 0;
+
+static void terminal_write_fat_failure(const char *prefix);
 static unsigned short editor_vga_start = 0;
 static unsigned short editor_prev_end = 0;
 static int editor_dirty = 0;
@@ -186,6 +205,15 @@ static char command_alias_names[COMMAND_ALIAS_MAX][COMMAND_ALIAS_NAME_LEN];
 static char command_alias_expansions[COMMAND_ALIAS_MAX][COMMAND_ALIAS_EXPANSION_LEN];
 static int autorun_boot_pending = 0;
 static unsigned long autorun_boot_deadline = 0;
+static unsigned long autorun_boot_started_at = 0;
+static int autorun_boot_clean_marked = 0;
+static int autorun_safe_latched = 0;
+static int script_last_error = 0;
+static unsigned long script_last_error_line = 0;
+static char script_last_error_text[96];
+static unsigned char ramfs2fat_copy_buf[FS_MAX_FILE_SIZE];
+static unsigned char fatstress_payload_buf[FATSTRESS_MAX_PAYLOAD];
+static unsigned char fatstress_verify_buf[FATSTRESS_MAX_PAYLOAD];
 
 static int string_equals(const char *a, const char *b);
 static int string_equals_ci(const char *a, const char *b);
@@ -198,6 +226,10 @@ static void terminal_clear_selection(void);
 static void terminal_redraw_input_line(void);
 static int fat_mode_active(void);
 static int fat_resolve_path(const char *input, char *out, unsigned long out_size);
+static int fat_mount_drive_now(int drive_index, int enable_generic_mode);
+static int parse_mount_target_drive(const char *token, int *out_drive_index);
+static int parse_drive_prefixed_path(const char *input, int *out_drive_index, const char **out_rest, int *out_explicit);
+static int parse_mountpoint_token(const char *token, int drive_index);
 static void editor_handle_scancode(unsigned char scancode);
 static void run_command(void);
 static int eval_script_condition(const char *expr);
@@ -269,6 +301,12 @@ static void cmd_ramfs2fat(const char *args);
 static void uint_to_dec(unsigned long v, char *buf, unsigned long buf_sz);
 static void cmd_drives(void);
 static void cmd_fatmount(const char *args);
+static int parse_fat_drive_index_arg(const char *args, int *out_drive_index, int *out_used_default);
+static void cmd_fatwhere(void);
+static void cmd_fatunmount(const char *args);
+static void cmd_fatstress(const char *args);
+static void cmd_fatperf(const char *args);
+static const char *ata_drive_label(int drive_index);
 static void cmd_fatattr(const char *args);
 static void cmd_serial(const char *args);
 static void cmd_display(const char *args);
@@ -279,6 +317,7 @@ static void cmd_pagefault(const char *args);
 static void cmd_gpfault(const char *args);
 static void cmd_udfault(const char *args);
 static void cmd_doublefault(const char *args);
+static int confirm_dangerous_action(const char *args, const char *rerun_hint);
 static void cmd_exceptstat(const char *args);
 static void cmd_dumpstack(const char *args);
 static void cmd_selftest(const char *args);
@@ -299,6 +338,7 @@ static void cmd_ticks(void);
 static void cmd_elfinfo(const char *args);
 static void cmd_elfsym(const char *args);
 static void cmd_elfaddr(const char *args);
+static void cmd_elfcheck(const char *args);
 static void cmd_execstress(const char *args);
 static void cmd_elfselftest(const char *args);
 static void trigger_forced_panic(void);
@@ -315,12 +355,26 @@ static int resolve_command_aliases(const char *in, char *out, unsigned long out_
 static void terminal_auto_fatmount(void);
 static int terminal_try_mount_boot_fat(void);
 static int terminal_write_fat_text(const char *path, const char *text);
+static int terminal_read_config_text(const char *fat_path, const char *ram_path, const char **ram_text, unsigned char *fat_buf, unsigned long fat_buf_size, const char **out_text);
+static void terminal_write_config_text(const char *fat_path, const char *ram_path, const char *text);
 static int terminal_get_autorun_mode(void);
 static void terminal_set_autorun_mode(int mode);
 static int terminal_autorun_once_done(void);
 static void terminal_set_autorun_once_done(int done);
 static unsigned long terminal_get_autorun_delay_seconds(void);
 static void terminal_set_autorun_delay_seconds(unsigned long seconds);
+static int terminal_get_autorun_safe_mode(void);
+static void terminal_set_autorun_safe_mode(int enabled);
+static int terminal_get_autorun_clean_flag(void);
+static void terminal_set_autorun_clean_flag(int clean);
+static void terminal_get_autorun_last_status(char *out, unsigned long out_size);
+static void terminal_set_autorun_last_status(const char *status);
+static void terminal_get_autorun_last_source(char *out, unsigned long out_size);
+static void terminal_set_autorun_last_source(const char *source);
+static void terminal_autorun_boot_begin(void);
+static void terminal_autorun_boot_heartbeat(void);
+static void terminal_set_script_error(unsigned long line_no, const char *msg);
+static int terminal_script_command_known(const char *line);
 static int terminal_run_autorun_script_now(void);
 static int terminal_autorun_should_run_on_boot(void);
 static void terminal_schedule_boot_autorun(void);
@@ -425,15 +479,15 @@ static void print_help_basic(void)
 	terminal_write_line("  ethemes [list]       - List editor themes");
 	terminal_write_line("  clear                - Clear screen");
 	terminal_write_line("  reboot               - Reboot the system");
-	terminal_write_line("  panic                - Deliberately trigger kernel panic");
+	terminal_write_line("  panic [yes]          - Deliberately trigger kernel panic");
 	terminal_write_line("  shutdown/exit/quit   - Shut down");
 	terminal_write_line("  memmap               - Physical memory map");
 	terminal_write_line("  memstat              - Allocator and paging summary");
 	terminal_write_line("  pagetest             - Paging allocator self-test");
-	terminal_write_line("  pagefault <mode>     - Trigger PF: read|write|exec");
-	terminal_write_line("  gpfault              - Trigger #GP using non-canonical address");
-	terminal_write_line("  udfault              - Trigger #UD via UD2 instruction");
-	terminal_write_line("  doublefault          - Simulate double-fault recovery");
+	terminal_write_line("  pagefault <mode> [yes] - Trigger PF: read|write|exec");
+	terminal_write_line("  gpfault [yes]        - Trigger #GP using non-canonical address");
+	terminal_write_line("  udfault [yes]        - Trigger #UD via UD2 instruction");
+	terminal_write_line("  doublefault [yes]    - Simulate double-fault recovery");
 	terminal_write_line("  exceptstat           - Show exception statistics");
 	terminal_write_line("  dumpstack            - Dump current kernel call stack");
 	terminal_write_line("  selftest exceptions [step] - Guided exception test harness");
@@ -451,7 +505,7 @@ static void print_help_fs(void)
 	terminal_write_line("Filesystem commands:");
 	terminal_write_line("  pwd                  - Print current directory");
 	terminal_write_line("  ls [path]            - List entries");
-	terminal_write_line("  dir [path]           - Windows-style directory listing with sizes");
+	terminal_write_line("  dir [/b] [/w] [/s] [/rN] [path] - Directory listing (/rN sets FAT read batch)");
 	terminal_write_line("  tree [/f] [path]     - DOS-style directory tree (/f includes files)");
 	terminal_write_line("  cls/type/copy/move/del/ren - DOS aliases for clear/cat/cp/mv/rm/mv");
 	terminal_write_line("  cd <path>            - Change directory");
@@ -464,23 +518,31 @@ static void print_help_fs(void)
 	terminal_write_line("  mv [-n] [-i] <src> <dst>      - Move/rename file or directory");
 	terminal_write_line("  edit <path>          - Edit text file");
 	terminal_write_line("  hexedit <path>       - Edit raw bytes in hex");
-	terminal_write_line("  run [-x] <path>      - Run script (-x echoes lines)");
+	terminal_write_line("  run [-x] [-t <sec>] <path> - Run script with optional timeout");
 	terminal_write_line("  basic <path>         - Run Tiny BASIC program");
+	terminal_write_line("  motd                 - Print MOTD with inline color/style tokens");
+	terminal_write_line("  autorun [show|log|off|always|once|rearm|stop|run|safe <on|off>|delay <sec>] - Boot script control");
 	terminal_write_line("  elfinfo <path>       - Inspect ELF headers and symbol tables");
 	terminal_write_line("  elfsym <path> [f]    - List symbols from an ELF image");
 	terminal_write_line("  elfaddr <p> <addr>   - Resolve an address inside an ELF image");
+	terminal_write_line("  elfcheck <path>      - Validate ELF loadability without executing");
 	terminal_write_line("  exec <path>          - Load and run ELF64 kernel binary");
 	terminal_write_line("  elfselftest          - Validate built-in ELF fixtures");
 	terminal_write_line("  script: foreach i in a,b do echo $(i)");
-	terminal_write_line("  fatmount [0|1]       - Mount FAT32 drive (0=master, 1=slave)");
+	terminal_write_line("  fatmount <hd#> [/hd#|A:] - Register/mount FAT drive with root alias");
+	terminal_write_line("  mtn|mnt|mount <hd#> [/hd#|A:] - Linux-style mount aliases");
+	terminal_write_line("  fatwhere             - Show active + registered FAT mount roots");
 	terminal_write_line("  drives               - List detected ATA drives");
 	terminal_write_line("  ramfs                - Switch generic fs commands to RAM FS");
 	terminal_write_line("  ramfs2fat [map]      - Copy RAM FS tree to FAT (or show name map)");
-	terminal_write_line("  fatunmount           - Unmount FAT32 data disk");
+	terminal_write_line("  fatunmount [hd#|A:]  - Remove one mount root or unmount all");
+	terminal_write_line("  umtn|umnt|umount [hd#|A:] - Linux-style unmount aliases");
 	terminal_write_line("  fatls                - List FAT32 cwd");
 	terminal_write_line("  fatcat <path>        - Read FAT32 file");
 	terminal_write_line("  fattouch <path>      - Create FAT32 file");
 	terminal_write_line("  fatwrite <p> <txt>   - Write FAT32 file");
+	terminal_write_line("  fatstress [n] [-v] [-p <n>] [-s <bytes>] [-k <slots>] [-d <n>]");
+	terminal_write_line("  fatperf [show|batch <1..16>|cache <on|off>|cache data|fat <on|off>|flush|dirbench [path] [list]]");
 	terminal_write_line("  fatattr <p> [mods]   - Show/set FAT attrs (+r -h +s +a)");
 	terminal_write_line("  fatrm <path>         - Remove FAT32 path");
 }
@@ -523,11 +585,11 @@ static const struct manual_entry manual_entries[] = {
 	{"ethemes", "list available editor themes", "ethemes [list]", "Enumerates editor theme files from /edit/themes.", "ethemes", "etheme theme", "editor theme list"},
 	{"clear", "clear the screen", "clear", "Clears the terminal contents and redraws the prompt.", "clear", "help", "cls clear screen"},
 	{"reboot", "restart the machine", "reboot", "Requests an immediate reboot.", "reboot", "shutdown", "restart reset power"},
-	{"panic", "deliberately trigger a kernel panic", "panic", "Triggers an invalid opcode exception on purpose. Useful for testing panic screen handling and reboot hotkeys like Esc+F12.", "panic", "reboot memstat", "crash panic test debug"},
+	{"panic", "deliberately trigger a kernel panic", "panic [yes]", "Triggers an invalid opcode exception on purpose. Requires confirmation using the yes argument.", "panic yes", "reboot memstat", "crash panic test debug"},
 	{"shutdown", "shut down the machine", "shutdown\nexit\nquit", "Stops the VM or machine using the supported power-off path.", "shutdown", "reboot", "power off quit exit"},
 	{"pwd", "print the current working directory", "pwd", "Shows the shell's current working directory.", "pwd", "cd ls", "filesystem cwd path"},
 	{"ls", "list directory entries", "ls [path]", "Lists files and directories from the current working directory or the given path.", "ls\nls /scripts", "cd pwd dir", "filesystem list directory"},
-	{"dir", "show a Windows-style directory listing", "dir [/b] [/w] [/s] [path]", "Prints one entry per line with a type column and file sizes, followed by summary totals. /b is bare names, /w is wide names, and /s recursively lists each directory with its own totals plus a grand total.", "dir\ndir /w\ndir /s scripts", "ls tree cd pwd", "filesystem directory size windows dos"},
+	{"dir", "show a Windows-style directory listing", "dir [/b] [/w] [/s] [/rN] [path]", "Prints one entry per line with a type column and file sizes, followed by summary totals. /b is bare names, /w is wide names, /s recursively lists each directory with its own totals plus a grand total, and /rN sets FAT multi-sector read batch size (for example /r8).", "dir\ndir /w\ndir /r8\ndir /s scripts", "ls tree cd pwd fatperf", "filesystem directory size windows dos perf"},
 	{"tree", "show a DOS-style directory tree", "tree [/f] [path]", "Displays a recursive tree. Add /f to include files in addition to directories.", "tree\ntree /f scripts", "dir ls cd", "filesystem recursive tree dos"},
 	{"cls", "DOS alias for clear", "cls", "Runs clear.", "cls", "clear", "dos compatibility alias"},
 	{"type", "DOS alias for cat", "type <path>", "Runs cat on a file path.", "type readme.txt", "cat", "dos compatibility alias"},
@@ -545,11 +607,14 @@ static const struct manual_entry manual_entries[] = {
 	{"mv", "move or rename a file or directory", "mv [-n] [-i] <src> <dst>", "Renames or moves files and directories. -n avoids overwrite, -i asks before overwrite when supported.", "mv old.txt new.txt", "cp rm", "filesystem move rename"},
 	{"edit", "open the built-in text editor", "edit <path>", "Starts the text editor on the chosen file.", "edit readme.txt", "hexedit write cat", "editor text file"},
 	{"hexedit", "open the built-in hex editor", "hexedit <path>", "Starts the hex editor for raw byte editing.", "hexedit kernel.bin", "edit hexdump", "editor hex bytes file"},
-	{"run", "execute a shell script file", "run [-x] <path>", "Runs one script file through the shell. -x echoes each line before executing it.", "run boot.scr\nrun -x test.scr", "basic edit", "script shell batch"},
+	{"run", "execute a shell script file", "run [-x] [-t <1..3600>] <path>", "Runs one script file through the shell. -x echoes each line before executing it, and -t sets a per-script timeout in seconds. Script errors now report line numbers for control-flow mistakes, cancel, timeout, and unknown commands.", "run boot.scr\nrun -x test.scr\nrun -t 20 boot.scr", "basic edit autorun", "script shell batch timeout diagnostics"},
+	{"motd", "print the message of the day", "motd", "Prints the boot message text from /motd.txt on FAT when present, otherwise from /etc/motd.txt in RAM FS. MOTD rendering supports the same inline color and style tokens as echo, including &NN and &r.", "motd", "echo autorun", "motd boot banner colors"},
+	{"autorun", "configure the delayed boot script runner", "autorun [show|log|off|always|once|rearm|stop|run|safe <on|off|show>|delay <0..3600>]", "Controls whether /autorun.sh on FAT, or /etc/autorun.sh in RAM FS, executes after boot. show reports current mode, safe mode, delay, pending state, last status, and source. log shows the last execution status/source. safe enables the crash guard that skips autorun after an unclean reboot until the system survives the clean-boot window.", "autorun show\nautorun always\nautorun delay 10\nautorun safe on\nautorun log", "run motd fatmount", "autorun boot script startup safe mode delay"},
 	{"basic", "run a Tiny BASIC program", "basic <path>", "Loads and runs a Tiny BASIC program from the filesystem.", "basic scripts/tic-tac-toe.bas", "run edit", "basic interpreter program"},
 	{"elfinfo", "inspect ELF64 headers and symbol metadata", "elfinfo <path>", "Parses an ELF64 file without executing it and prints header fields, PT_LOAD range, and how many named defined symbols were found.", "elfinfo /app.elf", "elfsym elfaddr exec", "elf symbols debug headers metadata"},
 	{"elfsym", "list named ELF64 symbols", "elfsym <path> [filter]", "Lists named defined symbols from SHT_SYMTAB or SHT_DYNSYM. Supply an optional filter substring to narrow the output.", "elfsym /app.elf\nelfsym /kernel/app.elf start", "elfinfo elfaddr exec", "elf symbols symtab debug lookup"},
 	{"elfaddr", "resolve an address to the nearest ELF64 symbol", "elfaddr <path> <hex-address>", "Looks up the nearest named symbol at or before the given virtual address and reports the offset into that symbol.", "elfaddr /app.elf 0xFFFF900003000000", "elfinfo elfsym exec", "elf address symbol resolve debug"},
+	{"elfcheck", "validate ELF64 loadability", "elfcheck <path>", "Loads and immediately unloads an ELF image to verify loader compatibility and report detailed load error names without executing entry code.", "elfcheck /app.elf", "elfinfo exec execstress", "elf validation loader sanity check"},
 	{"exec", "load and call an ELF64 kernel binary", "exec <path>", "Loads a small ELF64 image into kernel memory, maps its PT_LOAD segments, and calls its entry point directly.", "exec app.elf", "memstat pagetest", "elf executable loader"},
 	{"execstress", "run one ELF repeatedly and check memory delta", "execstress <count> <path>", "Loads, executes, and unloads the same ELF image count times, then reports free-page delta to help detect leaks while iterating on ELF/memory changes.", "execstress 100 app.elf", "exec memstat pagetest", "elf stress test memory leak"},
 	{"elfselftest", "run built-in ELF functional and leak tests", "elfselftest", "Runs /app.elf, /appw.elf, and /app2p.elf checks (return values + load/unload stability) and performs a short stress loop with free-page delta reporting.", "elfselftest", "exec execstress memstat", "elf selftest memory loader"},
@@ -557,10 +622,10 @@ static const struct manual_entry manual_entries[] = {
 	{"memmap", "show the physical memory map", "memmap", "Displays the multiboot-provided physical memory map.", "memmap", "memstat pagetest", "memory multiboot map"},
 	{"memstat", "show allocator and paging state", "memstat", "Displays total and free pages, the virtual allocation window, and the active CR3 value.", "memstat", "memmap pagetest exec", "memory paging allocator cr3"},
 	{"pagetest", "exercise the paging allocator", "pagetest", "Allocates pages, writes a pattern, verifies it, unmaps it, and confirms the mapping is gone.", "pagetest", "memstat exec", "paging allocator self test"},
-	{"pagefault", "trigger a controlled page fault", "pagefault <read|write|exec>", "Intentionally faults using an unmapped address. read dereferences it, write stores through it, and exec calls it as code so you can verify decoded #PF bits on the panic screen.", "pagefault read\npagefault write\npagefault exec", "panic pagetest memstat", "page fault pf cr2 panic test"},
-	{"gpfault", "trigger a controlled general-protection fault", "gpfault", "Triggers #GP by dereferencing a non-canonical address in long mode.", "gpfault", "udfault pagefault panic", "general protection fault gp exception test"},
-	{"udfault", "trigger a controlled invalid-opcode fault", "udfault", "Executes UD2 to intentionally trigger #UD.", "udfault", "gpfault pagefault panic", "invalid opcode ud exception test"},
-	{"doublefault", "simulate double-fault recovery", "doublefault", "Simulates a double fault by directly invoking the recovery handler. A double fault occurs when an exception happens while handling another exception.", "doublefault", "udfault gpfault panic", "double fault df exception recovery test"},
+	{"pagefault", "trigger a controlled page fault", "pagefault <read|write|exec> [yes]", "Intentionally faults using an unmapped address. read dereferences it, write stores through it, and exec calls it as code so you can verify decoded #PF bits on the panic screen. Requires confirmation using yes.", "pagefault read yes\npagefault write yes\npagefault exec yes", "panic pagetest memstat", "page fault pf cr2 panic test"},
+	{"gpfault", "trigger a controlled general-protection fault", "gpfault [yes]", "Triggers #GP by dereferencing a non-canonical address in long mode. Requires confirmation using yes.", "gpfault yes", "udfault pagefault panic", "general protection fault gp exception test"},
+	{"udfault", "trigger a controlled invalid-opcode fault", "udfault [yes]", "Executes UD2 to intentionally trigger #UD. Requires confirmation using yes.", "udfault yes", "gpfault pagefault panic", "invalid opcode ud exception test"},
+	{"doublefault", "simulate double-fault recovery", "doublefault [yes]", "Simulates a double fault by directly invoking the recovery handler. A double fault occurs when an exception happens while handling another exception. Requires confirmation using yes.", "doublefault yes", "udfault gpfault panic", "double fault df exception recovery test"},
 	{"exceptstat", "display exception statistics", "exceptstat", "Shows the count of each exception type that has occurred since system boot. Useful for detecting repeated faults under load.", "exceptstat", "panic udfault gpfault", "exception statistics counter tracking diagnostics"},
 	{"dumpstack", "dump current kernel call stack", "dumpstack", "Walks the RBP chain to display the current function call stack. Useful for runtime diagnostics before intentional faults.", "dumpstack", "exceptstat panic", "stack dump backtrace call chain"},
 	{"selftest", "run guided built-in test suites", "selftest exceptions [pf-read|pf-write|pf-exec|ud|gp|1|2|3|4|5]", "Prints a reboot-friendly exception test plan, or runs one selected step and triggers the expected fault immediately.", "selftest exceptions\nselftest exceptions pf-exec\nselftest exceptions 4", "pagefault gpfault udfault panic", "selftest test harness exceptions diagnostics"},
@@ -568,14 +633,23 @@ static const struct manual_entry manual_entries[] = {
 	{"readsec", "dump one 512-byte sector", "readsec <lba-hex>", "Reads and dumps one sector from the selected ATA device.", "readsec 0x20", "writesec ataid", "ata sector read"},
 	{"writesec", "write text into one sector", "writesec <lba> <text>", "Writes marker text into a single sector for low-level disk testing.", "writesec 32 hello", "readsec ataid", "ata sector write"},
 	{"drives", "list detected ATA drives", "drives", "Enumerates the ATA drives seen by the kernel.", "drives", "ataid fatmount", "ata disk list"},
-	{"fatmount", "mount a FAT32 drive", "fatmount [0|1]", "Mounts the selected ATA disk as the active FAT32 data drive.", "fatmount 0", "fatunmount drives ramfs", "fat32 mount disk"},
-	{"fatunmount", "unmount the FAT32 drive", "fatunmount", "Detaches the active FAT32 data drive.", "fatunmount", "fatmount ramfs", "fat32 unmount disk"},
+	{"fatmount", "register/mount a FAT32 drive with aliases", "fatmount <0..3|hd0..hd3> [/hd#|A:]", "Registers a FAT drive so it can be addressed by /hdN/... or A:/... style prefixes. The command mounts the selected drive immediately, but previously registered drives remain available by prefix.", "fatmount hd1\nfatmount hd2 /hd2\nfatmount hd0 A:", "fatunmount fatwhere drives ramfs", "fat32 mount roots hd0 hd1 hd2 hd3 A:"},
+	{"mtn", "Linux-style FAT mount alias", "mtn <hd0|hd1|hd2|hd3> [/hd#|A:]", "Alias for fatmount using Linux-like drive names.", "mtn hd1\nmtn hd3 /hd3", "fatmount mnt mount fatwhere drives", "mount mtn fat32 hd0 hd1 hd2 hd3"},
+	{"mnt", "short Linux-style FAT mount alias", "mnt <hd0|hd1|hd2|hd3> [/hd#|A:]", "Short alias for fatmount. Equivalent to mtn.", "mnt hd1", "mtn mount fatmount fatwhere", "mount mnt fat32 hd0 hd1 hd2 hd3"},
+	{"mount", "long Linux-style FAT mount alias", "mount <hd0|hd1|hd2|hd3> [/hd#|A:]", "Long alias for fatmount. Equivalent to mtn/mnt.", "mount hd2 /hd2", "mtn mnt fatmount fatwhere", "mount fat32 hd0 hd1 hd2 hd3"},
+	{"fatwhere", "show active and registered FAT mount roots", "fatwhere", "Reports the currently active FAT drive and all registered drive prefixes (/hdN and A: style roots).", "fatwhere", "fatmount fatunmount drives", "fat32 mount target diagnostics roots"},
+	{"fatunmount", "remove FAT mount roots", "fatunmount [hd#|A:]", "Without an argument, unmounts FAT and clears all registered roots. With hd#/A:, removes only that drive root and keeps others registered.", "fatunmount\nfatunmount hd2\nfatunmount A:", "fatmount ramfs", "fat32 unmount disk roots"},
+	{"umtn", "Linux-style FAT unmount alias", "umtn [hd#|A:]", "Alias for fatunmount.", "umtn\numtn hd2", "umnt umount fatunmount mtn fatmount", "unmount umount fat32"},
+	{"umnt", "short Linux-style FAT unmount alias", "umnt [hd#|A:]", "Short alias for fatunmount. Equivalent to umtn.", "umnt A:", "umtn umount fatunmount", "unmount umnt fat32"},
+	{"umount", "long Linux-style FAT unmount alias", "umount [hd#|A:]", "Long alias for fatunmount. Equivalent to umtn/umnt.", "umount hd1", "umtn umnt fatunmount", "unmount umount fat32"},
 	{"ramfs", "switch generic file commands back to RAM FS", "ramfs", "Makes generic file commands operate on the RAM filesystem again instead of the FAT volume.", "ramfs", "fatmount ramfs2fat", "ramfs filesystem switch"},
 	{"ramfs2fat", "copy the RAM FS tree to FAT32", "ramfs2fat [map]", "Copies the RAM filesystem tree onto the mounted FAT32 volume or prints the filename mapping when map is supplied.", "ramfs2fat\nramfs2fat map", "ramfs fatmount", "ramfs fat32 copy sync"},
 	{"fatls", "list FAT32 directory entries", "fatls", "Lists the contents of the current FAT32 working directory.", "fatls", "fatcat fattouch fatwrite", "fat32 list directory"},
 	{"fatcat", "print one FAT32 file", "fatcat <path>", "Reads and prints a file from the mounted FAT32 volume.", "fatcat /notes.txt", "fatwrite fattouch", "fat32 file read"},
 	{"fattouch", "create an empty FAT32 file", "fattouch <path>", "Creates a zero-length file on the mounted FAT32 volume.", "fattouch /new.txt", "fatwrite fatcat", "fat32 file create"},
 	{"fatwrite", "replace a FAT32 file with text", "fatwrite <path> <text>", "Writes text into a FAT32 file, replacing the previous contents.", "fatwrite /note.txt hello", "fattouch fatcat", "fat32 file write"},
+	{"fatstress", "stress-test FAT read/write integrity", "fatstress [rounds] [-v] [-p <n>] [-s <bytes>] [-k <slots>] [-d <n>]", "Runs repeated write-read-verify cycles on rotating FAT files and periodic deletes to exercise allocation/reuse paths. Optional rounds range: 1..100000. -v enables trace logs; -p sets progress interval; -s sets payload bytes (1..4096); -k sets rotating slot count (1..9999); -d sets delete interval in rounds (1..100000).", "fatstress\nfatstress 2000 -v\nfatstress 5000 -v -p 250 -s 512 -k 256 -d 16", "fatwrite fatcat fatrm", "fat32 stress test integrity fsck debug trace payload"},
+	{"fatperf", "tune FAT32 read batching and caches", "fatperf [show|batch <1..16>|cache <on|off>|cache data|fat <on|off>|flush|dirbench [path] [list]]", "Shows or changes FAT32 read-performance settings. batch sets ATA multi-sector read size used by directory and file reads. cache toggles both caches together, or data/fat cache separately. flush clears caches, and dirbench runs dir /b repeatedly with multiple batch sizes and prints tick deltas.", "fatperf show\nfatperf batch 8\nfatperf cache fat off\nfatperf flush\nfatperf dirbench / 1,2,4,8,16", "dir fatls fatmount", "fat32 performance benchmark cache batch tuning"},
 	{"fatattr", "inspect or modify FAT32 attributes", "fatattr <path> [mods]", "Shows or changes FAT attribute bits like read-only, hidden, system, and archive.", "fatattr /note.txt\nfatattr /note.txt +r", "fatls fatrm", "fat32 attributes readonly hidden"},
 	{"fatrm", "remove a FAT32 file or directory", "fatrm <path>", "Deletes a file or directory from the mounted FAT32 volume.", "fatrm /note.txt", "fatls fatattr", "fat32 remove delete"}
 };
@@ -1072,6 +1146,141 @@ static int fat_mode_active(void)
 	return vfs_prefer_fat_root && fat32_is_mounted();
 }
 
+static int fat_mount_drive_now(int drive_index, int enable_generic_mode)
+{
+	struct block_device *dev;
+	int old_drive;
+
+	if (drive_index < 0 || drive_index >= BLOCKDEV_MAX_DRIVES) return -1;
+	dev = blockdev_get(drive_index);
+	if (dev == (void *)0 || !dev->present) return -1;
+
+	old_drive = fat_mounted_drive_index;
+	if (old_drive == drive_index && fat32_is_mounted())
+	{
+		if (enable_generic_mode) vfs_prefer_fat_root = 1;
+		return 0;
+	}
+
+	if (old_drive >= 0 && old_drive < BLOCKDEV_MAX_DRIVES && fat32_is_mounted())
+	{
+		unsigned long i = 0;
+		while (fat_cwd[i] != '\0' && i + 1 < sizeof(fat_drive_cwd[0])) { fat_drive_cwd[old_drive][i] = fat_cwd[i]; i++; }
+		fat_drive_cwd[old_drive][i] = '\0';
+	}
+
+	if (fat32_mount(dev) != 0) return -1;
+	fat_mounted_drive_index = drive_index;
+	if (enable_generic_mode) vfs_prefer_fat_root = 1;
+
+	if (fat_drive_cwd[drive_index][0] == '\0')
+	{
+		fat_drive_cwd[drive_index][0] = '/';
+		fat_drive_cwd[drive_index][1] = '\0';
+	}
+	{
+		unsigned long i = 0;
+		while (fat_drive_cwd[drive_index][i] != '\0' && i + 1 < sizeof(fat_cwd)) { fat_cwd[i] = fat_drive_cwd[drive_index][i]; i++; }
+		fat_cwd[i] = '\0';
+	}
+	return 0;
+}
+
+static int parse_mount_target_drive(const char *token, int *out_drive_index)
+{
+	char tok[16];
+	unsigned long i = 0;
+
+	if (token == (void *)0 || out_drive_index == (void *)0) return -1;
+	while (token[i] != '\0' && i + 1 < sizeof(tok))
+	{
+		tok[i] = ascii_lower(token[i]);
+		i++;
+	}
+	if (token[i] != '\0') return -1;
+	tok[i] = '\0';
+
+	if ((tok[0] == '/' && tok[1] == 'h' && tok[2] == 'd' && tok[3] >= '0' && tok[3] <= '3' && tok[4] == '\0') ||
+		(tok[0] == 'h' && tok[1] == 'd' && tok[2] >= '0' && tok[2] <= '3' && tok[3] == '\0'))
+	{
+		*out_drive_index = (tok[0] == '/') ? (tok[3] - '0') : (tok[2] - '0');
+		return 0;
+	}
+	if (tok[0] >= '0' && tok[0] <= '3' && tok[1] == '\0')
+	{
+		*out_drive_index = tok[0] - '0';
+		return 0;
+	}
+	if (tok[1] == ':' && tok[2] == '\0')
+	{
+		char c = tok[0];
+		if (c >= 'a' && c <= 'd')
+		{
+			*out_drive_index = c - 'a';
+			return 0;
+		}
+	}
+
+	return -1;
+}
+
+static int parse_mountpoint_token(const char *token, int drive_index)
+{
+	int mapped_drive = -1;
+	if (parse_mount_target_drive(token, &mapped_drive) != 0) return -1;
+	if (drive_index >= 0 && mapped_drive != drive_index) return -1;
+	return 0;
+}
+
+static int parse_drive_prefixed_path(const char *input, int *out_drive_index, const char **out_rest, int *out_explicit)
+{
+	const char *p;
+	char token[16];
+	unsigned long n = 0;
+	int drive_index;
+
+	if (out_drive_index == (void *)0 || out_rest == (void *)0 || out_explicit == (void *)0) return -1;
+	*out_drive_index = -1;
+	*out_rest = input;
+	*out_explicit = 0;
+
+	if (input == (void *)0 || input[0] == '\0') return 0;
+
+	if (input[1] == ':' && input[0] != '\0')
+	{
+		token[0] = input[0];
+		token[1] = ':';
+		token[2] = '\0';
+		if (parse_mount_target_drive(token, &drive_index) != 0) return -1;
+		p = input + 2;
+		if (*p == '/' || *p == '\\') p++;
+		*out_drive_index = drive_index;
+		*out_rest = p;
+		*out_explicit = 1;
+		return 0;
+	}
+
+	if (input[0] == '/' || input[0] == '\\')
+	{
+		p = input + 1;
+		while (*p != '\0' && *p != '/' && *p != '\\')
+		{
+			if (n + 1 >= sizeof(token)) return -1;
+			token[n++] = *p++;
+		}
+		token[n] = '\0';
+		if (token[0] == '\0') return 0;
+		if (parse_mount_target_drive(token, &drive_index) != 0) return 0;
+		if (*p == '/' || *p == '\\') p++;
+		*out_drive_index = drive_index;
+		*out_rest = p;
+		*out_explicit = 1;
+		return 0;
+	}
+
+	return 0;
+}
+
 static int fat_append_component(char parts[][16], int *depth, const char *component)
 {
 	unsigned long i = 0;
@@ -1157,8 +1366,42 @@ static int fat_resolve_path(const char *input, char *out, unsigned long out_size
 	char parts[24][16];
 	int depth = 0;
 	const char *p;
+	int explicit_drive = -1;
+	int explicit_prefix = 0;
 
 	if (input == (void *)0 || out == (void *)0) return -1;
+
+	if (parse_drive_prefixed_path(input, &explicit_drive, &p, &explicit_prefix) != 0) return -1;
+	if (explicit_prefix)
+	{
+		if ((fat_registered_drive_mask & (1U << (unsigned int)explicit_drive)) == 0U) return -1;
+		if (fat_mount_drive_now(explicit_drive, 1) != 0) return -1;
+	}
+	else
+	{
+		/* No drive prefix — resolve on the user's active drive, not whatever is physically mounted. */
+		int active = (fat_active_drive_index >= 0) ? fat_active_drive_index : fat_mounted_drive_index;
+		if (active >= 0 && (fat_mounted_drive_index != active || !fat32_is_mounted()) &&
+			(fat_registered_drive_mask & (1U << (unsigned int)active)) != 0U)
+		{
+			if (fat_mount_drive_now(active, 1) != 0) return -1;
+		}
+		else if (!fat32_is_mounted())
+		{
+			int i;
+			int fallback = -1;
+			for (i = 0; i < BLOCKDEV_MAX_DRIVES; i++)
+			{
+				if ((fat_registered_drive_mask & (1U << (unsigned int)i)) != 0U)
+				{
+					fallback = i;
+					break;
+				}
+			}
+			if (fallback < 0 || fat_mount_drive_now(fallback, 1) != 0) return -1;
+		}
+	}
+
 	if (input[0] == '\0')
 	{
 		if (string_length(fat_cwd) + 1 > out_size) return -1;
@@ -1170,8 +1413,7 @@ static int fat_resolve_path(const char *input, char *out, unsigned long out_size
 		return 0;
 	}
 
-	p = input;
-	if (p[0] != '/' && p[0] != '\\')
+	if (!explicit_prefix && p[0] != '/' && p[0] != '\\')
 	{
 		if (fat_push_from_path(parts, &depth, fat_cwd) != 0) return -1;
 	}
@@ -1720,6 +1962,22 @@ static void ensure_theme_files(void)
 	if (fs_read_text(AUTORUN_DELAY_PATH, &existing) != 0)
 	{
 		fs_write_text(AUTORUN_DELAY_PATH, "8\n");
+	}
+	if (fs_read_text(AUTORUN_SAFE_MODE_PATH, &existing) != 0)
+	{
+		fs_write_text(AUTORUN_SAFE_MODE_PATH, "on\n");
+	}
+	if (fs_read_text(AUTORUN_CLEAN_PATH, &existing) != 0)
+	{
+		fs_write_text(AUTORUN_CLEAN_PATH, "1\n");
+	}
+	if (fs_read_text(AUTORUN_LAST_STATUS_PATH, &existing) != 0)
+	{
+		fs_write_text(AUTORUN_LAST_STATUS_PATH, "idle\n");
+	}
+	if (fs_read_text(AUTORUN_LAST_SOURCE_PATH, &existing) != 0)
+	{
+		fs_write_text(AUTORUN_LAST_SOURCE_PATH, "none\n");
 	}
 
 	if (fs_read_text(SYSTEM_THEME_DIR "/default.theme", &existing) != 0)
@@ -2918,10 +3176,13 @@ static int execute_substitution_command(const char *raw_cmd, char *out, unsigned
 	{
 		if (fat_mode_active())
 		{
+			const char *active_cwd;
+			int active = (fat_active_drive_index >= 0) ? fat_active_drive_index : fat_mounted_drive_index;
+			active_cwd = (active >= 0 && active != fat_mounted_drive_index) ? fat_drive_cwd[active] : fat_cwd;
 			i = 0;
-			while (fat_cwd[i] != '\0' && i + 1 < out_size)
+			while (active_cwd[i] != '\0' && i + 1 < out_size)
 			{
-				out[i] = fat_cwd[i];
+				out[i] = active_cwd[i];
 				i++;
 			}
 			out[i] = '\0';
@@ -3292,7 +3553,7 @@ static const char * const cmd_list[] = {
 	"panic",
 	"quit", "exit", "shutdown",
 	"pwd", "ls", "dir", "tree", "cd", "mkdir", "touch", "write", "cat", "type", "rm", "del", "cp", "copy", "mv", "move", "ren", "edit", "hexedit", "run", "basic", "cls",
-	"hexdump", "memmap", "memstat", "pagetest", "pagefault", "gpfault", "udfault", "doublefault", "exceptstat", "dumpstack", "selftest", "elfinfo", "elfsym", "elfaddr", "exec", "execstress", "elfselftest", "tasks", "tasktest", "taskspin", "shellspawn", "shellwatch", "taskprotect", "tasklog", "taskkill", "taskstop", "taskcont", "ticks", "motd", "autorun", "ataid", "readsec", "writesec", "drives", "fatmount", "ramfs", "ramfs2fat", "fatunmount", "fatls", "fatcat", "fattouch", "fatwrite", "fatattr", "fatrm", (void *)0
+	"hexdump", "memmap", "memstat", "pagetest", "pagefault", "gpfault", "udfault", "doublefault", "exceptstat", "dumpstack", "selftest", "elfinfo", "elfsym", "elfaddr", "elfcheck", "exec", "execstress", "elfselftest", "tasks", "tasktest", "taskspin", "shellspawn", "shellwatch", "taskprotect", "tasklog", "taskkill", "taskstop", "taskcont", "ticks", "motd", "autorun", "ataid", "readsec", "writesec", "drives", "fatmount", "mtn", "mnt", "mount", "fatwhere", "fatstress", "fatperf", "ramfs", "ramfs2fat", "fatunmount", "umtn", "umnt", "umount", "fatls", "fatcat", "fattouch", "fatwrite", "fatattr", "fatrm", (void *)0
 };
 
 static int parse_dec_u32(const char *s, unsigned int *out)
@@ -3448,6 +3709,14 @@ static int print_elf_symbol(const elf_symbol_t *sym, void *ctx)
 struct elf_phdr_print_ctx
 {
 	unsigned long count;
+	unsigned long entry;
+	unsigned long load_starts[32];
+	unsigned long load_ends[32];
+	unsigned long load_count;
+	int entry_in_load;
+	int overlap_detected;
+	int align_mismatch;
+	int range_overflow;
 };
 
 struct elf_section_print_ctx
@@ -3460,6 +3729,11 @@ static int print_elf_phdr(const elf_program_header_info_t *ph, void *ctx)
 	struct elf_phdr_print_ctx *print_ctx = (struct elf_phdr_print_ctx *)ctx;
 	char n[16];
 	char flags[4];
+	unsigned long seg_end = 0;
+	unsigned long page_start = 0;
+	unsigned long page_end = 0;
+	unsigned long i;
+	const unsigned long page_size = 4096UL;
 
 	flags[0] = (ph->flags & 0x4u) ? 'R' : '-';
 	flags[1] = (ph->flags & 0x2u) ? 'W' : '-';
@@ -3483,7 +3757,57 @@ static int print_elf_phdr(const elf_program_header_info_t *ph, void *ctx)
 	terminal_write(n);
 	terminal_write(" memsz=");
 	uint_to_dec(ph->memsz, n, sizeof(n));
-	terminal_write_line(n);
+	terminal_write(n);
+	terminal_write(" align=");
+	terminal_write_hex64(ph->align);
+
+	if (ph->type == 1u && ph->memsz != 0)
+	{
+		seg_end = ph->vaddr + ph->memsz;
+		if (seg_end < ph->vaddr)
+		{
+			print_ctx->range_overflow = 1;
+		}
+		else
+		{
+			page_start = ph->vaddr & ~(page_size - 1UL);
+			page_end = (seg_end + page_size - 1UL) & ~(page_size - 1UL);
+
+			if (print_ctx->entry >= ph->vaddr && print_ctx->entry < seg_end)
+			{
+				print_ctx->entry_in_load = 1;
+				terminal_write(" <entry>");
+			}
+
+			if (ph->align > 1UL)
+			{
+				if ((ph->align & (ph->align - 1UL)) != 0 || ((ph->vaddr & (ph->align - 1UL)) != (ph->offset & (ph->align - 1UL))))
+				{
+					print_ctx->align_mismatch = 1;
+					terminal_write(" <align?>");
+				}
+			}
+
+			for (i = 0; i < print_ctx->load_count; i++)
+			{
+				if (page_start < print_ctx->load_ends[i] && print_ctx->load_starts[i] < page_end)
+				{
+					print_ctx->overlap_detected = 1;
+					terminal_write(" <overlap?>");
+					break;
+				}
+			}
+
+			if (print_ctx->load_count < (sizeof(print_ctx->load_starts) / sizeof(print_ctx->load_starts[0])))
+			{
+				print_ctx->load_starts[print_ctx->load_count] = page_start;
+				print_ctx->load_ends[print_ctx->load_count] = page_end;
+				print_ctx->load_count++;
+			}
+		}
+	}
+
+	terminal_putc('\n');
 	return 0;
 }
 
@@ -3994,6 +4318,19 @@ static void trigger_forced_panic(void)
 	for (;;) arch_halt();
 }
 
+static int confirm_dangerous_action(const char *args, const char *rerun_hint)
+{
+	char tok[8];
+	const char *p = read_token(args, tok, sizeof(tok));
+
+	if (p != (void *)0 && string_equals(tok, "yes") && skip_spaces(p)[0] == '\0') return 1;
+
+	terminal_write("Are you sure? Re-run: ");
+	terminal_write(rerun_hint);
+	terminal_write_line(" yes");
+	return 0;
+}
+
 static unsigned long pagefault_test_addr(void)
 {
 	unsigned long addr = memory_virtual_limit() + MEMORY_PAGE_SIZE;
@@ -4011,14 +4348,34 @@ static unsigned long pagefault_test_addr(void)
 static void cmd_pagefault(const char *args)
 {
 	char mode[16];
+	char rerun_hint[48];
+	unsigned long i = 0;
 	const char *p = read_token(args, mode, sizeof(mode));
 	unsigned long fault_addr;
 
-	if (p == (void *)0 || mode[0] == '\0' || skip_spaces(p)[0] != '\0')
+	if (p == (void *)0 || mode[0] == '\0')
 	{
-		terminal_write_line("Usage: pagefault <read|write|exec>");
+		terminal_write_line("Usage: pagefault <read|write|exec> [yes]");
 		return;
 	}
+
+	if (!(string_equals(mode, "read") || string_equals(mode, "write") || string_equals(mode, "exec")))
+	{
+		terminal_write_line("Usage: pagefault <read|write|exec> [yes]");
+		return;
+	}
+
+	{
+		const char *prefix = "pagefault ";
+		while (prefix[i] != '\0' && i + 1 < sizeof(rerun_hint)) { rerun_hint[i] = prefix[i]; i++; }
+		{
+			unsigned long j = 0;
+			while (mode[j] != '\0' && i + 1 < sizeof(rerun_hint)) { rerun_hint[i++] = mode[j++]; }
+		}
+		rerun_hint[i] = '\0';
+	}
+
+	if (!confirm_dangerous_action(p, rerun_hint)) return;
 
 	terminal_write("[pagefault] mode: ");
 	terminal_write_line(mode);
@@ -4044,7 +4401,7 @@ static void cmd_pagefault(const char *args)
 	}
 	else
 	{
-		terminal_write_line("Usage: pagefault <read|write|exec>");
+		terminal_write_line("Usage: pagefault <read|write|exec> [yes]");
 		return;
 	}
 
@@ -4053,9 +4410,8 @@ static void cmd_pagefault(const char *args)
 
 static void cmd_gpfault(const char *args)
 {
-	if (skip_spaces(args)[0] != '\0')
+	if (!confirm_dangerous_action(args, "gpfault"))
 	{
-		terminal_write_line("Usage: gpfault");
 		return;
 	}
 
@@ -4070,9 +4426,8 @@ static void cmd_gpfault(const char *args)
 
 static void cmd_udfault(const char *args)
 {
-	if (skip_spaces(args)[0] != '\0')
+	if (!confirm_dangerous_action(args, "udfault"))
 	{
-		terminal_write_line("Usage: udfault");
 		return;
 	}
 
@@ -4086,9 +4441,8 @@ static void cmd_doublefault(const char *args)
 	struct exception_frame frame;
 	unsigned long current_rsp;
 
-	if (skip_spaces(args)[0] != '\0')
+	if (!confirm_dangerous_action(args, "doublefault"))
 	{
-		terminal_write_line("Usage: doublefault");
 		return;
 	}
 
@@ -4277,31 +4631,31 @@ static void cmd_selftest(const char *args)
 	if (string_equals(step, "pf-read") || string_equals(step, "1"))
 	{
 		terminal_write_line("[selftest] step 1/5: #PF read expected (vec=0x0E, P=0 W=0 I=0)");
-		cmd_pagefault("read");
+		cmd_pagefault("read yes");
 		return;
 	}
 	if (string_equals(step, "pf-write") || string_equals(step, "2"))
 	{
 		terminal_write_line("[selftest] step 2/5: #PF write expected (vec=0x0E, P=0 W=1 I=0)");
-		cmd_pagefault("write");
+		cmd_pagefault("write yes");
 		return;
 	}
 	if (string_equals(step, "pf-exec") || string_equals(step, "3"))
 	{
 		terminal_write_line("[selftest] step 3/5: #PF exec expected (vec=0x0E, P=0 W=0 I=1)");
-		cmd_pagefault("exec");
+		cmd_pagefault("exec yes");
 		return;
 	}
 	if (string_equals(step, "ud") || string_equals(step, "4"))
 	{
 		terminal_write_line("[selftest] step 4/5: #UD expected (vec=0x06)");
-		cmd_udfault("");
+		cmd_udfault("yes");
 		return;
 	}
 	if (string_equals(step, "gp") || string_equals(step, "5"))
 	{
 		terminal_write_line("[selftest] step 5/5: #GP expected (vec=0x0D)");
-		cmd_gpfault("");
+		cmd_gpfault("yes");
 		return;
 	}
 
@@ -4479,6 +4833,24 @@ static void cmd_pagetest(void)
 		terminal_write_line("pagetest: FAILED");
 }
 
+static const char *elf_load_error_name(int rc)
+{
+	switch (rc)
+	{
+		case ELF_ERR_MAGIC: return "bad ELF magic";
+		case ELF_ERR_CLASS: return "not ELF64";
+		case ELF_ERR_TYPE: return "not executable or shared";
+		case ELF_ERR_ARCH: return "not x86-64";
+		case ELF_ERR_PHDR: return "bad program headers";
+		case ELF_ERR_MAP: return "page mapping failed";
+		case ELF_ERR_RANGE: return "segment exceeds file";
+		case ELF_ERR_OVERLAP: return "overlapping PT_LOAD page windows";
+		case ELF_ERR_ENTRY: return "entry point not in PT_LOAD segment";
+		case ELF_ERR_NULL: return "null input";
+		default: return "unknown error";
+	}
+}
+
 static void cmd_exec(const char *args)
 {
 	char path[128];
@@ -4503,18 +4875,21 @@ static void cmd_exec(const char *args)
 	rc = elf_load(buf, size, &prog);
 	if (rc != 0)
 	{
+		char n[16];
 		terminal_write("[exec] load error: ");
-		switch (rc)
+		terminal_write(elf_load_error_name(rc));
+		terminal_write(" (rc=");
+		if (rc < 0)
 		{
-			case ELF_ERR_MAGIC:  terminal_write_line("bad ELF magic"); break;
-			case ELF_ERR_CLASS:  terminal_write_line("not ELF64"); break;
-			case ELF_ERR_TYPE:   terminal_write_line("not executable or shared"); break;
-			case ELF_ERR_ARCH:   terminal_write_line("not x86-64"); break;
-			case ELF_ERR_PHDR:   terminal_write_line("bad program headers"); break;
-			case ELF_ERR_MAP:    terminal_write_line("page mapping failed"); break;
-			case ELF_ERR_RANGE:  terminal_write_line("segment exceeds file"); break;
-			default:             terminal_write_line("unknown error"); break;
+			terminal_putc('-');
+			uint_to_dec((unsigned long)(-rc), n, sizeof(n));
 		}
+		else
+		{
+			uint_to_dec((unsigned long)rc, n, sizeof(n));
+		}
+		terminal_write(n);
+		terminal_write_line(")");
 		return;
 	}
 
@@ -4575,6 +4950,54 @@ static void cmd_exec(const char *args)
 
 	elf_unload(buf, size);
 	terminal_write_line("[exec] done");
+}
+
+static void cmd_elfcheck(const char *args)
+{
+	char path[128];
+	unsigned char buf[8192];
+	unsigned long size = 0;
+	elf_exec_t prog;
+	int rc;
+	const char *p = read_token(args, path, sizeof(path));
+
+	if (p == (void *)0 || path[0] == '\0' || skip_spaces(p)[0] != '\0')
+	{
+		terminal_write_line("Usage: elfcheck <path>");
+		return;
+	}
+
+	if (read_shell_file_bytes("elfcheck", path, buf, sizeof(buf), &size) != 0) return;
+
+	rc = elf_load(buf, size, &prog);
+	if (rc != 0)
+	{
+		char n[16];
+		terminal_write("elfcheck: FAIL ");
+		terminal_write(path);
+		terminal_write(" : ");
+		terminal_write(elf_load_error_name(rc));
+		terminal_write(" (rc=");
+		if (rc < 0)
+		{
+			terminal_putc('-');
+			uint_to_dec((unsigned long)(-rc), n, sizeof(n));
+		}
+		else
+		{
+			uint_to_dec((unsigned long)rc, n, sizeof(n));
+		}
+		terminal_write(n);
+		terminal_write_line(")");
+		return;
+	}
+
+	terminal_write("elfcheck: PASS ");
+	terminal_write(path);
+	terminal_write(" entry=");
+	terminal_write_hex64(prog.entry);
+	terminal_putc('\n');
+	elf_unload(buf, size);
 }
 
 struct task_test_ctx { unsigned int id; };
@@ -4783,12 +5206,20 @@ static void cmd_autorun(const char *args)
 	if (rest == (void *)0 || tok[0] == '\0' || string_equals(tok, "show"))
 	{
 		char n[16];
+		int safe_enabled;
+		char last_status[48];
+		char last_source[48];
 		unsigned long delay_seconds = terminal_get_autorun_delay_seconds();
 		mode = terminal_get_autorun_mode();
+		safe_enabled = terminal_get_autorun_safe_mode();
+		terminal_get_autorun_last_status(last_status, sizeof(last_status));
+		terminal_get_autorun_last_source(last_source, sizeof(last_source));
 		terminal_write("autorun: mode=");
 		if (mode == 0) terminal_write("off");
 		else if (mode == 2) terminal_write("once");
 		else terminal_write("always");
+		terminal_write(" safe=");
+		terminal_write(safe_enabled ? "on" : "off");
 		terminal_write(" delay=");
 		uint_to_dec(delay_seconds, n, sizeof(n));
 		terminal_write(n);
@@ -4812,7 +5243,45 @@ static void cmd_autorun(const char *args)
 			}
 			else terminal_write("ready");
 		}
+		terminal_write(" last=");
+		terminal_write(last_status);
+		terminal_write(" src=");
+		terminal_write(last_source);
 		terminal_putc('\n');
+		return;
+	}
+	if (string_equals(tok, "log"))
+	{
+		char last_status[48];
+		char last_source[48];
+		terminal_get_autorun_last_status(last_status, sizeof(last_status));
+		terminal_get_autorun_last_source(last_source, sizeof(last_source));
+		terminal_write("autorun log: status=");
+		terminal_write(last_status);
+		terminal_write(" source=");
+		terminal_write_line(last_source);
+		return;
+	}
+	if (string_equals(tok, "safe"))
+	{
+		char mode_tok[8];
+		int enabled;
+		if (read_token(rest, mode_tok, sizeof(mode_tok)) == (void *)0 || mode_tok[0] == '\0' || string_equals(mode_tok, "show"))
+		{
+			terminal_write("autorun: safe=");
+			terminal_write_line(terminal_get_autorun_safe_mode() ? "on" : "off");
+			return;
+		}
+		if (!string_equals(mode_tok, "on") && !string_equals(mode_tok, "off"))
+		{
+			terminal_write_line("Usage: autorun safe [on|off|show]");
+			return;
+		}
+		enabled = string_equals(mode_tok, "on") ? 1 : 0;
+		terminal_set_autorun_safe_mode(enabled);
+		autorun_safe_latched = 0;
+		terminal_write("autorun: safe mode ");
+		terminal_write_line(enabled ? "on" : "off");
 		return;
 	}
 	if (string_equals(tok, "delay"))
@@ -4878,17 +5347,34 @@ static void cmd_autorun(const char *args)
 	if (string_equals(tok, "stop"))
 	{
 		autorun_boot_pending = 0;
+		terminal_set_autorun_last_status("canceled\n");
+		terminal_set_autorun_last_source("none\n");
 		terminal_write_line("autorun: canceled for this boot");
 		return;
 	}
 	if (string_equals(tok, "run"))
 	{
-		if (terminal_run_autorun_script_now()) terminal_write_line("autorun: executed");
-		else terminal_write_line("autorun: no script found");
+		int rc = terminal_run_autorun_script_now();
+		if (rc > 0)
+		{
+			terminal_set_autorun_last_status("executed\n");
+			terminal_write_line("autorun: executed");
+		}
+		else if (rc == 0)
+		{
+			terminal_set_autorun_last_status("no-script\n");
+			terminal_set_autorun_last_source("none\n");
+			terminal_write_line("autorun: no script found");
+		}
+		else
+		{
+			terminal_set_autorun_last_status("error\n");
+			terminal_write_line("autorun: script failed");
+		}
 		return;
 	}
 
-	terminal_write_line("Usage: autorun [show|off|always|once|rearm|stop|run|delay <0..3600>]");
+	terminal_write_line("Usage: autorun [show|log|off|always|once|rearm|stop|run|safe <on|off|show>|delay <0..3600>]");
 }
 
 static void cmd_taskkill(const char *args)
@@ -5045,6 +5531,12 @@ static void cmd_elfinfo(const char *args)
 
 	terminal_write_line("  program headers:");
 	phdr_ctx.count = 0;
+	phdr_ctx.entry = info.entry;
+	phdr_ctx.load_count = 0;
+	phdr_ctx.entry_in_load = 0;
+	phdr_ctx.overlap_detected = 0;
+	phdr_ctx.align_mismatch = 0;
+	phdr_ctx.range_overflow = 0;
 	rc = elf_visit_program_headers(buf, size, print_elf_phdr, &phdr_ctx);
 	if (rc == ELF_ERR_PHDR)
 	{
@@ -5057,6 +5549,14 @@ static void cmd_elfinfo(const char *args)
 	else if (phdr_ctx.count == 0)
 	{
 		terminal_write_line("    none");
+	}
+	if (rc == ELF_OK && phdr_ctx.count != 0)
+	{
+		terminal_write("  entry in PT_LOAD: ");
+		terminal_write_line(phdr_ctx.entry_in_load ? "yes" : "no");
+		if (phdr_ctx.overlap_detected) terminal_write_line("  warning: PT_LOAD page overlap detected");
+		if (phdr_ctx.align_mismatch) terminal_write_line("  warning: PT_LOAD alignment mismatch detected");
+		if (phdr_ctx.range_overflow) terminal_write_line("  warning: PT_LOAD range overflow detected");
 	}
 
 	terminal_write_line("  sections:");
@@ -5290,18 +5790,21 @@ static void cmd_execstress(const char *args)
 			terminal_write(n);
 		}
 		terminal_write(", elf_load rc=");
-		if (last_rc < 0)
 		{
 			char n[16];
-			terminal_putc('-');
-			uint_to_dec((unsigned long)(-last_rc), n, sizeof(n));
-			terminal_write_line(n);
-		}
-		else
-		{
-			char n[16];
-			uint_to_dec((unsigned long)last_rc, n, sizeof(n));
-			terminal_write_line(n);
+			terminal_write(elf_load_error_name(last_rc));
+			terminal_write(" (");
+			if (last_rc < 0)
+			{
+				terminal_putc('-');
+				uint_to_dec((unsigned long)(-last_rc), n, sizeof(n));
+			}
+			else
+			{
+				uint_to_dec((unsigned long)last_rc, n, sizeof(n));
+			}
+			terminal_write(n);
+			terminal_write_line(")");
 		}
 	}
 	else
@@ -5535,7 +6038,12 @@ static void cmd_pwd(void)
 {
 	if (fat_mode_active())
 	{
-		terminal_write_line(fat_cwd);
+		/* Show the active drive's CWD, not the temporarily mounted drive's CWD */
+		int active = (fat_active_drive_index >= 0) ? fat_active_drive_index : fat_mounted_drive_index;
+		if (active >= 0 && active != fat_mounted_drive_index)
+			terminal_write_line(fat_drive_cwd[active]);
+		else
+			terminal_write_line(fat_cwd);
 		return;
 	}
 	else
@@ -5886,6 +6394,8 @@ static void cmd_dir(const char *args)
 	int opt_bare = 0;
 	int opt_wide = 0;
 	int opt_recursive = 0;
+	unsigned int batch_override = 0;
+	int batch_override_set = 0;
 	char entries[FS_MAX_LIST][40];
 	int entry_types[FS_MAX_LIST];
 	unsigned long entry_sizes[FS_MAX_LIST];
@@ -5908,6 +6418,16 @@ static void cmd_dir(const char *args)
 		if (tok[0] == '\0') break;
 		if (tok[0] == '/' || tok[0] == '-')
 		{
+			if (ascii_upper(tok[1]) == 'R' && tok[2] != '\0')
+			{
+				if (parse_dec_u32(tok + 2, &batch_override) != 0 || fat32_set_io_batch_sectors(batch_override) != 0)
+				{
+					terminal_write_line("dir: invalid /rN (N=1..16)");
+					return;
+				}
+				batch_override_set = 1;
+				continue;
+			}
 			unsigned long k = 1;
 			while (tok[k] != '\0')
 			{
@@ -5915,14 +6435,14 @@ static void cmd_dir(const char *args)
 				if (c == 'B') opt_bare = 1;
 				else if (c == 'W') opt_wide = 1;
 				else if (c == 'S') opt_recursive = 1;
-				else { terminal_write_line("dir: unknown option (use /b /w /s)"); return; }
+				else { terminal_write_line("dir: unknown option (use /b /w /s /rN)"); return; }
 				k++;
 			}
 			continue;
 		}
 		if (target[0] != '\0')
 		{
-			terminal_write_line("Usage: dir [/b] [/w] [/s] [path]");
+			terminal_write_line("Usage: dir [/b] [/w] [/s] [/rN] [path]");
 			return;
 		}
 		{
@@ -5930,6 +6450,11 @@ static void cmd_dir(const char *args)
 			while (tok[k] != '\0' && k + 1 < sizeof(target)) { target[k] = tok[k]; k++; }
 			target[k] = '\0';
 		}
+	}
+
+	if (batch_override_set && !fat_mode_active())
+	{
+		terminal_write_line("dir: /rN applied for next FAT operations");
 	}
 
 	if (opt_wide && opt_bare) opt_wide = 0;
@@ -6348,6 +6873,14 @@ static void cmd_cd(const char *args)
 			while (full_path[i] != '\0' && i + 1 < sizeof(fat_cwd)) { fat_cwd[i] = full_path[i]; i++; }
 			fat_cwd[i] = '\0';
 		}
+		if (fat_mounted_drive_index >= 0 && fat_mounted_drive_index < BLOCKDEV_MAX_DRIVES)
+		{
+			unsigned long i = 0;
+			while (fat_cwd[i] != '\0' && i + 1 < sizeof(fat_drive_cwd[0])) { fat_drive_cwd[fat_mounted_drive_index][i] = fat_cwd[i]; i++; }
+			fat_drive_cwd[fat_mounted_drive_index][i] = '\0';
+		}
+		/* cd is an explicit navigation — the drive we landed on becomes the active drive */
+		fat_active_drive_index = fat_mounted_drive_index;
 		return;
 	}
 	if (fs_cd(path) != 0) terminal_write_line("cd: invalid directory");
@@ -6365,9 +6898,14 @@ static void cmd_mkdir(const char *args)
 	}
 	if (fat_mode_active())
 	{
-		if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0 || fat32_mkdir_path(full_path) != 0)
+		if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
 		{
-			terminal_write_line("mkdir: failed");
+			terminal_write_line("mkdir: failed (bad path)");
+			return;
+		}
+		if (fat32_mkdir_path(full_path) != 0)
+		{
+			terminal_write_fat_failure("mkdir: failed");
 		}
 		return;
 	}
@@ -6386,9 +6924,14 @@ static void cmd_touch(const char *args)
 	}
 	if (fat_mode_active())
 	{
-		if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0 || fat32_touch_file_path(full_path) != 0)
+		if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
 		{
-			terminal_write_line("touch: failed");
+			terminal_write_line("touch: failed (bad path)");
+			return;
+		}
+		if (fat32_touch_file_path(full_path) != 0)
+		{
+			terminal_write_fat_failure("touch: failed");
 		}
 		return;
 	}
@@ -6427,7 +6970,7 @@ static void cmd_cat(const char *args)
 			terminal_putc('\n');
 			return;
 		}
-		terminal_write_line("cat: failed");
+		terminal_write_fat_failure("cat: failed");
 		return;
 	}
 
@@ -6457,9 +7000,14 @@ static void cmd_write(const char *args)
 	}
 	if (fat_mode_active())
 	{
-		if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0 || fat32_write_file_path(full_path, (const unsigned char *)p, string_length(p)) != 0)
+		if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
 		{
-			terminal_write_line("write: failed");
+			terminal_write_line("write: failed (bad path)");
+			return;
+		}
+		if (fat32_write_file_path(full_path, (const unsigned char *)p, string_length(p)) != 0)
+		{
+			terminal_write_fat_failure("write: failed");
 		}
 		return;
 	}
@@ -6881,11 +7429,87 @@ static void cmd_cp(const char *args)
 	}
 	if (fat_mode_active())
 	{
-		if (fat_resolve_path(src, src_full, sizeof(src_full)) != 0 || fat_resolve_path(dst, dst_full, sizeof(dst_full)) != 0)
+		int src_drive, dst_drive;
+		if (fat_resolve_path(src, src_full, sizeof(src_full)) != 0)
 		{
 			terminal_write_line("cp: failed");
 			return;
 		}
+		src_drive = fat_mounted_drive_index;
+		if (fat_resolve_path(dst, dst_full, sizeof(dst_full)) != 0)
+		{
+			terminal_write_line("cp: failed");
+			return;
+		}
+		dst_drive = fat_mounted_drive_index;
+
+		if (src_drive >= 0 && dst_drive >= 0 && src_drive != dst_drive)
+		{
+			/* Cross-drive copy: read from src_drive then write to dst_drive */
+			unsigned char xbuf[FS_MAX_FILE_SIZE];
+			unsigned long xsize;
+			char xtarget[128];
+			unsigned long j;
+
+			if (recursive)
+			{
+				terminal_write_line("cp: cross-drive recursive copy not supported");
+				return;
+			}
+			/* Determine actual destination path (directory check needs dst drive mounted) */
+			if (fat_mount_drive_now(dst_drive, 1) != 0)
+			{
+				terminal_write_line("cp: failed");
+				return;
+			}
+			if (fat_path_is_dir(dst_full))
+			{
+				if (rm_path_join(xtarget, sizeof(xtarget), dst_full, path_basename_part(src_full)) != 0)
+				{
+					terminal_write_line("cp: failed");
+					return;
+				}
+			}
+			else
+			{
+				j = 0;
+				while (dst_full[j] != '\0' && j + 1 < sizeof(xtarget)) { xtarget[j] = dst_full[j]; j++; }
+				xtarget[j] = '\0';
+			}
+			if (no_clobber && fat_path_exists(xtarget)) return;
+			if (interactive && fat_path_exists(xtarget) && !prompt_overwrite("cp", xtarget)) return;
+
+			/* Read source file from src drive */
+			if (fat_mount_drive_now(src_drive, 1) != 0)
+			{
+				terminal_write_line("cp: failed");
+				return;
+			}
+			if (fat32_read_file_path(src_full, xbuf, sizeof(xbuf), &xsize) != 0)
+			{
+				terminal_write_line("cp: failed (read error or file too large)");
+				return;
+			}
+
+			/* Write to destination drive */
+			if (fat_mount_drive_now(dst_drive, 1) != 0)
+			{
+				terminal_write_line("cp: failed");
+				return;
+			}
+			if (fat_path_exists(xtarget) && rm_fat_recursive(xtarget, 1, 0) != 0)
+			{
+				terminal_write_line("cp: failed");
+				return;
+			}
+			if (fat32_write_file_path(xtarget, xbuf, xsize) != 0)
+				terminal_write_line("cp: failed (write error)");
+			return;
+		}
+
+		/* Same drive — ensure it's mounted, then do normal copy */
+		if (src_drive >= 0 && fat_mounted_drive_index != src_drive)
+			fat_mount_drive_now(src_drive, 1);
 		if (resolve_copy_target_fat(src_full, dst_full, target, sizeof(target)) != 0)
 		{
 			terminal_write_line("cp: failed");
@@ -7430,6 +8054,31 @@ static void run_inline_command(const char *line)
 	}
 }
 
+static void terminal_set_script_error(unsigned long line_no, const char *msg)
+{
+	unsigned long i = 0;
+	script_last_error = 1;
+	script_last_error_line = line_no;
+	if (msg == (void *)0) msg = "error";
+	while (msg[i] != '\0' && i + 1 < sizeof(script_last_error_text))
+	{
+		script_last_error_text[i] = msg[i];
+		i++;
+	}
+	script_last_error_text[i] = '\0';
+}
+
+static int terminal_script_command_known(const char *line)
+{
+	char token[32];
+	const char *p;
+	p = read_token(line, token, sizeof(token));
+	if (p == (void *)0 || token[0] == '\0') return 1;
+	if (command_is_builtin_name(token)) return 1;
+	if (command_alias_lookup(token) != (void *)0) return 1;
+	return 0;
+}
+
 static void trim_spaces_inplace(char *s)
 {
 	unsigned long start = 0;
@@ -7545,10 +8194,42 @@ static int terminal_try_mount_boot_fat(void)
 	struct block_device *dev;
 	if (fat32_is_mounted()) return 1;
 	dev = blockdev_get_primary();
-	if (dev != (void *)0 && dev->present && fat32_mount(dev) == 0) return 1;
+	if (dev != (void *)0 && dev->present && fat32_mount(dev) == 0)
+	{
+		fat_mounted_drive_index = 0;
+		fat_active_drive_index = 0;
+		fat_registered_drive_mask |= (1U << 0);
+		fat_drive_cwd[0][0] = '/';
+		fat_drive_cwd[0][1] = '\0';
+		return 1;
+	}
 	dev = blockdev_get_secondary();
-	if (dev != (void *)0 && dev->present && fat32_mount(dev) == 0) return 1;
+	if (dev != (void *)0 && dev->present && fat32_mount(dev) == 0)
+	{
+		fat_mounted_drive_index = 1;
+		fat_active_drive_index = 1;
+		fat_registered_drive_mask |= (1U << 1);
+		fat_drive_cwd[1][0] = '/';
+		fat_drive_cwd[1][1] = '\0';
+		return 1;
+	}
 	return 0;
+}
+
+static void terminal_warn_if_fat_mount_suspicious(void)
+{
+	struct block_device *primary;
+	struct block_device *secondary;
+	if (!fat32_is_mounted()) return;
+	if (fat_mounted_drive_index != 0) return;
+
+	primary = blockdev_get_primary();
+	secondary = blockdev_get_secondary();
+	if (primary == (void *)0 || !primary->present) return;
+	if (secondary == (void *)0 || !secondary->present) return;
+
+	terminal_write_line("warning: FAT mounted on drive 0 while drive 1 is present");
+	terminal_write_line("         (run-disk usually expects data on drive 1)");
 }
 
 static void terminal_auto_fatmount(void)
@@ -7557,6 +8238,7 @@ static void terminal_auto_fatmount(void)
 	vfs_prefer_fat_root = 1;
 	fat_cwd[0] = '/';
 	fat_cwd[1] = '\0';
+	terminal_warn_if_fat_mount_suspicious();
 }
 
 static int terminal_write_fat_text(const char *path, const char *text)
@@ -7567,19 +8249,37 @@ static int terminal_write_fat_text(const char *path, const char *text)
 	return fat32_write_file_path(path, (const unsigned char *)text, len);
 }
 
-static int terminal_get_autorun_mode(void)
+static int terminal_read_config_text(const char *fat_path, const char *ram_path, const char **ram_text, unsigned char *fat_buf, unsigned long fat_buf_size, const char **out_text)
 {
-	const char *text;
-	unsigned char fat_buf[32];
 	unsigned long fat_size = 0;
-
-	if (terminal_try_mount_boot_fat() &&
-		fat32_read_file_path(FAT_AUTORUN_MODE_PATH, fat_buf, sizeof(fat_buf) - 1, &fat_size) == 0)
+	if (out_text == (void *)0) return -1;
+	if (terminal_try_mount_boot_fat() && fat_path != (void *)0 && fat_buf != (void *)0 && fat_buf_size > 1 &&
+		fat32_read_file_path(fat_path, fat_buf, fat_buf_size - 1, &fat_size) == 0)
 	{
 		fat_buf[fat_size] = '\0';
-		text = (const char *)fat_buf;
+		*out_text = (const char *)fat_buf;
+		return 0;
 	}
-	else if (fs_read_text(AUTORUN_MODE_PATH, &text) != 0)
+	if (ram_path != (void *)0 && ram_text != (void *)0 && fs_read_text(ram_path, ram_text) == 0)
+	{
+		*out_text = *ram_text;
+		return 0;
+	}
+	return -1;
+}
+
+static void terminal_write_config_text(const char *fat_path, const char *ram_path, const char *text)
+{
+	if (ram_path != (void *)0) fs_write_text(ram_path, text);
+	if (fat_path != (void *)0 && terminal_try_mount_boot_fat()) terminal_write_fat_text(fat_path, text);
+}
+
+static int terminal_get_autorun_mode(void)
+{
+	const char *text = (void *)0;
+	const char *ram_text = (void *)0;
+	unsigned char fat_buf[32];
+	if (terminal_read_config_text(FAT_AUTORUN_MODE_PATH, AUTORUN_MODE_PATH, &ram_text, fat_buf, sizeof(fat_buf), &text) != 0)
 	{
 		return 1;
 	}
@@ -7595,23 +8295,15 @@ static void terminal_set_autorun_mode(int mode)
 	if (mode == 0) text = "off\n";
 	else if (mode == 2) text = "once\n";
 	else text = "always\n";
-	fs_write_text(AUTORUN_MODE_PATH, text);
-	if (terminal_try_mount_boot_fat()) terminal_write_fat_text(FAT_AUTORUN_MODE_PATH, text);
+	terminal_write_config_text(FAT_AUTORUN_MODE_PATH, AUTORUN_MODE_PATH, text);
 }
 
 static int terminal_autorun_once_done(void)
 {
-	const char *text;
+	const char *text = (void *)0;
+	const char *ram_text = (void *)0;
 	unsigned char fat_buf[8];
-	unsigned long fat_size = 0;
-
-	if (terminal_try_mount_boot_fat() &&
-		fat32_read_file_path(FAT_AUTORUN_ONCE_STATE_PATH, fat_buf, sizeof(fat_buf) - 1, &fat_size) == 0)
-	{
-		fat_buf[fat_size] = '\0';
-		text = (const char *)fat_buf;
-	}
-	else if (fs_read_text(AUTORUN_ONCE_STATE_PATH, &text) != 0)
+	if (terminal_read_config_text(FAT_AUTORUN_ONCE_STATE_PATH, AUTORUN_ONCE_STATE_PATH, &ram_text, fat_buf, sizeof(fat_buf), &text) != 0)
 	{
 		return 0;
 	}
@@ -7622,30 +8314,18 @@ static int terminal_autorun_once_done(void)
 static void terminal_set_autorun_once_done(int done)
 {
 	const char *text = done ? "1\n" : "0\n";
-	fs_write_text(AUTORUN_ONCE_STATE_PATH, text);
-	if (terminal_try_mount_boot_fat()) terminal_write_fat_text(FAT_AUTORUN_ONCE_STATE_PATH, text);
+	terminal_write_config_text(FAT_AUTORUN_ONCE_STATE_PATH, AUTORUN_ONCE_STATE_PATH, text);
 }
 
 static unsigned long terminal_get_autorun_delay_seconds(void)
 {
-	const char *text;
+	const char *text = (void *)0;
+	const char *ram_text = (void *)0;
 	char token[16];
 	unsigned int seconds = (unsigned int)AUTORUN_DEFAULT_DELAY_SECONDS;
 	unsigned char fat_buf[32];
-	unsigned long fat_size = 0;
 
-	if (terminal_try_mount_boot_fat() &&
-		fat32_read_file_path(FAT_AUTORUN_DELAY_PATH, fat_buf, sizeof(fat_buf) - 1, &fat_size) == 0)
-	{
-		fat_buf[fat_size] = '\0';
-		if (read_token((const char *)fat_buf, token, sizeof(token)) != (void *)0 && token[0] != '\0' &&
-			parse_dec_u32(token, &seconds) == 0)
-		{
-			return (unsigned long)seconds;
-		}
-	}
-
-	if (fs_read_text(AUTORUN_DELAY_PATH, &text) == 0 &&
+	if (terminal_read_config_text(FAT_AUTORUN_DELAY_PATH, AUTORUN_DELAY_PATH, &ram_text, fat_buf, sizeof(fat_buf), &text) == 0 &&
 		read_token(text, token, sizeof(token)) != (void *)0 && token[0] != '\0' &&
 		parse_dec_u32(token, &seconds) == 0)
 	{
@@ -7659,14 +8339,122 @@ static void terminal_set_autorun_delay_seconds(unsigned long seconds)
 {
 	char value[16];
 	uint_to_dec(seconds, value, sizeof(value));
-	fs_write_text(AUTORUN_DELAY_PATH, value);
-	if (terminal_try_mount_boot_fat()) terminal_write_fat_text(FAT_AUTORUN_DELAY_PATH, value);
+	terminal_write_config_text(FAT_AUTORUN_DELAY_PATH, AUTORUN_DELAY_PATH, value);
+}
+
+static int terminal_get_autorun_safe_mode(void)
+{
+	const char *text = (void *)0;
+	const char *ram_text = (void *)0;
+	unsigned char fat_buf[16];
+	if (terminal_read_config_text(FAT_AUTORUN_SAFE_MODE_PATH, AUTORUN_SAFE_MODE_PATH, &ram_text, fat_buf, sizeof(fat_buf), &text) != 0)
+	{
+		return 1;
+	}
+	if (string_starts_with(text, "off") || text[0] == '0') return 0;
+	return 1;
+}
+
+static void terminal_set_autorun_safe_mode(int enabled)
+{
+	terminal_write_config_text(FAT_AUTORUN_SAFE_MODE_PATH, AUTORUN_SAFE_MODE_PATH, enabled ? "on\n" : "off\n");
+}
+
+static int terminal_get_autorun_clean_flag(void)
+{
+	const char *text = (void *)0;
+	const char *ram_text = (void *)0;
+	unsigned char fat_buf[16];
+	if (terminal_read_config_text(FAT_AUTORUN_CLEAN_PATH, AUTORUN_CLEAN_PATH, &ram_text, fat_buf, sizeof(fat_buf), &text) != 0)
+	{
+		return 1;
+	}
+	return (text[0] == '1') ? 1 : 0;
+}
+
+static void terminal_set_autorun_clean_flag(int clean)
+{
+	terminal_write_config_text(FAT_AUTORUN_CLEAN_PATH, AUTORUN_CLEAN_PATH, clean ? "1\n" : "0\n");
+}
+
+static void terminal_get_autorun_last_status(char *out, unsigned long out_size)
+{
+	const char *text = (void *)0;
+	const char *ram_text = (void *)0;
+	unsigned char fat_buf[48];
+	unsigned long i = 0;
+	if (out_size == 0) return;
+	if (terminal_read_config_text(FAT_AUTORUN_LAST_STATUS_PATH, AUTORUN_LAST_STATUS_PATH, &ram_text, fat_buf, sizeof(fat_buf), &text) != 0)
+	{
+		text = "idle";
+	}
+	while (text[i] != '\0' && text[i] != '\n' && i + 1 < out_size)
+	{
+		out[i] = text[i];
+		i++;
+	}
+	out[i] = '\0';
+}
+
+static void terminal_set_autorun_last_status(const char *status)
+{
+	terminal_write_config_text(FAT_AUTORUN_LAST_STATUS_PATH, AUTORUN_LAST_STATUS_PATH, status);
+}
+
+static void terminal_get_autorun_last_source(char *out, unsigned long out_size)
+{
+	const char *text = (void *)0;
+	const char *ram_text = (void *)0;
+	unsigned char fat_buf[48];
+	unsigned long i = 0;
+	if (out_size == 0) return;
+	if (terminal_read_config_text(FAT_AUTORUN_LAST_SOURCE_PATH, AUTORUN_LAST_SOURCE_PATH, &ram_text, fat_buf, sizeof(fat_buf), &text) != 0)
+	{
+		text = "none";
+	}
+	while (text[i] != '\0' && text[i] != '\n' && i + 1 < out_size)
+	{
+		out[i] = text[i];
+		i++;
+	}
+	out[i] = '\0';
+}
+
+static void terminal_set_autorun_last_source(const char *source)
+{
+	terminal_write_config_text(FAT_AUTORUN_LAST_SOURCE_PATH, AUTORUN_LAST_SOURCE_PATH, source);
+}
+
+static void terminal_autorun_boot_begin(void)
+{
+	int safe_mode = terminal_get_autorun_safe_mode();
+	int previous_clean = terminal_get_autorun_clean_flag();
+	autorun_boot_started_at = timer_ticks();
+	autorun_boot_clean_marked = 0;
+	autorun_safe_latched = (safe_mode && !previous_clean) ? 1 : 0;
+	terminal_set_autorun_clean_flag(0);
+	terminal_set_autorun_last_source("none\n");
+	if (autorun_safe_latched) terminal_set_autorun_last_status("skipped-safe\n");
+	else terminal_set_autorun_last_status("armed\n");
+}
+
+static void terminal_autorun_boot_heartbeat(void)
+{
+	unsigned long now = timer_ticks();
+	if (autorun_boot_clean_marked) return;
+	if (now - autorun_boot_started_at < AUTORUN_SAFE_BOOT_WINDOW_TICKS) return;
+	autorun_boot_clean_marked = 1;
+	terminal_set_autorun_clean_flag(1);
 }
 
 static int terminal_run_autorun_script_now(void)
 {
 	const char *text;
 	int old_fat_mode;
+
+	script_last_error = 0;
+	script_last_error_line = 0;
+	script_last_error_text[0] = '\0';
 
 	if (terminal_try_mount_boot_fat())
 	{
@@ -7678,6 +8466,8 @@ static int terminal_run_autorun_script_now(void)
 			vfs_prefer_fat_root = 1;
 			cmd_run(FAT_AUTORUN_PATH);
 			vfs_prefer_fat_root = old_fat_mode;
+			terminal_set_autorun_last_source("/autorun.sh\n");
+			if (script_last_error) return -1;
 			return 1;
 		}
 	}
@@ -7685,6 +8475,8 @@ static int terminal_run_autorun_script_now(void)
 	if (fs_read_text(AUTORUN_PATH, &text) != 0) return 0;
 	if (text[0] == '\0') return 0;
 	cmd_run(AUTORUN_PATH);
+	terminal_set_autorun_last_source("/etc/autorun.sh\n");
+	if (script_last_error) return -1;
 	return 1;
 }
 
@@ -7693,6 +8485,7 @@ static int terminal_autorun_should_run_on_boot(void)
 	int mode = terminal_get_autorun_mode();
 	if (mode == 0) return 0;
 	if (mode == 2 && terminal_autorun_once_done()) return 0;
+	if (autorun_safe_latched) return 0;
 	return 1;
 }
 
@@ -7705,12 +8498,17 @@ static void terminal_schedule_boot_autorun(void)
 	if (!terminal_autorun_should_run_on_boot())
 	{
 		autorun_boot_pending = 0;
+		if (autorun_safe_latched)
+		{
+			terminal_write_line("autorun: skipped (safe mode; previous boot was not marked clean)");
+		}
 		return;
 	}
 	delay_seconds = terminal_get_autorun_delay_seconds();
 	delay_ticks = delay_seconds * 100UL;
 	autorun_boot_pending = 1;
 	autorun_boot_deadline = timer_ticks() + delay_ticks;
+	terminal_set_autorun_last_status("scheduled\n");
 	terminal_write("autorun: scheduled in ");
 	uint_to_dec(delay_seconds, n, sizeof(n));
 	terminal_write(n);
@@ -7729,11 +8527,20 @@ static void terminal_poll_boot_autorun(void)
 	autorun_boot_pending = 0;
 	mode = terminal_get_autorun_mode();
 	ran = terminal_run_autorun_script_now();
-	if (!ran)
+	if (ran == 0)
 	{
+		terminal_set_autorun_last_status("no-script\n");
+		terminal_set_autorun_last_source("none\n");
 		terminal_write_line("autorun: no script found");
 		return;
 	}
+	if (ran < 0)
+	{
+		terminal_set_autorun_last_status("error\n");
+		terminal_write_line("autorun: script failed");
+		return;
+	}
+	terminal_set_autorun_last_status("executed\n");
 	if (mode == 2) terminal_set_autorun_once_done(1);
 }
 
@@ -7795,34 +8602,63 @@ static void cmd_run(const char *args)
 	char path[128];
 	char resolved[128];
 	char script[EDITOR_BUFFER_SIZE];
+	char tok[32];
 	unsigned long script_len = 0;
+	unsigned long timeout_ticks = SCRIPT_DEFAULT_TIMEOUT_TICKS;
+	unsigned long start_ticks;
+	unsigned long line_no = 1;
 	unsigned long i;
 	unsigned long line_len = 0;
 	char line[INPUT_BUFFER_SIZE];
-	char first[32];
-	const char *p = read_token(args, first, sizeof(first));
+	const char *p = args;
 
-	if (p != (void *)0 && string_equals(first, "-x"))
+	path[0] = '\0';
+	script_last_error = 0;
+	script_last_error_line = 0;
+	script_last_error_text[0] = '\0';
+
+	for (;;)
 	{
-		trace = 1;
-		p = read_token(p, path, sizeof(path));
-	}
-	else
-	{
-		unsigned long c = 0;
-		while (first[c] != '\0' && c + 1 < sizeof(path)) { path[c] = first[c]; c++; }
-		path[c] = '\0';
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0 || tok[0] == '\0') break;
+		if (string_equals(tok, "-x"))
+		{
+			trace = 1;
+			continue;
+		}
+		if (string_equals(tok, "-t"))
+		{
+			unsigned int seconds;
+			char sec_tok[16];
+			p = read_token(p, sec_tok, sizeof(sec_tok));
+			if (p == (void *)0 || sec_tok[0] == '\0' || parse_dec_u32(sec_tok, &seconds) != 0 || seconds > 3600U)
+			{
+				terminal_write_line("Usage: run [-x] [-t <1..3600>] <path>");
+				terminal_set_script_error(0, "bad timeout");
+				return;
+			}
+			timeout_ticks = (unsigned long)seconds * 100UL;
+			continue;
+		}
+		{
+			unsigned long c = 0;
+			while (tok[c] != '\0' && c + 1 < sizeof(path)) { path[c] = tok[c]; c++; }
+			path[c] = '\0';
+		}
+		break;
 	}
 
-	if (p == (void *)0 || path[0] == '\0')
+	if (path[0] == '\0')
 	{
-		terminal_write_line("Usage: run [-x] <path>");
+		terminal_write_line("Usage: run [-x] [-t <1..3600>] <path>");
+		terminal_set_script_error(0, "missing path");
 		return;
 	}
 
 	if (script_depth >= 3)
 	{
 		terminal_write_line("run: max script depth reached");
+		terminal_set_script_error(0, "max depth reached");
 		return;
 	}
 
@@ -7848,11 +8684,13 @@ static void cmd_run(const char *args)
 		if (fat_resolve_path(path, resolved, sizeof(resolved)) != 0)
 		{
 			terminal_write_line("run: invalid FAT path");
+			terminal_set_script_error(0, "invalid FAT path");
 			return;
 		}
 		if (fat32_read_file_path(resolved, (unsigned char *)script, sizeof(script) - 1, &script_len) != 0)
 		{
 			terminal_write_line("run: read failed");
+			terminal_set_script_error(0, "read failed");
 			return;
 		}
 		script[script_len] = '\0';
@@ -7863,6 +8701,7 @@ static void cmd_run(const char *args)
 		if (fs_read_text(path, &text) != 0)
 		{
 			terminal_write_line("run: read failed");
+			terminal_set_script_error(0, "read failed");
 			return;
 		}
 		while (text[script_len] != '\0' && script_len + 1 < sizeof(script))
@@ -7875,6 +8714,7 @@ static void cmd_run(const char *args)
 
 	script_mode_active = 1;
 	script_depth++;
+	start_ticks = timer_ticks();
 
 	for (i = 0; i <= script_len; i++)
 	{
@@ -7887,6 +8727,33 @@ static void cmd_run(const char *args)
 		}
 
 		line[line_len] = '\0';
+		terminal_poll_control_hotkeys();
+		if (terminal_take_cancel_request())
+		{
+			terminal_set_script_error(line_no, "canceled");
+			terminal_write("run:");
+			{
+				char ln[16];
+				uint_to_dec(line_no, ln, sizeof(ln));
+				terminal_write(ln);
+			}
+			terminal_write_line(": canceled");
+			line_len = 0;
+			break;
+		}
+		if (timer_ticks() - start_ticks > timeout_ticks)
+		{
+			terminal_set_script_error(line_no, "timeout");
+			terminal_write("run:");
+			{
+				char ln[16];
+				uint_to_dec(line_no, ln, sizeof(ln));
+				terminal_write(ln);
+			}
+			terminal_write_line(": timeout");
+			line_len = 0;
+			break;
+		}
 		if (line_len > 0)
 		{
 			unsigned long start = 0;
@@ -7900,7 +8767,14 @@ static void cmd_run(const char *args)
 					int cond;
 					if (if_depth >= 8)
 					{
-						terminal_write_line("run: if nesting too deep");
+						terminal_set_script_error(line_no, "if nesting too deep");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write_line(": if nesting too deep");
 						line_len = 0;
 						break;
 					}
@@ -7915,7 +8789,14 @@ static void cmd_run(const char *args)
 				{
 					if (if_depth == 0)
 					{
-						terminal_write_line("run: elif without if");
+						terminal_set_script_error(line_no, "elif without if");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write_line(": elif without if");
 					}
 					else
 					{
@@ -7938,7 +8819,14 @@ static void cmd_run(const char *args)
 				{
 					if (if_depth == 0)
 					{
-						terminal_write_line("run: else without if");
+						terminal_set_script_error(line_no, "else without if");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write_line(": else without if");
 					}
 					else
 					{
@@ -7970,35 +8858,70 @@ static void cmd_run(const char *args)
 					rest = read_token(rest, var_name, sizeof(var_name));
 					if (rest == (void *)0 || var_name[0] == '\0')
 					{
-						terminal_write_line("run: bad foreach syntax");
+						terminal_set_script_error(line_no, "bad foreach syntax");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write_line(": bad foreach syntax");
 						line_len = 0;
 						continue;
 					}
 					rest = read_token(rest, items, sizeof(items));
 					if (rest == (void *)0 || !string_equals(items, "in"))
 					{
-						terminal_write_line("run: use 'foreach <var> in <a,b,..> do <cmd>'");
+						terminal_set_script_error(line_no, "bad foreach syntax");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write_line(": use 'foreach <var> in <a,b,..> do <cmd>'");
 						line_len = 0;
 						continue;
 					}
 					rest = read_token(rest, items, sizeof(items));
 					if (rest == (void *)0 || items[0] == '\0')
 					{
-						terminal_write_line("run: missing foreach items");
+						terminal_set_script_error(line_no, "missing foreach items");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write_line(": missing foreach items");
 						line_len = 0;
 						continue;
 					}
 					rest = read_token(rest, body, sizeof(body));
 					if (rest == (void *)0 || !string_equals(body, "do"))
 					{
-						terminal_write_line("run: missing 'do' in foreach");
+						terminal_set_script_error(line_no, "missing 'do' in foreach");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write_line(": missing 'do' in foreach");
 						line_len = 0;
 						continue;
 					}
 					rest = skip_spaces(rest);
 					if (*rest == '\0')
 					{
-						terminal_write_line("run: missing foreach body command");
+						terminal_set_script_error(line_no, "missing foreach body");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write_line(": missing foreach body command");
 						line_len = 0;
 						continue;
 					}
@@ -8055,7 +8978,14 @@ static void cmd_run(const char *args)
 				{
 					if (if_depth == 0)
 					{
-						terminal_write_line("run: fi without if");
+						terminal_set_script_error(line_no, "fi without if");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write_line(": fi without if");
 					}
 					else
 					{
@@ -8066,6 +8996,20 @@ static void cmd_run(const char *args)
 				}
 				else if (current_exec)
 				{
+					if (!terminal_script_command_known(cmd))
+					{
+						terminal_set_script_error(line_no, "unknown command");
+						terminal_write("run:");
+						{
+							char ln[16];
+							uint_to_dec(line_no, ln, sizeof(ln));
+							terminal_write(ln);
+						}
+						terminal_write(" unknown command: ");
+						terminal_write_line(cmd);
+						line_len = 0;
+						break;
+					}
 					if (trace)
 					{
 						terminal_write("+ ");
@@ -8076,10 +9020,12 @@ static void cmd_run(const char *args)
 			}
 		}
 		line_len = 0;
+		line_no++;
 	}
 
 	if (if_depth != 0)
 	{
+		terminal_set_script_error(line_no, "missing fi");
 		terminal_write_line("run: missing fi");
 	}
 
@@ -8161,14 +9107,14 @@ static void cmd_ataid(void)
 {
 	int i;
 	int any = 0;
-	for (i = 0; i < 2; i++)
+	for (i = 0; i < ATA_MAX_DRIVES; i++)
 	{
 		if (ata_is_present_drive(i))
 		{
 			terminal_write("ATA drive ");
 			terminal_putc((char)('0' + i));
 			terminal_write(" (");
-			terminal_write(i == 0 ? "primary master" : "primary slave ");
+			terminal_write(ata_drive_label(i));
 			terminal_write("): sectors=");
 			terminal_write_hex64((unsigned long)ata_get_sector_count_drive(i));
 			terminal_putc('\n');
@@ -8265,10 +9211,43 @@ static void cmd_writesec(const char *args)
 static void cmd_fatmount(const char *args)
 {
 	int drive_index = 0;
+	int used_default = 0;
+	char mount_tok[16];
+	const char *tail;
 	struct block_device *dev;
 
-	/* Optional argument: "0" = master, "1" = slave */
-	if (args != (void *)0 && args[0] == '1') drive_index = 1;
+	if (parse_fat_drive_index_arg(args, &drive_index, &used_default) != 0)
+	{
+		terminal_write_line("fatmount: Usage: fatmount <0..3|hd#> [/hd#|A:]");
+		return;
+	}
+
+	tail = read_token(args, mount_tok, sizeof(mount_tok));
+	if (tail == (void *)0)
+	{
+		terminal_write_line("fatmount: Usage: fatmount <0..3|hd#> [/hd#|A:]");
+		return;
+	}
+	tail = read_token(tail, mount_tok, sizeof(mount_tok));
+	if (tail == (void *)0)
+	{
+		terminal_write_line("fatmount: mountpoint token too long");
+		return;
+	}
+	if (mount_tok[0] != '\0')
+	{
+		if (parse_mountpoint_token(mount_tok, drive_index) != 0 || skip_spaces(tail)[0] != '\0')
+		{
+			terminal_write_line("fatmount: Usage: fatmount <0..3|hd#> [/hd#|A:]");
+			return;
+		}
+	}
+
+	if (used_default)
+	{
+		dev = blockdev_get_secondary();
+		if (dev != (void *)0 && dev->present) drive_index = 1;
+	}
 
 	dev = blockdev_get(drive_index);
 	if (dev == (void *)0 || !dev->present)
@@ -8279,34 +9258,126 @@ static void cmd_fatmount(const char *args)
 		return;
 	}
 
-	if (fat32_mount(dev) != 0)
+	if (fat_mount_drive_now(drive_index, 1) != 0)
 	{
 		terminal_write("fatmount: drive ");
 		terminal_putc((char)('0' + drive_index));
 		terminal_write_line(" mount failed (not FAT32?)");
 		return;
 	}
-
-	vfs_prefer_fat_root = 1;
-	fat_cwd[0] = '/';
-	fat_cwd[1] = '\0';
+	fat_registered_drive_mask |= (1U << (unsigned int)drive_index);
+	if (fat_drive_cwd[drive_index][0] == '\0')
+	{
+		fat_drive_cwd[drive_index][0] = '/';
+		fat_drive_cwd[drive_index][1] = '\0';
+	}
+	/* No explicit mount-point token means this is a primary mount; make it the active drive */
+	if (mount_tok[0] == '\0')
+		fat_active_drive_index = drive_index;
 
 	terminal_write("fatmount: drive ");
 	terminal_putc((char)('0' + drive_index));
-	terminal_write_line(" mounted (generic fs commands now use FAT)");
+	terminal_write(" registered as /hd");
+	terminal_putc((char)('0' + drive_index));
+	terminal_write(" and ");
+	terminal_putc((char)('A' + drive_index));
+	terminal_write_line(":");
+	terminal_warn_if_fat_mount_suspicious();
+}
+
+static int parse_fat_drive_index_arg(const char *args, int *out_drive_index, int *out_used_default)
+{
+	char tok[16];
+	const char *p;
+
+	if (out_drive_index == (void *)0 || out_used_default == (void *)0) return -1;
+
+	*out_drive_index = 0;
+	*out_used_default = 1;
+
+	if (args == (void *)0) return 0;
+	p = read_token(args, tok, sizeof(tok));
+	if (p == (void *)0) return -1;
+	if (tok[0] == '\0') return 0;
+	if (parse_mount_target_drive(tok, out_drive_index) == 0)
+	{
+		*out_used_default = 0;
+		return 0;
+	}
+	return -1;
+}
+
+static const char *ata_drive_label(int drive_index)
+{
+	switch (drive_index)
+	{
+		case 0: return "primary master";
+		case 1: return "primary slave";
+		case 2: return "secondary master";
+		case 3: return "secondary slave";
+		default: return "unknown";
+	}
+}
+
+static void cmd_fatwhere(void)
+{
+	int i;
+	int any = 0;
+	int active = (fat_active_drive_index >= 0) ? fat_active_drive_index : fat_mounted_drive_index;
+
+	if (!fat32_is_mounted() && fat_active_drive_index < 0)
+	{
+		terminal_write_line("fatwhere: not mounted");
+	}
+	else
+	{
+		terminal_write("fatwhere: context drive=");
+		if (active >= 0 && active <= 9)
+		{
+			terminal_putc((char)('0' + active));
+		}
+		else
+		{
+			terminal_write("?");
+		}
+		terminal_write(" cwd=");
+		terminal_write((active >= 0 && active != fat_mounted_drive_index) ? fat_drive_cwd[active] : fat_cwd);
+		if (fat_mounted_drive_index != active && fat32_is_mounted())
+		{
+			terminal_write(" (phys=hd");
+			terminal_putc((char)('0' + fat_mounted_drive_index));
+			terminal_putc(')');
+		}
+		terminal_write(" mode=");
+		terminal_write_line(vfs_prefer_fat_root ? "FAT generic-on" : "FAT mounted-only");
+	}
+
+	terminal_write_line("fatwhere: registered mount roots:");
+	for (i = 0; i < BLOCKDEV_MAX_DRIVES; i++)
+	{
+		if ((fat_registered_drive_mask & (1U << (unsigned int)i)) == 0U) continue;
+		terminal_write(i == active ? "* /hd" : "  /hd");
+		terminal_putc((char)('0' + i));
+		terminal_write("  ");
+		terminal_putc((char)('A' + i));
+		terminal_write(":  cwd=");
+		terminal_write_line(fat_drive_cwd[i]);
+		any = 1;
+	}
+	if (!any) terminal_write_line("  (none)");
 }
 
 static void cmd_drives(void)
 {
 	int i;
 	char num[16];
-	for (i = 0; i < 2; i++)
+	for (i = 0; i < BLOCKDEV_MAX_DRIVES; i++)
 	{
 		struct block_device *dev = blockdev_get(i);
 		terminal_write("  drive ");
 		terminal_putc((char)('0' + i));
 		terminal_write(" (");
-		terminal_write(i == 0 ? "primary master" : "primary slave ");
+		terminal_write(ata_drive_label(i));
 		terminal_write("): ");
 		if (dev != (void *)0 && dev->present)
 		{
@@ -8321,8 +9392,60 @@ static void cmd_drives(void)
 	}
 }
 
-static void cmd_fatunmount(void)
+static void cmd_fatunmount(const char *args)
 {
+	char tok[16];
+	const char *p;
+	int drive_index;
+	int i;
+	int fallback = -1;
+
+	p = read_token(args, tok, sizeof(tok));
+	if (p == (void *)0)
+	{
+		terminal_write_line("fatunmount: argument too long");
+		return;
+	}
+	if (tok[0] != '\0')
+	{
+		if (parse_mount_target_drive(tok, &drive_index) != 0 || skip_spaces(p)[0] != '\0')
+		{
+			terminal_write_line("fatunmount: Usage: fatunmount [hd#|A:]");
+			return;
+		}
+		fat_registered_drive_mask &= ~(1U << (unsigned int)drive_index);
+		if (fat_mounted_drive_index == drive_index && fat32_is_mounted())
+		{
+			fat32_unmount();
+			fat_mounted_drive_index = -1;
+			for (i = 0; i < BLOCKDEV_MAX_DRIVES; i++)
+			{
+				if ((fat_registered_drive_mask & (1U << (unsigned int)i)) != 0U)
+				{
+					fallback = i;
+					break;
+				}
+			}
+			if (fallback >= 0 && fat_mount_drive_now(fallback, 1) != 0)
+			{
+				vfs_prefer_fat_root = 0;
+			}
+			else if (fallback < 0)
+			{
+				vfs_prefer_fat_root = 0;
+				fat_cwd[0] = '/';
+				fat_cwd[1] = '\0';
+			}
+		}
+		/* Update active drive if we just removed it */
+		if (drive_index == fat_active_drive_index)
+			fat_active_drive_index = (fallback >= 0) ? fallback : -1;
+		terminal_write("fatunmount: removed drive ");
+		terminal_putc((char)('0' + drive_index));
+		terminal_write_line(" mount root");
+		return;
+	}
+
 	if (!fat32_is_mounted())
 	{
 		terminal_write_line("fatunmount: not mounted");
@@ -8331,6 +9454,9 @@ static void cmd_fatunmount(void)
 
 	fat32_unmount();
 	vfs_prefer_fat_root = 0;
+	fat_mounted_drive_index = -1;
+	fat_active_drive_index = -1;
+	fat_registered_drive_mask = 0;
 	fat_cwd[0] = '/';
 	fat_cwd[1] = '\0';
 	terminal_write_line("fatunmount: done");
@@ -9289,7 +10415,7 @@ static int ramfs_used_name_contains(char used[][16], int used_count, const char 
 static void ramfs_used_name_add(char used[][16], int *used_count, const char *name)
 {
 	unsigned long i = 0;
-	if (*used_count >= 128) return;
+	if (*used_count >= RAMFS2FAT_USED_MAX) return;
 	while (name[i] != '\0' && i + 1 < 16)
 	{
 		used[*used_count][i] = fat83_safe_upper(name[i]);
@@ -9299,11 +10425,48 @@ static void ramfs_used_name_add(char used[][16], int *used_count, const char *na
 	(*used_count)++;
 }
 
+static void ramfs2fat_report_error(const char *reason, const char *src, const char *dst)
+{
+	const char *fat_reason = fat32_last_error();
+	terminal_write("ramfs2fat: ");
+	terminal_write(reason);
+	if (fat_reason != (void *)0 && fat_reason[0] != '\0')
+	{
+		terminal_write(" (");
+		terminal_write(fat_reason);
+		terminal_write(")");
+	}
+	if (src != (void *)0 && src[0] != '\0')
+	{
+		terminal_write(" src=");
+		terminal_write(src);
+	}
+	if (dst != (void *)0 && dst[0] != '\0')
+	{
+		terminal_write(" dst=");
+		terminal_write(dst);
+	}
+	terminal_putc('\n');
+}
+
+static void terminal_write_fat_failure(const char *prefix)
+{
+	const char *fat_reason = fat32_last_error();
+	terminal_write(prefix);
+	if (fat_reason != (void *)0 && fat_reason[0] != '\0')
+	{
+		terminal_write(" (");
+		terminal_write(fat_reason);
+		terminal_write(")");
+	}
+	terminal_putc('\n');
+}
+
 static void ramfs_copy_to_fat_r(const char *rpath, const char *fpath, int *copied, int *errors, int depth, int map_only)
 {
-	char names[64][FS_NAME_MAX + 2];
-	int types[64];
-	char used_names[128][16];
+	char names[RAMFS2FAT_BATCH_MAX][FS_NAME_MAX + 2];
+	int types[RAMFS2FAT_BATCH_MAX];
+	char used_names[RAMFS2FAT_USED_MAX][16];
 	int used_count = 0;
 	int count;
 	int i;
@@ -9311,29 +10474,12 @@ static void ramfs_copy_to_fat_r(const char *rpath, const char *fpath, int *copie
 	if (depth > 16) return;
 	if (terminal_cancel_requested) return;
 	count = 0;
-	if (fs_ls(rpath, names, types, 64, &count) != 0) return;
+	if (fs_ls(rpath, names, types, RAMFS2FAT_BATCH_MAX, &count) != 0) return;
 
-	/* seed collision table with already-existing FAT entries in this directory */
-	{
-		char fat_names[64][40];
-		int fat_count = 0;
-		if (fat32_ls_path(fpath, fat_names, 64, &fat_count) == 0)
-		{
-			for (i = 0; i < fat_count && used_count < 128; i++)
-			{
-				char clean[16];
-				unsigned long j = 0;
-				while (fat_names[i][j] != '\0' && fat_names[i][j] != '/' && j + 1 < sizeof(clean))
-				{
-					clean[j] = fat83_safe_upper(fat_names[i][j]);
-					j++;
-				}
-				clean[j] = '\0';
-				if (clean[0] != '\0' && !ramfs_used_name_contains(used_names, used_count, clean))
-					ramfs_used_name_add(used_names, &used_count, clean);
-			}
-		}
-	}
+	/*
+	 * Track only names chosen during this sync pass so repeated runs update
+	 * existing FAT files in-place (instead of creating APP~1, APP~2, ...).
+	 */
 
 	for (i = 0; i < count; i++)
 	{
@@ -9402,7 +10548,26 @@ static void ramfs_copy_to_fat_r(const char *rpath, const char *fpath, int *copie
 
 		if (types[i] == 1) /* directory */
 		{
-			if (!map_only) fat32_mkdir_path(child_fpath); /* ignore error — may already exist */
+			if (!map_only)
+			{
+				int dst_is_dir = 0;
+				unsigned long dst_size = 0;
+				if (fat32_stat_path(child_fpath, &dst_is_dir, &dst_size) == 0)
+				{
+					if (!dst_is_dir)
+					{
+						ramfs2fat_report_error("type conflict (file where directory expected)", child_rpath, child_fpath);
+						(*errors)++;
+						continue;
+					}
+				}
+				else if (fat32_mkdir_path(child_fpath) != 0)
+				{
+					ramfs2fat_report_error("mkdir failed", child_rpath, child_fpath);
+					(*errors)++;
+					continue;
+				}
+			}
 			ramfs_copy_to_fat_r(child_rpath, child_fpath, copied, errors, depth + 1, map_only);
 		}
 		else /* file */
@@ -9417,17 +10582,47 @@ static void ramfs_copy_to_fat_r(const char *rpath, const char *fpath, int *copie
 			}
 			else
 			{
-				unsigned char data[FS_MAX_FILE_SIZE];
+				int dst_is_dir = 0;
+				unsigned long dst_size = 0;
 				unsigned long size;
-				size = 0;
-				if (fs_read_file(child_rpath, data, sizeof(data), &size) == 0)
+				int write_ok = 0;
+				if (fat32_stat_path(child_fpath, &dst_is_dir, &dst_size) == 0 && dst_is_dir)
 				{
-					if (fat32_write_file_path(child_fpath, data, size) == 0)
-						(*copied)++;
-					else
-						(*errors)++;
+					ramfs2fat_report_error("type conflict (directory where file expected)", child_rpath, child_fpath);
+					(*errors)++;
+					continue;
 				}
-				else (*errors)++;
+				size = 0;
+				if (fs_read_file(child_rpath, ramfs2fat_copy_buf, sizeof(ramfs2fat_copy_buf), &size) == 0)
+				{
+					if (fat32_write_file_path(child_fpath, ramfs2fat_copy_buf, size) == 0)
+					{
+						write_ok = 1;
+					}
+					else if (fat32_stat_path(child_fpath, &dst_is_dir, &dst_size) == 0 && !dst_is_dir)
+					{
+						if (fat32_remove_path(child_fpath) == 0 &&
+							fat32_write_file_path(child_fpath, ramfs2fat_copy_buf, size) == 0)
+						{
+							write_ok = 1;
+						}
+					}
+
+					if (write_ok)
+					{
+						(*copied)++;
+					}
+					else
+					{
+						ramfs2fat_report_error("write failed (replace retry failed)", child_rpath, child_fpath);
+						(*errors)++;
+					}
+				}
+				else
+				{
+					ramfs2fat_report_error("read failed", child_rpath, child_fpath);
+					(*errors)++;
+				}
 			}
 		}
 	}
@@ -9566,6 +10761,453 @@ static void cmd_fatls(void)
 	}
 }
 
+static int fatstress_build_path(unsigned int slot, char *path, unsigned long path_size)
+{
+	char n[16];
+	unsigned long i = 0;
+	unsigned long j = 0;
+	if (path_size < 9) return -1;
+	path[i++] = '/';
+	path[i++] = 'F';
+	path[i++] = 'S';
+	uint_to_dec((unsigned long)slot, n, sizeof(n));
+	while (n[j] != '\0')
+	{
+		if (i + 1 >= path_size) return -1;
+		path[i++] = n[j++];
+	}
+	if (i + 5 >= path_size) return -1;
+	path[i++] = '.';
+	path[i++] = 'R';
+	path[i++] = 'E';
+	path[i++] = 'C';
+	path[i] = '\0';
+	return 0;
+}
+
+static void cmd_fatstress(const char *args)
+{
+	unsigned int rounds = 200;
+	unsigned int i;
+	unsigned int failures = 0;
+	unsigned int deleted = 0;
+	unsigned int verbose = 0;
+	unsigned int progress_every = 200;
+	unsigned int payload_size = 32;
+	unsigned int slots = 64;
+	unsigned int delete_every = 8;
+	char tok[16];
+	char n[16];
+	char path[32];
+	const char *p;
+
+	if (!fat32_is_mounted())
+	{
+		terminal_write_line("fatstress: not mounted (run fatmount)");
+		return;
+	}
+
+	p = args;
+	for (;;)
+	{
+		unsigned int parsed;
+		p = read_token(p, tok, sizeof(tok));
+		if (p == (void *)0)
+		{
+			terminal_write_line("Usage: fatstress [rounds] [-v] [-p <n>] [-s <bytes>] [-k <slots>] [-d <n>]");
+			return;
+		}
+		if (tok[0] == '\0') break;
+		if (string_equals(tok, "-v"))
+		{
+			verbose = 1;
+			continue;
+		}
+		if (string_equals(tok, "-p"))
+		{
+			char p_tok[16];
+			p = read_token(p, p_tok, sizeof(p_tok));
+			if (p == (void *)0 || p_tok[0] == '\0' || parse_dec_u32(p_tok, &parsed) != 0 || parsed == 0 || parsed > 100000U)
+			{
+				terminal_write_line("Usage: fatstress [rounds] [-v] [-p <n>] [-s <bytes>] [-k <slots>] [-d <n>]");
+				return;
+			}
+			progress_every = parsed;
+			continue;
+		}
+		if (string_equals(tok, "-s"))
+		{
+			char s_tok[16];
+			p = read_token(p, s_tok, sizeof(s_tok));
+			if (p == (void *)0 || s_tok[0] == '\0' || parse_dec_u32(s_tok, &parsed) != 0 || parsed == 0 || parsed > FATSTRESS_MAX_PAYLOAD)
+			{
+				terminal_write_line("Usage: fatstress [rounds] [-v] [-p <n>] [-s <bytes>] [-k <slots>] [-d <n>]");
+				return;
+			}
+			payload_size = parsed;
+			continue;
+		}
+		if (string_equals(tok, "-k"))
+		{
+			char k_tok[16];
+			p = read_token(p, k_tok, sizeof(k_tok));
+			if (p == (void *)0 || k_tok[0] == '\0' || parse_dec_u32(k_tok, &parsed) != 0 || parsed == 0 || parsed > 9999U)
+			{
+				terminal_write_line("Usage: fatstress [rounds] [-v] [-p <n>] [-s <bytes>] [-k <slots>] [-d <n>]");
+				return;
+			}
+			slots = parsed;
+			continue;
+		}
+		if (string_equals(tok, "-d"))
+		{
+			char d_tok[16];
+			p = read_token(p, d_tok, sizeof(d_tok));
+			if (p == (void *)0 || d_tok[0] == '\0' || parse_dec_u32(d_tok, &parsed) != 0 || parsed == 0 || parsed > 100000U)
+			{
+				terminal_write_line("Usage: fatstress [rounds] [-v] [-p <n>] [-s <bytes>] [-k <slots>] [-d <n>]");
+				return;
+			}
+			delete_every = parsed;
+			continue;
+		}
+
+		if (parse_dec_u32(tok, &parsed) != 0 || parsed == 0 || parsed > 100000U)
+		{
+			terminal_write_line("Usage: fatstress [rounds] [-v] [-p <n>] [-s <bytes>] [-k <slots>] [-d <n>]");
+			return;
+		}
+		rounds = parsed;
+	}
+
+	terminal_write("fatstress: rounds=");
+	uint_to_dec((unsigned long)rounds, n, sizeof(n));
+	terminal_write(n);
+	terminal_write(" verbose=");
+	terminal_write(verbose ? "on" : "off");
+	terminal_write(" progress=");
+	uint_to_dec((unsigned long)progress_every, n, sizeof(n));
+	terminal_write(n);
+	terminal_write(" payload=");
+	uint_to_dec((unsigned long)payload_size, n, sizeof(n));
+	terminal_write(n);
+	terminal_write(" slots=");
+	uint_to_dec((unsigned long)slots, n, sizeof(n));
+	terminal_write(n);
+	terminal_write(" del=");
+	uint_to_dec((unsigned long)delete_every, n, sizeof(n));
+	terminal_write_line(n);
+
+	terminal_take_cancel_request();
+	for (i = 0; i < rounds; i++)
+	{
+		unsigned long verify_len = 0;
+		unsigned long j;
+		unsigned int progress_now = (i == 0U) || (((i + 1U) % progress_every) == 0U);
+		unsigned int slot = i % slots;
+
+		terminal_poll_control_hotkeys();
+		if (terminal_take_cancel_request())
+		{
+			terminal_write_line("fatstress: canceled");
+			break;
+		}
+
+		if (fatstress_build_path(slot, path, sizeof(path)) != 0)
+		{
+			terminal_write_line("fatstress: internal path overflow");
+			failures++;
+			break;
+		}
+
+		if (verbose && progress_now)
+		{
+			unsigned long free_bytes = 0;
+			unsigned long free_kib = 0;
+			terminal_write("fatstress: round ");
+			uint_to_dec((unsigned long)(i + 1U), n, sizeof(n));
+			terminal_write(n);
+			terminal_write(" path=");
+			terminal_write(path);
+			if (fat32_get_free_bytes(&free_bytes) == 0)
+			{
+				free_kib = free_bytes / 1024UL;
+				terminal_write(" free_kib=");
+				uint_to_dec(free_kib, n, sizeof(n));
+				terminal_write(n);
+			}
+			terminal_putc('\n');
+		}
+
+		for (j = 0; j < payload_size; j++)
+		{
+			fatstress_payload_buf[j] = (unsigned char)(((unsigned long)i * 17UL + (unsigned long)slot * 31UL + j * 7UL) & 0xFFUL);
+		}
+
+		if (fat32_write_file_path(path, fatstress_payload_buf, payload_size) != 0)
+		{
+			failures++;
+			terminal_write("fatstress: write failed at ");
+			terminal_write(path);
+			if (fat32_last_error()[0] != '\0')
+			{
+				terminal_write(" (");
+				terminal_write(fat32_last_error());
+				terminal_write(")");
+			}
+			terminal_putc('\n');
+			break;
+		}
+		if (fat32_read_file_path(path, fatstress_verify_buf, payload_size, &verify_len) != 0)
+		{
+			failures++;
+			terminal_write("fatstress: read failed at ");
+			terminal_write(path);
+			if (fat32_last_error()[0] != '\0')
+			{
+				terminal_write(" (");
+				terminal_write(fat32_last_error());
+				terminal_write(")");
+			}
+			terminal_putc('\n');
+			break;
+		}
+		if (verify_len != payload_size)
+		{
+			failures++;
+			terminal_write("fatstress: size mismatch at ");
+			terminal_write_line(path);
+			break;
+		}
+		for (j = 0; j < payload_size; j++)
+		{
+			if (fatstress_verify_buf[j] != fatstress_payload_buf[j])
+			{
+				failures++;
+				terminal_write("fatstress: data mismatch at ");
+				terminal_write_line(path);
+				i = rounds;
+				break;
+			}
+		}
+
+		if (delete_every > 0U && ((i % delete_every) == (delete_every - 1U)))
+		{
+			if (fat32_remove_path(path) == 0)
+			{
+				deleted++;
+				if (verbose && progress_now)
+				{
+					terminal_write("fatstress: deleted ");
+					terminal_write_line(path);
+				}
+			}
+		}
+	}
+
+	for (i = 0; i < slots; i++)
+	{
+		if (fatstress_build_path(i, path, sizeof(path)) != 0) break;
+		if (fat32_remove_path(path) == 0) deleted++;
+	}
+
+	terminal_write("fatstress: ");
+	if (failures == 0) terminal_write("OK ");
+	else terminal_write("FAILED ");
+	terminal_write("rounds=");
+	uint_to_dec((unsigned long)rounds, n, sizeof(n));
+	terminal_write(n);
+	terminal_write(" deleted=");
+	uint_to_dec((unsigned long)deleted, n, sizeof(n));
+	terminal_write(n);
+	terminal_write(" failures=");
+	uint_to_dec((unsigned long)failures, n, sizeof(n));
+	terminal_write_line(n);
+}
+
+static void cmd_fatperf(const char *args)
+{
+	char tok[64];
+	char tok2[64];
+	char tok3[64];
+	const char *p = args;
+	unsigned int v;
+
+	p = read_token(p, tok, sizeof(tok));
+	if (p == (void *)0)
+	{
+		terminal_write_line("Usage: fatperf [show|batch <1..16>|cache <on|off>|cache data|fat <on|off>|flush|dirbench [path] [list]]");
+		return;
+	}
+
+	if (tok[0] == '\0' || string_equals(tok, "show"))
+	{
+		char n[16];
+		terminal_write("fatperf: batch=");
+		uint_to_dec((unsigned long)fat32_get_io_batch_sectors(), n, sizeof(n));
+		terminal_write(n);
+		terminal_write(" data-cache=");
+		terminal_write(fat32_get_data_cache_enabled() ? "on" : "off");
+		terminal_write(" fat-cache=");
+		terminal_write_line(fat32_get_fat_cache_enabled() ? "on" : "off");
+		return;
+	}
+
+	if (string_equals(tok, "batch"))
+	{
+		p = read_token(p, tok2, sizeof(tok2));
+		if (p == (void *)0 || tok2[0] == '\0' || parse_dec_u32(tok2, &v) != 0 || fat32_set_io_batch_sectors(v) != 0)
+		{
+			terminal_write_line("Usage: fatperf batch <1..16>");
+			return;
+		}
+		terminal_write("fatperf: batch=");
+		uint_to_dec((unsigned long)fat32_get_io_batch_sectors(), tok2, sizeof(tok2));
+		terminal_write_line(tok2);
+		return;
+	}
+
+	if (string_equals(tok, "cache"))
+	{
+		p = read_token(p, tok2, sizeof(tok2));
+		if (p == (void *)0 || tok2[0] == '\0')
+		{
+			terminal_write_line("Usage: fatperf cache <on|off>");
+			terminal_write_line("   or: fatperf cache data|fat <on|off>");
+			return;
+		}
+		if (string_equals(tok2, "on") || string_equals(tok2, "off"))
+		{
+			int on = string_equals(tok2, "on") ? 1 : 0;
+			fat32_set_data_cache_enabled(on);
+			fat32_set_fat_cache_enabled(on);
+			terminal_write_line("fatperf: cache updated");
+			return;
+		}
+		if (string_equals(tok2, "data") || string_equals(tok2, "fat"))
+		{
+			p = read_token(p, tok3, sizeof(tok3));
+			if (p == (void *)0 || (!string_equals(tok3, "on") && !string_equals(tok3, "off")))
+			{
+				terminal_write_line("Usage: fatperf cache data|fat <on|off>");
+				return;
+			}
+			if (string_equals(tok2, "data")) fat32_set_data_cache_enabled(string_equals(tok3, "on"));
+			else fat32_set_fat_cache_enabled(string_equals(tok3, "on"));
+			terminal_write_line("fatperf: cache updated");
+			return;
+		}
+		terminal_write_line("Usage: fatperf cache <on|off>");
+		terminal_write_line("   or: fatperf cache data|fat <on|off>");
+		return;
+	}
+
+	if (string_equals(tok, "flush"))
+	{
+		fat32_flush_cache();
+		terminal_write_line("fatperf: caches flushed");
+		return;
+	}
+
+	if (string_equals(tok, "dirbench"))
+	{
+		unsigned int old_batch = fat32_get_io_batch_sectors();
+		unsigned int batches[16] = {1U, 2U, 4U, 8U, 16U};
+		unsigned int batch_count = 5U;
+		char path[128];
+		char list[64];
+		char argbuf[196];
+		unsigned int i;
+
+		path[0] = '\0';
+		list[0] = '\0';
+		p = read_token(p, path, sizeof(path));
+		if (p == (void *)0)
+		{
+			terminal_write_line("Usage: fatperf dirbench [path] [1,2,4,8,16]");
+			return;
+		}
+		if (path[0] == '\0')
+		{
+			path[0] = '.';
+			path[1] = '\0';
+		}
+		else
+		{
+			p = read_token(p, list, sizeof(list));
+			if (p == (void *)0)
+			{
+				terminal_write_line("Usage: fatperf dirbench [path] [1,2,4,8,16]");
+				return;
+			}
+		}
+
+		if (list[0] != '\0')
+		{
+			unsigned int parsed[16];
+			unsigned int parsed_count = 0;
+			unsigned long pos = 0;
+			while (list[pos] != '\0')
+			{
+				char nbuf[12];
+				unsigned long n = 0;
+				while (list[pos] >= '0' && list[pos] <= '9' && n + 1 < sizeof(nbuf)) nbuf[n++] = list[pos++];
+				nbuf[n] = '\0';
+				if (n == 0 || parse_dec_u32(nbuf, &v) != 0 || fat32_set_io_batch_sectors(v) != 0 || parsed_count >= 16U)
+				{
+					fat32_set_io_batch_sectors(old_batch);
+					terminal_write_line("fatperf: invalid list (use values 1..16, comma-separated)");
+					return;
+				}
+				parsed[parsed_count++] = v;
+				if (list[pos] == ',') pos++;
+				else if (list[pos] != '\0')
+				{
+					fat32_set_io_batch_sectors(old_batch);
+					terminal_write_line("fatperf: invalid list format");
+					return;
+				}
+			}
+			for (i = 0; i < parsed_count; i++) batches[i] = parsed[i];
+			batch_count = parsed_count;
+		}
+
+		terminal_write_line("fatperf: dirbench (ticks)");
+		for (i = 0; i < batch_count; i++)
+		{
+			unsigned long t0;
+			unsigned long t1;
+			char n[16];
+			unsigned long w = 0;
+			unsigned long pi = 0;
+
+			if (fat32_set_io_batch_sectors(batches[i]) != 0) continue;
+
+			argbuf[w++] = '/';
+			argbuf[w++] = 'b';
+			argbuf[w++] = ' ';
+			while (path[pi] != '\0' && w + 1 < sizeof(argbuf)) { argbuf[w++] = path[pi++]; }
+			argbuf[w] = '\0';
+
+			t0 = timer_ticks();
+			cmd_dir(argbuf);
+			t1 = timer_ticks();
+
+			terminal_write("  batch=");
+			uint_to_dec((unsigned long)batches[i], n, sizeof(n));
+			terminal_write(n);
+			terminal_write(" dt=");
+			uint_to_dec(t1 - t0, n, sizeof(n));
+			terminal_write_line(n);
+		}
+		fat32_set_io_batch_sectors(old_batch);
+		terminal_write_line("fatperf: dirbench done");
+		return;
+	}
+
+	terminal_write_line("Usage: fatperf [show|batch <1..16>|cache <on|off>|cache data|fat <on|off>|flush|dirbench [path] [list]]");
+}
+
 static void cmd_fatcat(const char *args)
 {
 	char path[128];
@@ -9587,9 +11229,15 @@ static void cmd_fatcat(const char *args)
 		return;
 	}
 
-	if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0 || fat32_read_file_path(full_path, data, sizeof(data) - 1, &size) != 0)
+	if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
 	{
-		terminal_write_line("fatcat: read failed");
+		terminal_write_line("fatcat: bad path");
+		return;
+	}
+
+	if (fat32_read_file_path(full_path, data, sizeof(data) - 1, &size) != 0)
+	{
+		terminal_write_fat_failure("fatcat: read failed");
 		return;
 	}
 
@@ -9616,9 +11264,14 @@ static void cmd_fattouch(const char *args)
 		terminal_write_line("fattouch: not mounted (run fatmount)");
 		return;
 	}
-	if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0 || fat32_touch_file_path(full_path) != 0)
+	if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
 	{
-		terminal_write_line("fattouch: failed");
+		terminal_write_line("fattouch: bad path");
+		return;
+	}
+	if (fat32_touch_file_path(full_path) != 0)
+	{
+		terminal_write_fat_failure("fattouch: failed");
 		return;
 	}
 	terminal_write_line("fattouch: done");
@@ -9647,9 +11300,14 @@ static void cmd_fatwrite(const char *args)
 		return;
 	}
 	while (p[len] != '\0') len++;
-	if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0 || fat32_write_file_path(full_path, (const unsigned char *)p, len) != 0)
+	if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
 	{
-		terminal_write_line("fatwrite: failed");
+		terminal_write_line("fatwrite: bad path");
+		return;
+	}
+	if (fat32_write_file_path(full_path, (const unsigned char *)p, len) != 0)
+	{
+		terminal_write_fat_failure("fatwrite: failed");
 		return;
 	}
 	terminal_write_line("fatwrite: done");
@@ -9725,7 +11383,7 @@ static void cmd_fatattr(const char *args)
 	{
 		if (fat32_set_attr_path(full_path, set_mask, clear_mask, &attr) != 0)
 		{
-			terminal_write_line("fatattr: set failed");
+			terminal_write_fat_failure("fatattr: set failed");
 			return;
 		}
 	}
@@ -9733,7 +11391,7 @@ static void cmd_fatattr(const char *args)
 	{
 		if (fat32_get_attr_path(full_path, &attr) != 0)
 		{
-			terminal_write_line("fatattr: read failed");
+			terminal_write_fat_failure("fatattr: read failed");
 			return;
 		}
 	}
@@ -9766,9 +11424,14 @@ static void cmd_fatrm(const char *args)
 		terminal_write_line("fatrm: not mounted (run fatmount)");
 		return;
 	}
-	if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0 || fat32_remove_path(full_path) != 0)
+	if (fat_resolve_path(path, full_path, sizeof(full_path)) != 0)
 	{
-		terminal_write_line("fatrm: failed");
+		terminal_write_line("fatrm: bad path");
+		return;
+	}
+	if (fat32_remove_path(full_path) != 0)
+	{
+		terminal_write_fat_failure("fatrm: failed");
 		return;
 	}
 	terminal_write_line("fatrm: done");
@@ -9862,7 +11525,7 @@ static void run_command(void)
 	{
 		if (input_buffer[3] == '\0') cmd_dir("");
 		else if (input_buffer[3] == ' ') cmd_dir(input_buffer + 4);
-		else terminal_write_line("Usage: dir [/b] [/w] [/s] [path]");
+		else terminal_write_line("Usage: dir [/b] [/w] [/s] [/rN] [path]");
 	}
 	else if (string_starts_with(input_buffer, "tree"))
 	{
@@ -9948,7 +11611,7 @@ static void run_command(void)
 	else if (string_starts_with(input_buffer, "run"))
 	{
 		if (input_buffer[3] == ' ') cmd_run(input_buffer + 4);
-		else terminal_write_line("Usage: run [-x] <path>");
+		else terminal_write_line("Usage: run [-x] [-t <1..3600>] <path>");
 	}
 	else if (string_starts_with(input_buffer, "basic"))
 	{
@@ -9984,19 +11647,25 @@ static void run_command(void)
 	else if (string_starts_with(input_buffer, "pagefault"))
 	{
 		if (input_buffer[9] == ' ') cmd_pagefault(input_buffer + 10);
-		else terminal_write_line("Usage: pagefault <read|write|exec>");
+		else terminal_write_line("Usage: pagefault <read|write|exec> [yes]");
 	}
-	else if (string_equals(input_buffer, "gpfault"))
+	else if (string_starts_with(input_buffer, "gpfault"))
 	{
-		cmd_gpfault("");
+		if (input_buffer[7] == '\0') cmd_gpfault("");
+		else if (input_buffer[7] == ' ') cmd_gpfault(input_buffer + 8);
+		else terminal_write_line("Usage: gpfault [yes]");
 	}
-	else if (string_equals(input_buffer, "udfault"))
+	else if (string_starts_with(input_buffer, "udfault"))
 	{
-		cmd_udfault("");
+		if (input_buffer[7] == '\0') cmd_udfault("");
+		else if (input_buffer[7] == ' ') cmd_udfault(input_buffer + 8);
+		else terminal_write_line("Usage: udfault [yes]");
 	}
-	else if (string_equals(input_buffer, "doublefault"))
+	else if (string_starts_with(input_buffer, "doublefault"))
 	{
-		cmd_doublefault("");
+		if (input_buffer[11] == '\0') cmd_doublefault("");
+		else if (input_buffer[11] == ' ') cmd_doublefault(input_buffer + 12);
+		else terminal_write_line("Usage: doublefault [yes]");
 	}
 	else if (string_equals(input_buffer, "exceptstat"))
 	{
@@ -10029,6 +11698,11 @@ static void run_command(void)
 	{
 		if (input_buffer[7] == ' ') cmd_elfaddr(input_buffer + 8);
 		else terminal_write_line("Usage: elfaddr <path> <hex-address>");
+	}
+	else if (string_starts_with(input_buffer, "elfcheck"))
+	{
+		if (input_buffer[8] == ' ') cmd_elfcheck(input_buffer + 9);
+		else terminal_write_line("Usage: elfcheck <path>");
 	}
 	else if (string_starts_with(input_buffer, "execstress"))
 	{
@@ -10100,7 +11774,7 @@ static void run_command(void)
 	{
 		if (input_buffer[7] == '\0') cmd_autorun("show");
 		else if (input_buffer[7] == ' ') cmd_autorun(input_buffer + 8);
-		else terminal_write_line("Usage: autorun [show|off|always|once|rearm|stop|run|delay <0..3600>]");
+		else terminal_write_line("Usage: autorun [show|log|off|always|once|rearm|stop|run|safe <on|off|show>|delay <0..3600>]");
 	}
 	else if (string_starts_with(input_buffer, "hexdump"))
 	{
@@ -10128,11 +11802,35 @@ static void run_command(void)
 	{
 		if (input_buffer[8] == '\0') cmd_fatmount((void *)0);
 		else if (input_buffer[8] == ' ') cmd_fatmount(input_buffer + 9);
-		else terminal_write_line("Usage: fatmount [0|1]");
+		else terminal_write_line("Usage: fatmount <0..3|hd#> [/hd#|A:]");
+	}
+	else if (string_starts_with(input_buffer, "mtn") || string_starts_with(input_buffer, "mnt") || string_starts_with(input_buffer, "mount"))
+	{
+		unsigned long cmd_len = string_starts_with(input_buffer, "mount") ? 5UL : 3UL;
+		if (input_buffer[cmd_len] == '\0') cmd_fatmount((void *)0);
+		else if (input_buffer[cmd_len] == ' ') cmd_fatmount(input_buffer + cmd_len + 1UL);
+		else terminal_write_line("Usage: mtn|mnt|mount <hd#> [/hd#|A:]");
+	}
+	else if (string_equals(input_buffer, "fatwhere"))
+	{
+		cmd_fatwhere();
 	}
 	else if (string_equals(input_buffer, "fatunmount"))
 	{
-		cmd_fatunmount();
+		cmd_fatunmount("");
+	}
+	else if (string_starts_with(input_buffer, "fatunmount"))
+	{
+		if (input_buffer[10] == '\0') cmd_fatunmount("");
+		else if (input_buffer[10] == ' ') cmd_fatunmount(input_buffer + 11);
+		else terminal_write_line("Usage: fatunmount [hd#|A:]");
+	}
+	else if (string_starts_with(input_buffer, "umtn") || string_starts_with(input_buffer, "umnt") || string_starts_with(input_buffer, "umount"))
+	{
+		unsigned long cmd_len = string_starts_with(input_buffer, "umount") ? 6UL : 4UL;
+		if (input_buffer[cmd_len] == '\0') cmd_fatunmount("");
+		else if (input_buffer[cmd_len] == ' ') cmd_fatunmount(input_buffer + cmd_len + 1UL);
+		else terminal_write_line("Usage: umtn|umnt|umount [hd#|A:]");
 	}
 	else if (string_equals(input_buffer, "fatls"))
 	{
@@ -10152,6 +11850,18 @@ static void run_command(void)
 	{
 		if (input_buffer[8] == ' ') cmd_fatwrite(input_buffer + 9);
 		else terminal_write_line("Usage: fatwrite <path> <text>");
+	}
+	else if (string_starts_with(input_buffer, "fatstress"))
+	{
+		if (input_buffer[9] == '\0') cmd_fatstress((void *)0);
+		else if (input_buffer[9] == ' ') cmd_fatstress(input_buffer + 10);
+		else terminal_write_line("Usage: fatstress [rounds] [-v] [-p <n>] [-s <bytes>] [-k <slots>] [-d <n>]");
+	}
+	else if (string_starts_with(input_buffer, "fatperf"))
+	{
+		if (input_buffer[7] == '\0') cmd_fatperf((void *)0);
+		else if (input_buffer[7] == ' ') cmd_fatperf(input_buffer + 8);
+		else terminal_write_line("Usage: fatperf [show|batch <1..16>|cache <on|off>|cache data|fat <on|off>|flush|dirbench [path] [list]]");
 	}
 	else if (string_starts_with(input_buffer, "fatattr"))
 	{
@@ -10242,10 +11952,22 @@ static void run_command(void)
 	{
 		do_reboot();
 	}
-	else if (string_equals(input_buffer, "panic"))
+	else if (string_starts_with(input_buffer, "panic"))
 	{
-		terminal_write_line("[SYSTEM] deliberate panic requested");
-		trigger_forced_panic();
+		if (input_buffer[5] == '\0' || input_buffer[5] == ' ')
+		{
+			const char *panic_args = (input_buffer[5] == ' ') ? (input_buffer + 6) : "";
+			if (!confirm_dangerous_action(panic_args, "panic"))
+			{
+				/* no-op */
+			}
+			else
+			{
+				terminal_write_line("[SYSTEM] deliberate panic requested");
+				trigger_forced_panic();
+			}
+		}
+		else terminal_write_line("Usage: panic [yes]");
 	}
 	else if (string_equals(input_buffer, "quit") ||
 	         string_equals(input_buffer, "exit") ||
@@ -10868,6 +12590,7 @@ void terminal_init(unsigned long mb2_info_addr)
 	serial_ready = serial_init();
 	memmap_init(mb2_info_addr);
 	terminal_auto_fatmount();
+	terminal_autorun_boot_begin();
 	screen_set_style(SCREEN_STYLE_BOLD);
 	terminal_write_colored("TG11 OS (64-bit)", color_bold_variant(terminal_text_color));
 	screen_set_style(0);
@@ -10928,6 +12651,7 @@ void terminal_poll(void)
 		scancode_queue_tail = (scancode_queue_tail + 1) % SCANCODE_QUEUE_SIZE;
 		handle_scancode(sc);
 	}
+	terminal_autorun_boot_heartbeat();
 	terminal_poll_boot_autorun();
 }
 

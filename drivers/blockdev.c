@@ -14,6 +14,14 @@ static int drive0_write(unsigned int lba, const unsigned char *buf)
 {
 	return ata_write_sector28_drive(0, lba, buf);
 }
+static int drive0_read_sectors(unsigned int lba, int count, unsigned char *buf)
+{
+	return ata_read_sectors_drive(0, lba, count, buf);
+}
+static int drive0_write_sectors(unsigned int lba, int count, const unsigned char *buf)
+{
+	return ata_write_sectors_drive(0, lba, count, buf);
+}
 static int drive1_read(unsigned int lba, unsigned char *buf)
 {
 	return ata_read_sector28_drive(1, lba, buf);
@@ -22,49 +30,117 @@ static int drive1_write(unsigned int lba, const unsigned char *buf)
 {
 	return ata_write_sector28_drive(1, lba, buf);
 }
+static int drive1_read_sectors(unsigned int lba, int count, unsigned char *buf)
+{
+	return ata_read_sectors_drive(1, lba, count, buf);
+}
+static int drive1_write_sectors(unsigned int lba, int count, const unsigned char *buf)
+{
+	return ata_write_sectors_drive(1, lba, count, buf);
+}
+static int drive2_read(unsigned int lba, unsigned char *buf)
+{
+	return ata_read_sector28_drive(2, lba, buf);
+}
+static int drive2_write(unsigned int lba, const unsigned char *buf)
+{
+	return ata_write_sector28_drive(2, lba, buf);
+}
+static int drive2_read_sectors(unsigned int lba, int count, unsigned char *buf)
+{
+	return ata_read_sectors_drive(2, lba, count, buf);
+}
+static int drive2_write_sectors(unsigned int lba, int count, const unsigned char *buf)
+{
+	return ata_write_sectors_drive(2, lba, count, buf);
+}
+static int drive3_read(unsigned int lba, unsigned char *buf)
+{
+	return ata_read_sector28_drive(3, lba, buf);
+}
+static int drive3_write(unsigned int lba, const unsigned char *buf)
+{
+	return ata_write_sector28_drive(3, lba, buf);
+}
+static int drive3_read_sectors(unsigned int lba, int count, unsigned char *buf)
+{
+	return ata_read_sectors_drive(3, lba, count, buf);
+}
+static int drive3_write_sectors(unsigned int lba, int count, const unsigned char *buf)
+{
+	return ata_write_sectors_drive(3, lba, count, buf);
+}
 
-static struct block_device drives[2];
+static struct block_device drives[BLOCKDEV_MAX_DRIVES];
+
+static int (*const drive_read_wrappers[BLOCKDEV_MAX_DRIVES])(unsigned int, unsigned char *) = {
+	drive0_read, drive1_read, drive2_read, drive3_read
+};
+static int (*const drive_write_wrappers[BLOCKDEV_MAX_DRIVES])(unsigned int, const unsigned char *) = {
+	drive0_write, drive1_write, drive2_write, drive3_write
+};
+static int (*const drive_read_sectors_wrappers[BLOCKDEV_MAX_DRIVES])(unsigned int, int, unsigned char *) = {
+	drive0_read_sectors, drive1_read_sectors, drive2_read_sectors, drive3_read_sectors
+};
+static int (*const drive_write_sectors_wrappers[BLOCKDEV_MAX_DRIVES])(unsigned int, int, const unsigned char *) = {
+	drive0_write_sectors, drive1_write_sectors, drive2_write_sectors, drive3_write_sectors
+};
 
 void blockdev_init(void)
 {
 	int i;
-	for (i = 0; i < 2; i++)
+	for (i = 0; i < BLOCKDEV_MAX_DRIVES; i++)
 	{
 		drives[i].present = 0;
 		drives[i].sector_count = 0;
 		drives[i].read_sector = (void *)0;
 		drives[i].write_sector = (void *)0;
+		drives[i].read_sectors = (void *)0;
+		drives[i].write_sectors = (void *)0;
 	}
 
-	/* Probe master first (does the channel reset), then slave */
-	if (ata_init_drive(0) == 0 && ata_is_present_drive(0))
+	/* Probe masters first (channel reset), then slaves on each channel. */
+	for (i = 0; i < BLOCKDEV_MAX_DRIVES; i += 2)
 	{
-		drives[0].present = 1;
-		drives[0].sector_count = ata_get_sector_count_drive(0);
-		drives[0].read_sector = drive0_read;
-		drives[0].write_sector = drive0_write;
+		if (ata_init_drive(i) == 0 && ata_is_present_drive(i))
+		{
+			drives[i].present = 1;
+			drives[i].sector_count = ata_get_sector_count_drive(i);
+			drives[i].read_sector = drive_read_wrappers[i];
+			drives[i].write_sector = drive_write_wrappers[i];
+			drives[i].read_sectors = drive_read_sectors_wrappers[i];
+			drives[i].write_sectors = drive_write_sectors_wrappers[i];
+		}
 	}
 
-	if (ata_init_drive(1) == 0 && ata_is_present_drive(1))
+	for (i = 1; i < BLOCKDEV_MAX_DRIVES; i += 2)
 	{
-		drives[1].present = 1;
-		drives[1].sector_count = ata_get_sector_count_drive(1);
-		drives[1].read_sector = drive1_read;
-		drives[1].write_sector = drive1_write;
+		if (ata_init_drive(i) == 0 && ata_is_present_drive(i))
+		{
+			drives[i].present = 1;
+			drives[i].sector_count = ata_get_sector_count_drive(i);
+			drives[i].read_sector = drive_read_wrappers[i];
+			drives[i].write_sector = drive_write_wrappers[i];
+			drives[i].read_sectors = drive_read_sectors_wrappers[i];
+			drives[i].write_sectors = drive_write_sectors_wrappers[i];
+		}
 	}
 }
 
 int blockdev_count(void)
 {
 	int n = 0;
-	if (drives[0].present) n++;
-	if (drives[1].present) n++;
+	int i;
+	for (i = 0; i < BLOCKDEV_MAX_DRIVES; i++)
+	{
+		if (drives[i].present) n++;
+	}
 	return n;
 }
 
 struct block_device *blockdev_get(int index)
 {
-	if (index < 0 || index > 1) return (void *)0;
+	if (index < 0 || index >= BLOCKDEV_MAX_DRIVES) return (void *)0;
 	return &drives[index];
 }
 

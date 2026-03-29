@@ -117,6 +117,16 @@ static unsigned long align_up_page(unsigned long v)
     return (v + MEMORY_PAGE_SIZE - 1) & ~(MEMORY_PAGE_SIZE - 1);
 }
 
+static int add_overflows_ulong(unsigned long a, unsigned long b)
+{
+    return a + b < a;
+}
+
+static int is_power_of_two_ulong(unsigned long v)
+{
+    return v != 0 && (v & (v - 1)) == 0;
+}
+
 static void rollback_mapped_pages(const unsigned long *virt_pages, const unsigned long *phys_pages, unsigned long count)
 {
     unsigned long i;
@@ -264,6 +274,78 @@ static void collect_load_range(const unsigned char *data, const Elf64_Ehdr *ehdr
 
     if (out_base != (void *)0) *out_base = base;
     if (out_end != (void *)0) *out_end = end;
+}
+
+static int validate_load_segments(const unsigned char *data, unsigned long len, const Elf64_Ehdr *ehdr)
+{
+    unsigned long i;
+    int load_count = 0;
+
+    for (i = 0; i < (unsigned long)ehdr->e_phnum; i++)
+    {
+        const Elf64_Phdr *phdr = (const Elf64_Phdr *)(data + ehdr->e_phoff + i * (unsigned long)ehdr->e_phentsize);
+        unsigned long seg_end;
+        unsigned long page_start;
+        unsigned long page_end;
+        unsigned long j;
+
+        if (phdr->p_type != PT_LOAD) continue;
+        load_count++;
+
+        if (phdr->p_offset + phdr->p_filesz > len)
+            return ELF_ERR_RANGE;
+        if (phdr->p_memsz < phdr->p_filesz)
+            return ELF_ERR_RANGE;
+        if (phdr->p_memsz == 0) continue;
+        if (add_overflows_ulong(phdr->p_vaddr, phdr->p_memsz))
+            return ELF_ERR_RANGE;
+        if (add_overflows_ulong(phdr->p_offset, phdr->p_filesz))
+            return ELF_ERR_RANGE;
+        if (phdr->p_align > 1)
+        {
+            if (!is_power_of_two_ulong(phdr->p_align)) return ELF_ERR_PHDR;
+            if (((unsigned long)phdr->p_vaddr & (phdr->p_align - 1)) != ((unsigned long)phdr->p_offset & (phdr->p_align - 1)))
+                return ELF_ERR_PHDR;
+        }
+
+        seg_end = phdr->p_vaddr + phdr->p_memsz;
+        page_start = phdr->p_vaddr & ~(MEMORY_PAGE_SIZE - 1);
+        page_end = align_up_page(seg_end);
+
+        for (j = i + 1; j < (unsigned long)ehdr->e_phnum; j++)
+        {
+            const Elf64_Phdr *other = (const Elf64_Phdr *)(data + ehdr->e_phoff + j * (unsigned long)ehdr->e_phentsize);
+            unsigned long other_end;
+            unsigned long other_page_start;
+            unsigned long other_page_end;
+
+            if (other->p_type != PT_LOAD || other->p_memsz == 0) continue;
+            if (add_overflows_ulong(other->p_vaddr, other->p_memsz))
+                return ELF_ERR_RANGE;
+
+            other_end = other->p_vaddr + other->p_memsz;
+            other_page_start = other->p_vaddr & ~(MEMORY_PAGE_SIZE - 1);
+            other_page_end = align_up_page(other_end);
+
+            if (page_start < other_page_end && other_page_start < page_end)
+                return ELF_ERR_OVERLAP;
+        }
+    }
+
+    if (load_count == 0) return ELF_ERR_PHDR;
+
+    for (i = 0; i < (unsigned long)ehdr->e_phnum; i++)
+    {
+        const Elf64_Phdr *phdr = (const Elf64_Phdr *)(data + ehdr->e_phoff + i * (unsigned long)ehdr->e_phentsize);
+        unsigned long seg_end;
+
+        if (phdr->p_type != PT_LOAD || phdr->p_memsz == 0) continue;
+        seg_end = phdr->p_vaddr + phdr->p_memsz;
+        if ((unsigned long)ehdr->e_entry >= phdr->p_vaddr && (unsigned long)ehdr->e_entry < seg_end)
+            return ELF_OK;
+    }
+
+    return ELF_ERR_ENTRY;
 }
 
 static void register_active_image(const unsigned char *data, unsigned long len, unsigned long load_base, unsigned long load_end)
@@ -609,6 +691,10 @@ int elf_load(const unsigned char *data, unsigned long len, elf_exec_t *out)
 
     if (get_program_header_window(ehdr, len) != ELF_OK)
         return ELF_ERR_PHDR;
+    {
+        int rc = validate_load_segments(data, len, ehdr);
+        if (rc != ELF_OK) return rc;
+    }
 
     /* Iterate PT_LOAD segments */
     for (i = 0; i < (unsigned long)ehdr->e_phnum; i++)
@@ -627,11 +713,6 @@ int elf_load(const unsigned char *data, unsigned long len, elf_exec_t *out)
         /* Basic bounds check */
         if (ehdr->e_phoff + i * (unsigned long)ehdr->e_phentsize + sizeof(Elf64_Phdr) > len)
             return ELF_ERR_PHDR;
-
-        if (phdr->p_offset + phdr->p_filesz > len)
-            return ELF_ERR_RANGE;
-        if (phdr->p_memsz < phdr->p_filesz)
-            return ELF_ERR_RANGE;
 
         if (phdr->p_memsz == 0) continue;
 
