@@ -36,4 +36,16 @@ void screen_fbfont_reset_custom(void);
 int screen_fbfont_set_custom_glyph(char ch, const unsigned char rows[7]);
 int screen_fbfont_get_custom_glyph(char ch, unsigned char rows[7], int *is_custom);
 
+/* Framebuffer pixel-drawing APIs for GUI */
+int screen_fb_is_active(void);
+unsigned int screen_fb_width(void);
+unsigned int screen_fb_height(void);
+void screen_fb_plot_pixel(unsigned int x, unsigned int y, unsigned int rgb);
+unsigned int screen_fb_read_pixel(unsigned int x, unsigned int y);
+void screen_fb_fill_rect(unsigned int x, unsigned int y, unsigned int w, unsigned int h, unsigned int rgb);
+void screen_fb_draw_char(unsigned int px, unsigned int py, char ch, unsigned int fg, unsigned int bg);
+void screen_fb_draw_string(unsigned int px, unsigned int py, const char *s, unsigned int fg, unsigned int bg);
+unsigned int screen_fb_font_w(void);
+unsigned int screen_fb_cell_h(void);
+
 #endif

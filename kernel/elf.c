@@ -25,6 +25,7 @@ typedef unsigned short Elf64_Half;
 #define EM_X86_64  62
 
 #define PT_LOAD    1
+#define PT_INTERP  3
 
 #define PF_X       0x1
 #define PF_W       0x2
@@ -151,28 +152,12 @@ struct elf_active_image
     int used;
     const unsigned char *data;
     unsigned long len;
+    unsigned long load_bias;
     unsigned long load_base;
     unsigned long load_end;
 };
 
 static struct elf_active_image elf_active_images[ELF_ACTIVE_IMAGE_MAX];
-
-static int validate_elf64_image(const unsigned char *data, unsigned long len, const Elf64_Ehdr **out_ehdr)
-{
-    const Elf64_Ehdr *ehdr;
-
-    if (data == (void *)0 || out_ehdr == (void *)0 || len < sizeof(Elf64_Ehdr))
-        return ELF_ERR_NULL;
-
-    ehdr = (const Elf64_Ehdr *)data;
-    if (!check_magic(ehdr->e_ident)) return ELF_ERR_MAGIC;
-    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) return ELF_ERR_CLASS;
-    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) return ELF_ERR_CLASS;
-    if (ehdr->e_machine != EM_X86_64) return ELF_ERR_ARCH;
-
-    *out_ehdr = ehdr;
-    return ELF_OK;
-}
 
 static int validate_section_headers(const Elf64_Ehdr *ehdr, unsigned long len)
 {
@@ -181,6 +166,28 @@ static int validate_section_headers(const Elf64_Ehdr *ehdr, unsigned long len)
     if (ehdr->e_shoff >= len) return ELF_ERR_SHDR;
     if ((unsigned long)ehdr->e_shnum > ((len - ehdr->e_shoff) / (unsigned long)ehdr->e_shentsize))
         return ELF_ERR_SHDR;
+    return ELF_OK;
+}
+
+static int validate_elf64_image(const unsigned char *data, unsigned long len, const Elf64_Ehdr **out_ehdr)
+{
+    const Elf64_Ehdr *ehdr;
+
+    if (data == (void *)0 || out_ehdr == (void *)0) return ELF_ERR_NULL;
+    if (len < sizeof(Elf64_Ehdr)) return ELF_ERR_MAGIC;
+
+    ehdr = (const Elf64_Ehdr *)data;
+
+    if (!check_magic(ehdr->e_ident)) return ELF_ERR_MAGIC;
+    if (ehdr->e_ident[EI_CLASS] != ELFCLASS64) return ELF_ERR_CLASS;
+    if (ehdr->e_ident[EI_DATA] != ELFDATA2LSB) return ELF_ERR_CLASS;
+    if (ehdr->e_ident[EI_VERSION] != EV_CURRENT) return ELF_ERR_CLASS;
+    if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) return ELF_ERR_TYPE;
+    if (ehdr->e_machine != EM_X86_64) return ELF_ERR_ARCH;
+    if (ehdr->e_version != EV_CURRENT) return ELF_ERR_ARCH;
+    if (ehdr->e_ehsize < sizeof(Elf64_Ehdr)) return ELF_ERR_CLASS;
+
+    *out_ehdr = ehdr;
     return ELF_OK;
 }
 
@@ -281,6 +288,13 @@ static int validate_load_segments(const unsigned char *data, unsigned long len, 
     unsigned long i;
     int load_count = 0;
 
+    /* Reject dynamic-linked binaries before any further validation. */
+    for (i = 0; i < (unsigned long)ehdr->e_phnum; i++)
+    {
+        const Elf64_Phdr *phdr = (const Elf64_Phdr *)(data + ehdr->e_phoff + i * (unsigned long)ehdr->e_phentsize);
+        if (phdr->p_type == PT_INTERP) return ELF_ERR_INTERP;
+    }
+
     for (i = 0; i < (unsigned long)ehdr->e_phnum; i++)
     {
         const Elf64_Phdr *phdr = (const Elf64_Phdr *)(data + ehdr->e_phoff + i * (unsigned long)ehdr->e_phentsize);
@@ -348,7 +362,18 @@ static int validate_load_segments(const unsigned char *data, unsigned long len, 
     return ELF_ERR_ENTRY;
 }
 
-static void register_active_image(const unsigned char *data, unsigned long len, unsigned long load_base, unsigned long load_end)
+static unsigned long find_active_image_bias(const unsigned char *data, unsigned long len)
+{
+    unsigned long i;
+    for (i = 0; i < ELF_ACTIVE_IMAGE_MAX; i++)
+    {
+        if (elf_active_images[i].used && elf_active_images[i].data == data && elf_active_images[i].len == len)
+            return elf_active_images[i].load_bias;
+    }
+    return 0;
+}
+
+static void register_active_image(const unsigned char *data, unsigned long len, unsigned long load_bias, unsigned long load_base, unsigned long load_end)
 {
     unsigned long i;
     unsigned long free_slot = ELF_ACTIVE_IMAGE_MAX;
@@ -359,6 +384,7 @@ static void register_active_image(const unsigned char *data, unsigned long len, 
     {
         if (elf_active_images[i].used && elf_active_images[i].data == data && elf_active_images[i].len == len)
         {
+            elf_active_images[i].load_bias = load_bias;
             elf_active_images[i].load_base = load_base;
             elf_active_images[i].load_end = load_end;
             return;
@@ -370,6 +396,7 @@ static void register_active_image(const unsigned char *data, unsigned long len, 
     elf_active_images[free_slot].used = 1;
     elf_active_images[free_slot].data = data;
     elf_active_images[free_slot].len = len;
+    elf_active_images[free_slot].load_bias = load_bias;
     elf_active_images[free_slot].load_base = load_base;
     elf_active_images[free_slot].load_end = load_end;
 }
@@ -384,6 +411,7 @@ static void unregister_active_image(const unsigned char *data, unsigned long len
             elf_active_images[i].used = 0;
             elf_active_images[i].data = (void *)0;
             elf_active_images[i].len = 0;
+            elf_active_images[i].load_bias = 0;
             elf_active_images[i].load_base = 0;
             elf_active_images[i].load_end = 0;
             return;
@@ -524,12 +552,19 @@ int elf_symbolize_active_addr(unsigned long addr, elf_symbol_t *out_symbol,
         if (!elf_active_images[i].used) continue;
         if (addr < elf_active_images[i].load_base || addr >= elf_active_images[i].load_end) continue;
 
-        if (elf_find_symbol_by_addr(elf_active_images[i].data, elf_active_images[i].len, addr, out_symbol, out_offset) == ELF_OK)
         {
-            if (out_image_base != (void *)0) *out_image_base = elf_active_images[i].load_base;
-            if (out_image_end != (void *)0) *out_image_end = elf_active_images[i].load_end;
-            return ELF_OK;
+            unsigned long query_addr = addr;
+            if (elf_active_images[i].load_bias != 0)
+            {
+                if (addr < elf_active_images[i].load_bias) continue;
+                query_addr = addr - elf_active_images[i].load_bias;
+            }
+            if (elf_find_symbol_by_addr(elf_active_images[i].data, elf_active_images[i].len, query_addr, out_symbol, out_offset) != ELF_OK)
+                continue;
         }
+        if (out_image_base != (void *)0) *out_image_base = elf_active_images[i].load_base;
+        if (out_image_end != (void *)0) *out_image_end = elf_active_images[i].load_end;
+        return ELF_OK;
     }
 
     return ELF_ERR_NOSYM;
@@ -675,6 +710,7 @@ int elf_load(const unsigned char *data, unsigned long len, elf_exec_t *out)
     const Elf64_Ehdr *ehdr;
     unsigned long i;
     unsigned long mapped_count = 0;
+    unsigned long load_bias = 0;
     unsigned long mapped_virt[1024];
     unsigned long mapped_phys[1024];
 
@@ -688,6 +724,11 @@ int elf_load(const unsigned char *data, unsigned long len, elf_exec_t *out)
     if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN)
         return ELF_ERR_TYPE;
     if (ehdr->e_machine != EM_X86_64)          return ELF_ERR_ARCH;
+    if (ehdr->e_type == ET_DYN)
+    {
+        /* Fixed higher-half bias for PIE-style images to avoid low-memory map clashes. */
+        load_bias = 0xFFFF900003800000UL;
+    }
 
     if (get_program_header_window(ehdr, len) != ELF_OK)
         return ELF_ERR_PHDR;
@@ -716,8 +757,8 @@ int elf_load(const unsigned char *data, unsigned long len, elf_exec_t *out)
 
         if (phdr->p_memsz == 0) continue;
 
-        vaddr_start = phdr->p_vaddr & ~(MEMORY_PAGE_SIZE - 1);
-        vaddr_end   = align_up_page(phdr->p_vaddr + phdr->p_memsz);
+        vaddr_start = (phdr->p_vaddr + load_bias) & ~(MEMORY_PAGE_SIZE - 1);
+        vaddr_end   = align_up_page(phdr->p_vaddr + load_bias + phdr->p_memsz);
 
         /* Map writable while loading so segment bytes can be copied in. */
         flags = PAGE_FLAG_PRESENT | PAGE_FLAG_WRITABLE | PAGE_FLAG_USER;
@@ -734,8 +775,20 @@ int elf_load(const unsigned char *data, unsigned long len, elf_exec_t *out)
 
             if (paging_get_phys(page) != 0)
             {
-                rollback_mapped_pages(mapped_virt, mapped_phys, mapped_count);
-                return ELF_ERR_MAP;
+                /* Boot identity-mapped huge page covers this address — split
+                   the 2 MiB huge page into 4 KiB pages so we can reclaim it. */
+                if (paging_split_huge_page(page) != 0)
+                {
+                    rollback_mapped_pages(mapped_virt, mapped_phys, mapped_count);
+                    return ELF_ERR_MAP;
+                }
+                paging_unmap_page(page);
+                /* If still mapped after split+unmap, it's a real collision */
+                if (paging_get_phys(page) != 0)
+                {
+                    rollback_mapped_pages(mapped_virt, mapped_phys, mapped_count);
+                    return ELF_ERR_MAP;
+                }
             }
 
             phys = phys_alloc_page();
@@ -772,7 +825,7 @@ int elf_load(const unsigned char *data, unsigned long len, elf_exec_t *out)
 
             /* Segment file data range relative to vaddr_start */
             {
-                unsigned long seg_file_start = phdr->p_vaddr - vaddr_start;
+                unsigned long seg_file_start = (phdr->p_vaddr + load_bias) - vaddr_start;
                 unsigned long seg_file_end   = seg_file_start + phdr->p_filesz;
                 unsigned long src_base;
                 unsigned long dst_off;
@@ -810,12 +863,21 @@ int elf_load(const unsigned char *data, unsigned long len, elf_exec_t *out)
         }
     }
 
-    out->entry = (unsigned long)ehdr->e_entry;
+    out->entry = (unsigned long)ehdr->e_entry + load_bias;
+    out->load_base = 0;
+    out->load_end = 0;
     {
         unsigned long load_base = 0;
         unsigned long load_end = 0;
         collect_load_range(data, ehdr, &load_base, &load_end);
-        register_active_image(data, len, load_base, load_end);
+        if (load_end > load_base)
+        {
+            load_base += load_bias;
+            load_end += load_bias;
+            out->load_base = load_base;
+            out->load_end = load_end;
+        }
+        register_active_image(data, len, load_bias, load_base, load_end);
     }
     return ELF_OK;
 }
@@ -834,6 +896,7 @@ void elf_unload(const unsigned char *data, unsigned long len)
 {
     const Elf64_Ehdr *ehdr;
     unsigned long i;
+    unsigned long load_bias;
 
     if (data == (void *)0 || len < sizeof(Elf64_Ehdr)) return;
     ehdr = (const Elf64_Ehdr *)data;
@@ -843,6 +906,7 @@ void elf_unload(const unsigned char *data, unsigned long len)
         get_program_header_window(ehdr, len) != ELF_OK)
         return;
 
+    load_bias = find_active_image_bias(data, len);
     unregister_active_image(data, len);
 
     for (i = 0; i < (unsigned long)ehdr->e_phnum; i++)
@@ -855,8 +919,8 @@ void elf_unload(const unsigned char *data, unsigned long len)
 
         if (phdr->p_type != PT_LOAD) continue;
 
-        vaddr_start = phdr->p_vaddr & ~(MEMORY_PAGE_SIZE - 1);
-        vaddr_end   = align_up_page(phdr->p_vaddr + phdr->p_memsz);
+        vaddr_start = (phdr->p_vaddr + load_bias) & ~(MEMORY_PAGE_SIZE - 1);
+        vaddr_end   = align_up_page(phdr->p_vaddr + load_bias + phdr->p_memsz);
 
         for (page = vaddr_start; page < vaddr_end; page += MEMORY_PAGE_SIZE)
         {

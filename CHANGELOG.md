@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.8 - 2026-04-03
+
+### Added
+- Minimal user-mode heap growth via `SYS_BRK` (`12`) with per-`exec` heap window management and cleanup on return to the kernel.
+- Bundled `/brk.elf` user-mode smoke test that expands its heap, writes into the new page, shrinks the heap, and exits.
+
+### Changed
+- `exec` now initializes a heap region after the loaded ELF image and before the fixed user stack window.
+- README updated with the new ELF smoke-test workflow and `SYS_BRK` notes.
+
+### Fixed
+- Reduced pressure on hardcoded user-memory layout by giving user ELFs a syscall path to request heap space instead of relying only on loader-time mappings.
+
 ## 0.0.7 - 2026-03-19
 
 ### Added

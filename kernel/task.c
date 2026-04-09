@@ -13,6 +13,9 @@
 
 static task_t tasks[TASK_MAX];
 static task_t *current_task;
+
+/* Forward declaration — defined further down after helpers. */
+static void do_switch_to_next(task_t *old);
 /* 0=default policy, 1=force protected, 2=force unprotected */
 static unsigned char task_protect_mode[TASK_MAX];
 static int task_event_log_on = 1;
@@ -30,6 +33,39 @@ static unsigned long syscall_kstack[2048];
  * task_exit() (via SYS_EXIT) restores it so task_exec_user() returns.
  */
 static unsigned long user_task_saved_rsp = 0;
+static unsigned long user_heap_base = 0;
+static unsigned long user_heap_limit = 0;
+static unsigned long user_heap_brk = 0;
+
+/*
+ * Preemption control.  The timer tick handler calls task_preempt_tick()
+ * which yields the CPU to the next ready task when safe to do so.
+ *
+ *  preempt_enabled       – master switch; toggled via task_set_preemption()
+ *  preempt_disable_count – per-CPU nesting counter; >0 inhibits preemption
+ */
+static int preempt_enabled = 1;
+static volatile int preempt_disable_count = 0;
+
+static void brk_trace_fail(const char *reason,
+    unsigned long req,
+    unsigned long old_brk,
+    unsigned long page)
+{
+    terminal_write("[brk] fail ");
+    terminal_write(reason);
+    terminal_write(" req=");
+    terminal_write_hex64(req);
+    terminal_write(" old=");
+    terminal_write_hex64(old_brk);
+    terminal_write(" page=");
+    terminal_write_hex64(page);
+    terminal_write(" base=");
+    terminal_write_hex64(user_heap_base);
+    terminal_write(" lim=");
+    terminal_write_hex64(user_heap_limit);
+    terminal_write("\n");
+}
 
 /* Declared in arch/x86_64/syscall.s */
 extern unsigned long syscall_kernel_rsp_slot;
@@ -165,13 +201,51 @@ void task_reap_zombies(void)
 
 void task_preempt_tick(void)
 {
-    /*
-     * IRQ-time context switching is unsafe with the current switch path.
-     * Keep the timer hook for accounting and future scheduler work, but do
-     * not switch tasks directly from the interrupt handler.
-     */
-    (void)current_task;
-    (void)user_task_saved_rsp;
+    task_t *next;
+
+    /* Don't preempt if the master switch is off or a critical section
+     * has incremented the nesting counter. */
+    if (!preempt_enabled || preempt_disable_count > 0)
+        return;
+
+    /* Don't preempt while a user-mode program is executing — the shared
+     * syscall kernel stack and user_task_saved_rsp are not yet per-task. */
+    if (user_task_saved_rsp != 0)
+        return;
+
+    /* Quick scan: is there another READY task? */
+    next = current_task->next;
+    while (next != current_task) {
+        if (next->state == TASK_STATE_READY)
+            break;
+        next = next->next;
+    }
+    if (next == current_task)
+        return;  /* sole runnable task — nothing to switch to */
+
+    /* Prevent re-entrant preemption during the switch. */
+    preempt_disable_count++;
+
+    /* Yield via the normal cooperative path.  task_switch now saves
+     * RFLAGS, so the resumed task restores its original interrupt flag. */
+    {
+        task_t *old = current_task;
+        old->state = TASK_STATE_READY;
+        do_switch_to_next(old);
+        current_task->state = TASK_STATE_RUNNING;
+    }
+
+    preempt_disable_count--;
+}
+
+void task_set_preemption(int enabled)
+{
+    preempt_enabled = enabled ? 1 : 0;
+}
+
+int task_get_preemption(void)
+{
+    return preempt_enabled;
 }
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
@@ -295,8 +369,8 @@ int task_create(const char *name, void (*entry)(void *), void *arg)
     stack_top = (unsigned long)t->stack_base + (unsigned long)(TASK_STACK_PAGES * 4096);
 
     /*
-     * Build the initial context so task_switch() can pop six
-     * callee-saved registers and ret into task_trampoline.
+     * Build the initial context so task_switch() can pop RFLAGS, six
+     * callee-saved registers, and ret into task_trampoline.
      *
      *  stack_top - 8  : alignment pad (skipped; not popped)
      *  stack_top - 16 : task_trampoline  ← return address for ret
@@ -305,9 +379,10 @@ int task_create(const char *name, void (*entry)(void *), void *arg)
      *  stack_top - 40 : 0  (r12)
      *  stack_top - 48 : 0  (r13)
      *  stack_top - 56 : 0  (r14)
-     *  stack_top - 64 : 0  (r15)  ← initial rsp
+     *  stack_top - 64 : 0  (r15)
+     *  stack_top - 72 : 0x202  (RFLAGS: IF=1)  ← initial rsp
      *
-     * After the six pops and ret, RSP = stack_top - 8, which is
+     * After popfq, six pops and ret, RSP = stack_top - 8, which is
      * 8 (mod 16) with a page-aligned stack_top — matching the ABI
      * requirement at function entry.
      */
@@ -320,6 +395,7 @@ int task_create(const char *name, void (*entry)(void *), void *arg)
     *(--sp) = 0; /* r13 */
     *(--sp) = 0; /* r14 */
     *(--sp) = 0; /* r15 */
+    *(--sp) = 0x202UL; /* RFLAGS: IF=1, reserved bit 1 set */
 
     t->rsp   = (unsigned long)sp;
     t->id    = next_id++;
@@ -597,7 +673,123 @@ void task_user_fault_exit(void)
     for (;;) arch_halt();
 }
 
-void task_exec_user(unsigned long entry, unsigned long user_rsp)
+static unsigned long align_up_page(unsigned long addr)
+{
+    return (addr + 4095UL) & ~4095UL;
+}
+
+static void user_heap_unmap_range(unsigned long start, unsigned long end)
+{
+    unsigned long page;
+    for (page = start; page < end; page += 4096UL)
+    {
+        unsigned long phys = paging_get_phys(page);
+        if (phys != 0)
+        {
+            paging_unmap_page(page);
+            phys_free_page(phys);
+        }
+    }
+}
+
+void task_user_heap_reset(void)
+{
+    if (user_heap_base != 0 && user_heap_limit > user_heap_base)
+    {
+        unsigned long mapped_start = align_up_page(user_heap_base);
+        unsigned long mapped_end = align_up_page(user_heap_brk);
+        if (mapped_end > mapped_start)
+        {
+            user_heap_unmap_range(mapped_start, mapped_end);
+        }
+    }
+    user_heap_base = 0;
+    user_heap_limit = 0;
+    user_heap_brk = 0;
+}
+
+int task_user_heap_config(unsigned long base, unsigned long limit)
+{
+    if (base == 0 || limit <= base) return -1;
+    task_user_heap_reset();
+    user_heap_base = base;
+    user_heap_limit = limit;
+    user_heap_brk = base;
+    return 0;
+}
+
+unsigned long task_user_heap_brk(unsigned long new_break)
+{
+    unsigned long old_break;
+    unsigned long map_from;
+    unsigned long map_to;
+    unsigned long page;
+
+    if (user_heap_base == 0 || user_heap_limit <= user_heap_base)
+    {
+        brk_trace_fail("unconfigured", new_break, user_heap_brk, 0);
+        return (unsigned long)-1;
+    }
+
+    if (new_break == 0)
+    {
+        return user_heap_brk;
+    }
+
+    if (new_break < user_heap_base || new_break > user_heap_limit)
+    {
+        brk_trace_fail("bounds", new_break, user_heap_brk, 0);
+        return (unsigned long)-1;
+    }
+
+    old_break = user_heap_brk;
+    if (new_break == old_break) return old_break;
+
+    map_from = align_up_page(old_break);
+    map_to = align_up_page(new_break);
+
+    if (new_break > old_break)
+    {
+        for (page = map_from; page < map_to; page += 4096UL)
+        {
+            unsigned long phys;
+            if (paging_get_phys(page) != 0)
+            {
+                brk_trace_fail("present", new_break, old_break, page);
+                user_heap_unmap_range(map_from, page);
+                return (unsigned long)-1;
+            }
+            phys = phys_alloc_page();
+            if (phys == 0)
+            {
+                brk_trace_fail("oom", new_break, old_break, page);
+                user_heap_unmap_range(map_from, page);
+                return (unsigned long)-1;
+            }
+            if (paging_map_page(page, phys,
+                                PAGE_FLAG_PRESENT | PAGE_FLAG_WRITABLE |
+                                PAGE_FLAG_USER | PAGE_FLAG_NO_EXECUTE) != 0)
+            {
+                brk_trace_fail("map", new_break, old_break, page);
+                phys_free_page(phys);
+                user_heap_unmap_range(map_from, page);
+                return (unsigned long)-1;
+            }
+
+            /* Zero freshly-mapped heap pages before exposing them to user mode. */
+            memory_zero_phys_page(phys);
+        }
+    }
+    else
+    {
+        user_heap_unmap_range(map_to, map_from);
+    }
+
+    user_heap_brk = new_break;
+    return user_heap_brk;
+}
+
+void task_exec_user(unsigned long entry, unsigned long user_rsp, unsigned long user_arg0, unsigned long argv1_ptr)
 {
     /*
      * Point the TSS RSP0 and the syscall kernel stack at the top of
@@ -612,10 +804,11 @@ void task_exec_user(unsigned long entry, unsigned long user_rsp)
      * iretq into ring 3.  When the user program calls SYS_EXIT,
      * task_exit() → task_restore_kernel() brings RSP back here.
      */
-    task_save_and_enter_user(entry, user_rsp, &user_task_saved_rsp);
+    task_save_and_enter_user(entry, user_rsp, user_arg0, &user_task_saved_rsp, argv1_ptr);
 
     /* Execution resumes here after SYS_EXIT or a user-mode fault. */
     user_task_saved_rsp = 0;
+    task_user_heap_reset();
 
     /* Clear the TSS RSP0 so stale use is obvious. */
     syscall_kernel_rsp_slot = 0;

@@ -1,13 +1,16 @@
 #include "basic.h"
 #include "terminal.h"
 #include "screen.h"
+#include "fs.h"
 
 #define BASIC_MAX_LINES 256
 #define BASIC_MAX_STEPS 20000
 #define BASIC_MAX_CALL_DEPTH 32
 #define BASIC_MAX_FOR_DEPTH 16
+#define BASIC_MAX_WHILE_DEPTH 16
 #define BASIC_MAX_STRING_LEN 96
 #define BASIC_ARRAY_MAX 128
+#define BASIC_MAX_DEF_FN 16
 
 struct basic_line
 {
@@ -21,6 +24,18 @@ struct basic_for_frame
 	int end_value;
 	int step_value;
 	int body_pc;
+};
+
+struct basic_while_frame
+{
+	int while_pc;
+};
+
+struct basic_def_fn
+{
+	int fn_letter;
+	int param_var;
+	char body[128];
 };
 
 enum b_cmp_op
@@ -38,6 +53,21 @@ static char (*b_rt_str_vars)[BASIC_MAX_STRING_LEN] = (void *)0;
 static int (*b_rt_arrays)[BASIC_ARRAY_MAX] = (void *)0;
 static int *b_rt_array_sizes = (void *)0;
 static unsigned int b_rt_rand_state = 0x12345678U;
+static struct basic_def_fn b_def_fns[BASIC_MAX_DEF_FN];
+static int b_def_fn_count = 0;
+
+#define BASIC_MAX_FILES 4
+#define BASIC_FILE_BUF 8192
+struct basic_file_chan
+{
+	int active;
+	int mode; /* 0=input, 1=output, 2=append */
+	char path[64];
+	char buf[BASIC_FILE_BUF];
+	int buf_len;
+	int buf_pos;
+};
+static struct basic_file_chan b_files[BASIC_MAX_FILES];
 
 static int b_is_space(char c)
 {
@@ -395,6 +425,100 @@ static int b_parse_string_expr(const char **sp, char *out, int out_max)
 				if (b_parse_builtin_paren_expr(&s, b_rt_vars, &v) != 0) return -1;
 				b_int_to_text(v, part, sizeof(part));
 			}
+			else if (b_name_matches_ci(s, "MID$") && b_skip_spaces(s + 4)[0] == '(')
+			{
+				char src[BASIC_MAX_STRING_LEN];
+				int start_pos, length;
+				int src_len, pi;
+				s = b_skip_spaces(s + 4);
+				if (*s != '(') return -1;
+				s++;
+				if (b_parse_string_expr(&s, src, sizeof(src)) != 0) return -1;
+				s = b_skip_spaces(s);
+				if (*s != ',') return -1;
+				s++;
+				if (b_parse_expr(&s, b_rt_vars, &start_pos) != 0) return -1;
+				s = b_skip_spaces(s);
+				if (*s == ',')
+				{
+					s++;
+					if (b_parse_expr(&s, b_rt_vars, &length) != 0) return -1;
+				}
+				else
+				{
+					length = BASIC_MAX_STRING_LEN;
+				}
+				s = b_skip_spaces(s);
+				if (*s != ')') return -1;
+				s++;
+				src_len = 0;
+				while (src[src_len] != '\0') src_len++;
+				if (start_pos < 1) start_pos = 1;
+				start_pos--;
+				if (length < 0) length = 0;
+				pi = 0;
+				while (pi < length && start_pos + pi < src_len && pi + 1 < (int)sizeof(part))
+				{
+					part[pi] = src[start_pos + pi];
+					pi++;
+				}
+				part[pi] = '\0';
+			}
+			else if (b_name_matches_ci(s, "LEFT$") && b_skip_spaces(s + 5)[0] == '(')
+			{
+				char src[BASIC_MAX_STRING_LEN];
+				int count, src_len, pi;
+				s = b_skip_spaces(s + 5);
+				if (*s != '(') return -1;
+				s++;
+				if (b_parse_string_expr(&s, src, sizeof(src)) != 0) return -1;
+				s = b_skip_spaces(s);
+				if (*s != ',') return -1;
+				s++;
+				if (b_parse_expr(&s, b_rt_vars, &count) != 0) return -1;
+				s = b_skip_spaces(s);
+				if (*s != ')') return -1;
+				s++;
+				src_len = 0;
+				while (src[src_len] != '\0') src_len++;
+				if (count < 0) count = 0;
+				if (count > src_len) count = src_len;
+				pi = 0;
+				while (pi < count && pi + 1 < (int)sizeof(part))
+				{
+					part[pi] = src[pi];
+					pi++;
+				}
+				part[pi] = '\0';
+			}
+			else if (b_name_matches_ci(s, "RIGHT$") && b_skip_spaces(s + 6)[0] == '(')
+			{
+				char src[BASIC_MAX_STRING_LEN];
+				int count, src_len, pi, start;
+				s = b_skip_spaces(s + 6);
+				if (*s != '(') return -1;
+				s++;
+				if (b_parse_string_expr(&s, src, sizeof(src)) != 0) return -1;
+				s = b_skip_spaces(s);
+				if (*s != ',') return -1;
+				s++;
+				if (b_parse_expr(&s, b_rt_vars, &count) != 0) return -1;
+				s = b_skip_spaces(s);
+				if (*s != ')') return -1;
+				s++;
+				src_len = 0;
+				while (src[src_len] != '\0') src_len++;
+				if (count < 0) count = 0;
+				if (count > src_len) count = src_len;
+				start = src_len - count;
+				pi = 0;
+				while (pi < count && pi + 1 < (int)sizeof(part))
+				{
+					part[pi] = src[start + pi];
+					pi++;
+				}
+				part[pi] = '\0';
+			}
 			else if (b_parse_var_ref(&sv, &idx, &is_string) == 0 && is_string)
 			{
 				b_copy_string(part, b_rt_str_vars[idx], sizeof(part));
@@ -429,6 +553,15 @@ static int b_parse_factor(const char **sp, int vars[26], int *out)
 	const char *s = b_skip_spaces(*sp);
 	int sign = 1;
 	int v;
+
+	if (b_name_matches_ci(s, "NOT"))
+	{
+		s = b_skip_spaces(s + 3);
+		if (b_parse_factor(&s, vars, &v) != 0) return -1;
+		*out = ~v;
+		*sp = s;
+		return 0;
+	}
 
 	while (*s == '+' || *s == '-')
 	{
@@ -523,6 +656,83 @@ static int b_parse_factor(const char **sp, int vars[26], int *out)
 			*sp = s;
 			return 0;
 		}
+		if (b_name_matches_ci(s, "EOF") && b_skip_spaces(s + 3)[0] == '(')
+		{
+			int fnum;
+			s = b_skip_spaces(s + 3);
+			if (b_parse_builtin_paren_expr(&s, vars, &fnum) != 0) return -1;
+			if (fnum < 1 || fnum > BASIC_MAX_FILES) { v = -1; }
+			else
+			{
+				fnum--;
+				v = (!b_files[fnum].active || b_files[fnum].buf_pos >= b_files[fnum].buf_len) ? -1 : 0;
+			}
+			*out = v * sign;
+			*sp = s;
+			return 0;
+		}
+		if (b_name_matches_ci(s, "INSTR") && b_skip_spaces(s + 5)[0] == '(')
+		{
+			char haystack[BASIC_MAX_STRING_LEN];
+			char needle[BASIC_MAX_STRING_LEN];
+			int pos = -1;
+			int hi, ni;
+			s = b_skip_spaces(s + 5);
+			if (*s != '(') return -1;
+			s++;
+			if (b_parse_string_expr(&s, haystack, sizeof(haystack)) != 0) return -1;
+			s = b_skip_spaces(s);
+			if (*s != ',') return -1;
+			s++;
+			if (b_parse_string_expr(&s, needle, sizeof(needle)) != 0) return -1;
+			s = b_skip_spaces(s);
+			if (*s != ')') return -1;
+			s++;
+			for (hi = 0; haystack[hi] != '\0'; hi++)
+			{
+				int match = 1;
+				for (ni = 0; needle[ni] != '\0'; ni++)
+				{
+					if (haystack[hi + ni] != needle[ni]) { match = 0; break; }
+				}
+				if (match) { pos = hi + 1; break; }
+			}
+			if (needle[0] == '\0') pos = 1;
+			if (pos < 0) pos = 0;
+			*out = pos * sign;
+			*sp = s;
+			return 0;
+		}
+		if (b_up(s[0]) == 'F' && b_up(s[1]) == 'N' && b_is_alpha(s[2]) && !b_is_ident_tail(s[3]))
+		{
+			int fn_idx = b_up(s[2]) - 'A';
+			int fi;
+			s += 3;
+			for (fi = 0; fi < b_def_fn_count; fi++)
+			{
+				if (b_def_fns[fi].fn_letter == fn_idx)
+				{
+					int arg;
+					const char *body;
+					int old_val;
+					int pv = b_def_fns[fi].param_var;
+					if (b_parse_builtin_paren_expr(&s, vars, &arg) != 0) return -1;
+					old_val = vars[pv];
+					vars[pv] = arg;
+					body = b_def_fns[fi].body;
+					if (b_parse_expr(&body, vars, &v) != 0)
+					{
+						vars[pv] = old_val;
+						return -1;
+					}
+					vars[pv] = old_val;
+					*out = v * sign;
+					*sp = s;
+					return 0;
+				}
+			}
+			return -1;
+		}
 	}
 
 	if (b_parse_value(&s, vars, &v) != 0) return -1;
@@ -593,6 +803,24 @@ static int b_parse_expr(const char **sp, int vars[26], int *out)
 			if (b_parse_term(&s, vars, &rhs) != 0) return -1;
 			lhs -= rhs;
 		}
+		else if (b_name_matches_ci(s, "AND"))
+		{
+			s = b_skip_spaces(s + 3);
+			if (b_parse_term(&s, vars, &rhs) != 0) return -1;
+			lhs &= rhs;
+		}
+		else if (b_name_matches_ci(s, "OR"))
+		{
+			s = b_skip_spaces(s + 2);
+			if (b_parse_term(&s, vars, &rhs) != 0) return -1;
+			lhs |= rhs;
+		}
+		else if (b_name_matches_ci(s, "XOR"))
+		{
+			s = b_skip_spaces(s + 3);
+			if (b_parse_term(&s, vars, &rhs) != 0) return -1;
+			lhs ^= rhs;
+		}
 		else break;
 	}
 
@@ -644,6 +872,23 @@ static int b_find_matching_next(struct basic_line lines[], int line_count, int f
 		const char *s = b_statement_start(lines[i].text);
 		if (b_starts_with_ci(s, "FOR")) depth++;
 		else if (b_starts_with_ci(s, "NEXT"))
+		{
+			if (depth == 0) return i;
+			depth--;
+		}
+	}
+	return -1;
+}
+
+static int b_find_matching_wend(struct basic_line lines[], int line_count, int while_pc)
+{
+	int i;
+	int depth = 0;
+	for (i = while_pc + 1; i < line_count; i++)
+	{
+		const char *s = b_statement_start(lines[i].text);
+		if (b_starts_with_ci(s, "WHILE")) depth++;
+		else if (b_starts_with_ci(s, "WEND"))
 		{
 			if (depth == 0) return i;
 			depth--;
@@ -839,8 +1084,10 @@ int basic_run(char *program_text)
 	int array_sizes[26];
 	int call_stack[BASIC_MAX_CALL_DEPTH];
 	struct basic_for_frame for_stack[BASIC_MAX_FOR_DEPTH];
+	struct basic_while_frame while_stack[BASIC_MAX_WHILE_DEPTH];
 	int call_sp = 0;
 	int for_sp = 0;
+	int while_sp = 0;
 	int data_line = 0;
 	int data_offset = 0;
 	int line_count = 0;
@@ -849,7 +1096,9 @@ int basic_run(char *program_text)
 	int i;
 	char *p;
 
-#define B_RT_ERR(msg) do { b_runtime_error(lines, line_count, pc, (msg)); return -1; } while (0)
+#define B_RT_ERR(msg) do { b_runtime_error(lines, line_count, pc, (msg)); b_err_flag = 1; goto b_cleanup; } while (0)
+
+	int b_err_flag = 0;
 
 	if (program_text == (void *)0) return -1;
 
@@ -861,6 +1110,12 @@ int basic_run(char *program_text)
 	b_rt_str_vars = str_vars;
 	b_rt_arrays = arrays;
 	b_rt_array_sizes = array_sizes;
+	b_def_fn_count = 0;
+	{
+		int fi;
+		for (fi = 0; fi < BASIC_MAX_FILES; fi++)
+			b_files[fi].active = 0;
+	}
 
 	p = program_text;
 	while (*p != '\0' && line_count < BASIC_MAX_LINES)
@@ -1399,6 +1654,133 @@ int basic_run(char *program_text)
 			continue;
 		}
 
+		if (b_starts_with_ci(s, "WHILE") && (s[5] == ' ' || s[5] == '\t'))
+		{
+			int cond;
+			s = b_skip_spaces(s + 5);
+			if (b_parse_expr(&s, vars, &cond) != 0)
+			{
+				B_RT_ERR("WHILE condition error");
+			}
+			if (cond)
+			{
+				if (while_sp >= BASIC_MAX_WHILE_DEPTH)
+				{
+					B_RT_ERR("WHILE nested too deep");
+				}
+				while_stack[while_sp].while_pc = pc;
+				while_sp++;
+				pc++;
+			}
+			else
+			{
+				int wend_pc = b_find_matching_wend(lines, line_count, pc);
+				if (wend_pc < 0)
+				{
+					B_RT_ERR("WHILE without WEND");
+				}
+				pc = wend_pc + 1;
+			}
+			continue;
+		}
+
+		if (b_starts_with_ci(s, "WEND"))
+		{
+			int cond;
+			const char *ws;
+			if (while_sp <= 0)
+			{
+				B_RT_ERR("WEND without WHILE");
+			}
+			/* Re-evaluate condition at the WHILE line */
+			ws = b_statement_start(lines[while_stack[while_sp - 1].while_pc].text);
+			ws = b_skip_spaces(ws + 5);
+			if (b_parse_expr(&ws, vars, &cond) != 0)
+			{
+				B_RT_ERR("WEND condition re-eval error");
+			}
+			if (cond)
+			{
+				pc = while_stack[while_sp - 1].while_pc + 1;
+			}
+			else
+			{
+				while_sp--;
+				pc++;
+			}
+			continue;
+		}
+
+		if (b_starts_with_ci(s, "DEF") && (s[3] == ' ' || s[3] == '\t'))
+		{
+			int fn_idx, pvar;
+			s = b_skip_spaces(s + 3);
+			if (!(s[0] == 'F' || s[0] == 'f') || !(s[1] == 'N' || s[1] == 'n') || !b_is_alpha(s[2]))
+			{
+				B_RT_ERR("DEF FN syntax error");
+			}
+			fn_idx = (s[2] >= 'a' && s[2] <= 'z') ? s[2] - 'a' : s[2] - 'A';
+			s += 3;
+			s = b_skip_spaces(s);
+			if (*s != '(')
+			{
+				B_RT_ERR("DEF FN missing (");
+			}
+			s++;
+			s = b_skip_spaces(s);
+			if (!b_is_alpha(*s))
+			{
+				B_RT_ERR("DEF FN missing param");
+			}
+			pvar = (*s >= 'a' && *s <= 'z') ? *s - 'a' : *s - 'A';
+			s++;
+			s = b_skip_spaces(s);
+			if (*s != ')')
+			{
+				B_RT_ERR("DEF FN missing )");
+			}
+			s++;
+			s = b_skip_spaces(s);
+			if (*s != '=')
+			{
+				B_RT_ERR("DEF FN missing =");
+			}
+			s++;
+			s = b_skip_spaces(s);
+			/* Find or replace existing definition for this function letter */
+			{
+				int fi, found = -1;
+				for (fi = 0; fi < b_def_fn_count; fi++)
+				{
+					if (b_def_fns[fi].fn_letter == fn_idx)
+					{
+						found = fi;
+						break;
+					}
+				}
+				if (found < 0)
+				{
+					if (b_def_fn_count >= BASIC_MAX_DEF_FN)
+					{
+						B_RT_ERR("Too many DEF FN");
+					}
+					found = b_def_fn_count++;
+				}
+				b_def_fns[found].fn_letter = fn_idx;
+				b_def_fns[found].param_var = pvar;
+				{
+					int bi = 0;
+					while (*s && bi + 1 < (int)sizeof(b_def_fns[found].body))
+					{
+						b_def_fns[found].body[bi++] = *s++;
+					}
+					b_def_fns[found].body[bi] = '\0';
+				}
+			}
+			pc++;
+			continue;
+		}
+
 		if (b_starts_with_ci(s, "ADD"))
 		{
 			int idx;
@@ -1643,6 +2025,302 @@ int basic_run(char *program_text)
 		}
 
 		/* Allow classic BASIC implicit assignment without LET (e.g. A = 1, P$ = "X"). */
+
+		if (b_starts_with_ci(s, "OPEN"))
+		{
+			char fname[64];
+			int fmode = -1;
+			int fnum;
+			const char *tp;
+			s = b_skip_spaces(s + 4);
+			if (b_parse_string_literal(&s, fname, sizeof(fname)) != 0)
+			{
+				B_RT_ERR("OPEN filename error");
+			}
+			s = b_skip_spaces(s);
+			if (b_starts_with_ci(s, "FOR"))
+			{
+				s = b_skip_spaces(s + 3);
+				if (b_starts_with_ci(s, "INPUT"))
+				{
+					fmode = 0;
+					s += 5;
+				}
+				else if (b_starts_with_ci(s, "OUTPUT"))
+				{
+					fmode = 1;
+					s += 6;
+				}
+				else if (b_starts_with_ci(s, "APPEND"))
+				{
+					fmode = 2;
+					s += 6;
+				}
+				else
+				{
+					B_RT_ERR("OPEN mode error");
+				}
+			}
+			else
+			{
+				fmode = 0;
+			}
+			s = b_skip_spaces(s);
+			if (b_starts_with_ci(s, "AS"))
+			{
+				s = b_skip_spaces(s + 2);
+			}
+			if (*s != '#')
+			{
+				B_RT_ERR("OPEN missing #");
+			}
+			s++;
+			tp = s;
+			if (b_parse_expr(&tp, vars, &fnum) != 0)
+			{
+				B_RT_ERR("OPEN file number error");
+			}
+			if (fnum < 1 || fnum > BASIC_MAX_FILES)
+			{
+				B_RT_ERR("OPEN file number out of range (1-4)");
+			}
+			fnum--;
+			if (b_files[fnum].active)
+			{
+				B_RT_ERR("OPEN file already open");
+			}
+			b_files[fnum].active = 1;
+			b_files[fnum].mode = fmode;
+			{
+				int ci = 0;
+				while (fname[ci] && ci + 1 < (int)sizeof(b_files[fnum].path))
+				{
+					b_files[fnum].path[ci] = fname[ci];
+					ci++;
+				}
+				b_files[fnum].path[ci] = '\0';
+			}
+			b_files[fnum].buf_len = 0;
+			b_files[fnum].buf_pos = 0;
+			if (fmode == 0)
+			{
+				unsigned long fsize = 0;
+				if (fs_read_file(fname, (unsigned char *)b_files[fnum].buf, BASIC_FILE_BUF - 1, &fsize) != 0)
+				{
+					b_files[fnum].active = 0;
+					B_RT_ERR("OPEN cannot read file");
+				}
+				b_files[fnum].buf[fsize] = '\0';
+				b_files[fnum].buf_len = (int)fsize;
+			}
+			else if (fmode == 2)
+			{
+				unsigned long fsize = 0;
+				if (fs_read_file(fname, (unsigned char *)b_files[fnum].buf, BASIC_FILE_BUF - 1, &fsize) == 0)
+				{
+					b_files[fnum].buf[fsize] = '\0';
+					b_files[fnum].buf_len = (int)fsize;
+				}
+				b_files[fnum].buf_pos = b_files[fnum].buf_len;
+			}
+			pc++;
+			continue;
+		}
+
+		if (b_starts_with_ci(s, "CLOSE"))
+		{
+			int fnum;
+			const char *tp;
+			s = b_skip_spaces(s + 5);
+			if (*s != '#')
+			{
+				B_RT_ERR("CLOSE missing #");
+			}
+			s++;
+			tp = s;
+			if (b_parse_expr(&tp, vars, &fnum) != 0)
+			{
+				B_RT_ERR("CLOSE file number error");
+			}
+			if (fnum < 1 || fnum > BASIC_MAX_FILES)
+			{
+				B_RT_ERR("CLOSE file number out of range");
+			}
+			fnum--;
+			if (!b_files[fnum].active)
+			{
+				B_RT_ERR("CLOSE file not open");
+			}
+			if (b_files[fnum].mode == 1 || b_files[fnum].mode == 2)
+			{
+				b_files[fnum].buf[b_files[fnum].buf_len] = '\0';
+				fs_write_file(b_files[fnum].path, (unsigned char *)b_files[fnum].buf, (unsigned long)b_files[fnum].buf_len);
+			}
+			b_files[fnum].active = 0;
+			pc++;
+			continue;
+		}
+
+		if (b_starts_with_ci(s, "PRINT") && b_skip_spaces(s + 5)[0] == '#')
+		{
+			int fnum;
+			const char *tp;
+			s = b_skip_spaces(s + 5);
+			s++;
+			tp = s;
+			if (b_parse_expr(&tp, vars, &fnum) != 0)
+			{
+				B_RT_ERR("PRINT# file number error");
+			}
+			s = tp;
+			if (fnum < 1 || fnum > BASIC_MAX_FILES)
+			{
+				B_RT_ERR("PRINT# file number out of range");
+			}
+			fnum--;
+			if (!b_files[fnum].active || b_files[fnum].mode == 0)
+			{
+				B_RT_ERR("PRINT# file not open for output");
+			}
+			s = b_skip_spaces(s);
+			if (*s == ',') s++;
+			s = b_skip_spaces(s);
+			{
+				char out_buf[256];
+				int out_len = 0;
+				while (*s && out_len + 1 < (int)sizeof(out_buf))
+				{
+					if (*s == '"')
+					{
+						char lit[BASIC_MAX_STRING_LEN];
+						if (b_parse_string_literal(&s, lit, sizeof(lit)) != 0) break;
+						{
+							int li = 0;
+							while (lit[li] && out_len + 1 < (int)sizeof(out_buf))
+								out_buf[out_len++] = lit[li++];
+						}
+					}
+					else if (b_is_alpha(*s) && (s[1] == '$' || (b_is_alpha(s[0]) && !b_is_ident_tail(s[1]))))
+					{
+						int idx, is_str;
+						const char *sv = s;
+						if (b_parse_var_ref(&sv, &idx, &is_str) == 0 && is_str)
+						{
+							int li = 0;
+							s = sv;
+							while (str_vars[idx][li] && out_len + 1 < (int)sizeof(out_buf))
+								out_buf[out_len++] = str_vars[idx][li++];
+						}
+						else
+						{
+							int v;
+							char nb[16];
+							if (b_parse_expr(&s, vars, &v) != 0) break;
+							b_int_to_text(v, nb, sizeof(nb));
+							{
+								int li = 0;
+								while (nb[li] && out_len + 1 < (int)sizeof(out_buf))
+									out_buf[out_len++] = nb[li++];
+							}
+						}
+					}
+					else
+					{
+						int v;
+						char nb[16];
+						if (b_parse_expr(&s, vars, &v) != 0) break;
+						b_int_to_text(v, nb, sizeof(nb));
+						{
+							int li = 0;
+							while (nb[li] && out_len + 1 < (int)sizeof(out_buf))
+								out_buf[out_len++] = nb[li++];
+						}
+					}
+					s = b_skip_spaces(s);
+					if (*s == ';' || *s == ',')
+					{
+						if (*s == ',') out_buf[out_len++] = '\t';
+						s++;
+						s = b_skip_spaces(s);
+					}
+					else break;
+				}
+				out_buf[out_len++] = '\n';
+				{
+					int wi = 0;
+					while (wi < out_len && b_files[fnum].buf_len + 1 < BASIC_FILE_BUF)
+					{
+						b_files[fnum].buf[b_files[fnum].buf_len++] = out_buf[wi++];
+					}
+				}
+			}
+			pc++;
+			continue;
+		}
+
+		if (b_starts_with_ci(s, "INPUT") && b_skip_spaces(s + 5)[0] == '#')
+		{
+			int fnum, idx, is_str;
+			const char *tp;
+			s = b_skip_spaces(s + 5);
+			s++;
+			tp = s;
+			if (b_parse_expr(&tp, vars, &fnum) != 0)
+			{
+				B_RT_ERR("INPUT# file number error");
+			}
+			s = tp;
+			if (fnum < 1 || fnum > BASIC_MAX_FILES)
+			{
+				B_RT_ERR("INPUT# file number out of range");
+			}
+			fnum--;
+			if (!b_files[fnum].active || b_files[fnum].mode != 0)
+			{
+				B_RT_ERR("INPUT# file not open for input");
+			}
+			s = b_skip_spaces(s);
+			if (*s == ',') s++;
+			s = b_skip_spaces(s);
+			if (b_parse_var_ref(&s, &idx, &is_str) != 0)
+			{
+				B_RT_ERR("INPUT# variable error");
+			}
+			{
+				char line_buf[BASIC_MAX_STRING_LEN];
+				int li = 0;
+				while (b_files[fnum].buf_pos < b_files[fnum].buf_len &&
+					   b_files[fnum].buf[b_files[fnum].buf_pos] != '\n' &&
+					   li + 1 < (int)sizeof(line_buf))
+				{
+					char c = b_files[fnum].buf[b_files[fnum].buf_pos++];
+					if (c != '\r') line_buf[li++] = c;
+				}
+				line_buf[li] = '\0';
+				if (b_files[fnum].buf_pos < b_files[fnum].buf_len &&
+					b_files[fnum].buf[b_files[fnum].buf_pos] == '\n')
+				{
+					b_files[fnum].buf_pos++;
+				}
+				if (is_str)
+				{
+					b_copy_string(str_vars[idx], line_buf, BASIC_MAX_STRING_LEN);
+				}
+				else
+				{
+					const char *lp = line_buf;
+					int v;
+					if (b_parse_expr(&lp, vars, &v) != 0)
+					{
+						B_RT_ERR("INPUT# numeric parse error");
+					}
+					vars[idx] = v;
+				}
+			}
+			pc++;
+			continue;
+		}
+
 		if (b_is_alpha(*s))
 		{
 			const char *as = s;
@@ -1727,5 +2405,22 @@ int basic_run(char *program_text)
 	}
 
 	#undef B_RT_ERR
-	return 0;
+b_cleanup:
+	/* Close any files left open */
+	{
+		int fi;
+		for (fi = 0; fi < BASIC_MAX_FILES; fi++)
+		{
+			if (b_files[fi].active)
+			{
+				if (b_files[fi].mode == 1 || b_files[fi].mode == 2)
+				{
+					b_files[fi].buf[b_files[fi].buf_len] = '\0';
+					fs_write_file(b_files[fi].path, (unsigned char *)b_files[fi].buf, (unsigned long)b_files[fi].buf_len);
+				}
+				b_files[fi].active = 0;
+			}
+		}
+	}
+	return b_err_flag ? -1 : 0;
 }

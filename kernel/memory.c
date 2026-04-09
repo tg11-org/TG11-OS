@@ -21,6 +21,8 @@
 #define MEMORY_VIRT_PAGES 16384UL
 #define MEMORY_VIRT_LIMIT (MEMORY_VIRT_BASE + MEMORY_VIRT_PAGES * MEMORY_PAGE_SIZE)
 #define MEMORY_VIRT_BITMAP_BYTES (MEMORY_VIRT_PAGES / 8)
+#define MEMORY_TEMP_PAGE_INDEX (MEMORY_VIRT_PAGES - 1)
+#define MEMORY_TEMP_PAGE_VADDR (MEMORY_VIRT_BASE + MEMORY_TEMP_PAGE_INDEX * MEMORY_PAGE_SIZE)
 
 struct mb2_info_header
 {
@@ -246,6 +248,7 @@ void memory_init(unsigned long mb2_info_addr)
 
 	mem_fill(phys_bitmap, 0xFF, sizeof(phys_bitmap));
 	mem_zero(virt_bitmap, sizeof(virt_bitmap));
+	virt_page_mark_used(MEMORY_TEMP_PAGE_INDEX);
 	total_page_count = 0;
 	free_page_count = 0;
 
@@ -333,17 +336,29 @@ int paging_map_page(unsigned long virt_addr, unsigned long phys_addr, unsigned l
 	unsigned long *pdpt;
 	unsigned long *pd;
 	unsigned long *pt;
+	unsigned long *pml4e;
+	unsigned long *pdpte;
+	unsigned long *pde;
 	unsigned long *entry;
 	if ((virt_addr & (MEMORY_PAGE_SIZE - 1)) != 0 || (phys_addr & (MEMORY_PAGE_SIZE - 1)) != 0) return -1;
 	pml4 = root_page_table();
-	pdpt = ensure_next_table(&pml4[pml4_index(virt_addr)]);
-	if (pdpt == (void *)0) return -1;
-	pd = ensure_next_table(&pdpt[pdpt_index(virt_addr)]);
-	if (pd == (void *)0) return -1;
-	pt = ensure_next_table(&pd[pd_index(virt_addr)]);
-	if (pt == (void *)0) return -1;
+	pml4e = &pml4[pml4_index(virt_addr)];
+	pdpt = ensure_next_table(pml4e);
+	if (pdpt == (void *)0) return -2;
+	if ((flags & PAGE_FLAG_USER) != 0) *pml4e |= PAGE_FLAG_USER;
+	if ((flags & PAGE_FLAG_WRITABLE) != 0) *pml4e |= PAGE_FLAG_WRITABLE;
+	pdpte = &pdpt[pdpt_index(virt_addr)];
+	pd = ensure_next_table(pdpte);
+	if (pd == (void *)0) return -3;
+	if ((flags & PAGE_FLAG_USER) != 0) *pdpte |= PAGE_FLAG_USER;
+	if ((flags & PAGE_FLAG_WRITABLE) != 0) *pdpte |= PAGE_FLAG_WRITABLE;
+	pde = &pd[pd_index(virt_addr)];
+	pt = ensure_next_table(pde);
+	if (pt == (void *)0) return -4;
+	if ((flags & PAGE_FLAG_USER) != 0) *pde |= PAGE_FLAG_USER;
+	if ((flags & PAGE_FLAG_WRITABLE) != 0) *pde |= PAGE_FLAG_WRITABLE;
 	entry = &pt[pt_index(virt_addr)];
-	if ((*entry & PAGE_FLAG_PRESENT) != 0) return -1;
+	if ((*entry & PAGE_FLAG_PRESENT) != 0) return -5;
 	*entry = (phys_addr & PAGE_ADDR_MASK) | (flags & (PAGE_FLAGS_MASK | PAGE_FLAG_NO_EXECUTE)) | PAGE_FLAG_PRESENT;
 	arch_invlpg((const void *)virt_addr);
 	return 0;
@@ -373,6 +388,51 @@ int paging_set_page_flags(unsigned long virt_addr, unsigned long flags)
 	phys = *entry & PAGE_ADDR_MASK;
 	*entry = phys | (flags & (PAGE_FLAGS_MASK | PAGE_FLAG_NO_EXECUTE)) | PAGE_FLAG_PRESENT;
 	arch_invlpg((const void *)virt_addr);
+	return 0;
+}
+
+int paging_split_huge_page(unsigned long virt_addr)
+{
+	unsigned long *pml4;
+	unsigned long *pdpt;
+	unsigned long *pd;
+	unsigned long *pde;
+	unsigned long huge_phys;
+	unsigned long huge_flags;
+	unsigned long *new_pt;
+	int i;
+
+	if ((virt_addr & (MEMORY_PAGE_SIZE - 1)) != 0) return -1;
+
+	pml4 = root_page_table();
+	if ((pml4[pml4_index(virt_addr)] & PAGE_FLAG_PRESENT) == 0) return 0;
+	pdpt = page_table_from_entry(pml4[pml4_index(virt_addr)]);
+	if ((pdpt[pdpt_index(virt_addr)] & PAGE_FLAG_PRESENT) == 0) return 0;
+	pd = page_table_from_entry(pdpt[pdpt_index(virt_addr)]);
+	pde = &pd[pd_index(virt_addr)];
+
+	if ((*pde & PAGE_FLAG_PRESENT) == 0) return 0;
+	if ((*pde & PAGE_FLAG_HUGE) == 0) return 0; /* already 4K pages */
+
+	huge_phys  = *pde & PAGE_LARGE_ADDR_MASK;
+	huge_flags = *pde & (PAGE_FLAG_PRESENT | PAGE_FLAG_WRITABLE);
+
+	new_pt = alloc_page_table();
+	if (new_pt == (void *)0) return -1;
+
+	for (i = 0; i < 512; i++)
+		new_pt[i] = (huge_phys + (unsigned long)i * MEMORY_PAGE_SIZE) | huge_flags;
+
+	/* Replace PD entry: point to new page table, remove HUGE flag */
+	*pde = ((unsigned long)new_pt & PAGE_ADDR_MASK) | PAGE_FLAG_PRESENT | PAGE_FLAG_WRITABLE;
+
+	/* Flush TLB for all 512 pages in the former huge page */
+	{
+		unsigned long base = virt_addr & ~(0x200000UL - 1);
+		for (i = 0; i < 512; i++)
+			arch_invlpg((const void *)(base + (unsigned long)i * MEMORY_PAGE_SIZE));
+	}
+
 	return 0;
 }
 
@@ -422,6 +482,56 @@ unsigned long paging_get_phys(unsigned long virt_addr)
 	entry = pt[pt_index(virt_addr)];
 	if ((entry & PAGE_FLAG_PRESENT) == 0) return 0;
 	return (entry & PAGE_ADDR_MASK) | (virt_addr & (MEMORY_PAGE_SIZE - 1));
+}
+
+int paging_get_walk(unsigned long virt_addr,
+	unsigned long *out_pml4e,
+	unsigned long *out_pdpte,
+	unsigned long *out_pde,
+	unsigned long *out_pte)
+{
+	unsigned long *pml4;
+	unsigned long entry;
+	unsigned long *pdpt;
+	unsigned long *pd;
+	unsigned long *pt;
+
+	if (out_pml4e != (void *)0) *out_pml4e = 0;
+	if (out_pdpte != (void *)0) *out_pdpte = 0;
+	if (out_pde != (void *)0) *out_pde = 0;
+	if (out_pte != (void *)0) *out_pte = 0;
+
+	pml4 = root_page_table();
+	entry = pml4[pml4_index(virt_addr)];
+	if (out_pml4e != (void *)0) *out_pml4e = entry;
+	if ((entry & PAGE_FLAG_PRESENT) == 0) return -1;
+
+	pdpt = page_table_from_entry(entry);
+	entry = pdpt[pdpt_index(virt_addr)];
+	if (out_pdpte != (void *)0) *out_pdpte = entry;
+	if ((entry & PAGE_FLAG_PRESENT) == 0) return -1;
+
+	pd = page_table_from_entry(entry);
+	entry = pd[pd_index(virt_addr)];
+	if (out_pde != (void *)0) *out_pde = entry;
+	if ((entry & PAGE_FLAG_PRESENT) == 0) return -1;
+	if ((entry & PAGE_FLAG_HUGE) != 0) return 1;
+
+	pt = page_table_from_entry(entry);
+	entry = pt[pt_index(virt_addr)];
+	if (out_pte != (void *)0) *out_pte = entry;
+	if ((entry & PAGE_FLAG_PRESENT) == 0) return -1;
+	return 0;
+}
+
+void *virt_reserve_pages(unsigned long count)
+{
+	unsigned long virt_page;
+	if (count == 0) return (void *)0;
+	virt_page = find_virtual_run(count);
+	if (virt_page >= MEMORY_VIRT_PAGES) return (void *)0;
+	mark_virtual_run(virt_page, count, 1);
+	return (void *)(MEMORY_VIRT_BASE + virt_page * MEMORY_PAGE_SIZE);
 }
 
 void *virt_alloc_pages(unsigned long count)
@@ -513,6 +623,15 @@ void kfree(void *ptr)
 	if (hdr->magic != KMALLOC_HEADER_MAGIC || hdr->pages == 0) return;
 	hdr->magic = 0;
 	virt_free_pages((void *)header_addr, hdr->pages);
+}
+
+void memory_zero_phys_page(unsigned long phys_addr)
+{
+	if ((phys_addr & (MEMORY_PAGE_SIZE - 1)) != 0) return;
+	if (paging_map_page(MEMORY_TEMP_PAGE_VADDR, phys_addr, PAGE_FLAG_WRITABLE) != 0) return;
+	mem_zero((void *)MEMORY_TEMP_PAGE_VADDR, MEMORY_PAGE_SIZE);
+	paging_unmap_page(MEMORY_TEMP_PAGE_VADDR);
+	arch_invlpg((const void *)MEMORY_TEMP_PAGE_VADDR);
 }
 
 unsigned long memory_total_pages(void)

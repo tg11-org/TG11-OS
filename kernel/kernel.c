@@ -12,6 +12,8 @@
 #include "syscall.h"
 #include "timer.h"
 #include "serial_console.h"
+#include "net.h"
+#include "usb.h"
 
 static int shell_watchdog_on = 0;
 
@@ -56,7 +58,9 @@ void kernel_main(unsigned long mb2_info_addr)
     timer_init();
     syscall_init();
     mouse_init();
+    net_init();
     arch_enable_interrupts();
+    usb_init();
 
     if (kernel_ensure_shell_task() < 0)
     {

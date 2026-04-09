@@ -46,6 +46,20 @@ arch_outw:
     out dx, ax
     ret
 
+.global arch_inl
+arch_inl:
+    xor eax, eax
+    mov dx, di
+    in eax, dx
+    ret
+
+.global arch_outl
+arch_outl:
+    mov dx, di
+    mov eax, esi
+    out dx, eax
+    ret
+
 .global arch_io_wait
 arch_io_wait:
     xor eax, eax
@@ -264,6 +278,43 @@ irq1_stub:
     pop rax
     iretq
 
+.global irq11_stub
+.extern e1000_interrupt_handler
+irq11_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cld
+    call e1000_interrupt_handler
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    iretq
+
 /* ---------------------------------------------------------------
  * CPU Exception stubs (vectors 0-31)
  *
@@ -381,6 +432,26 @@ exception_common:
     cld
     mov rdi, rsp        /* first arg = pointer to exception_frame */
     call exception_handler
+    /* exception_handler returned — page fault was recovered (demand paging).
+     * Restore all saved GPRs, discard the vector+error_code slots,
+     * then iretq back to the faulting instruction (CPU retries it). */
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    add rsp, 16         /* discard saved vector number and error code */
+    iretq
 exception_common_halt:
     cli
     hlt

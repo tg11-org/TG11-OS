@@ -893,3 +893,76 @@ int screen_fbfont_get_custom_glyph(char ch, unsigned char rows[7], int *is_custo
 	if (is_custom != (void *)0) *is_custom = fb_custom_valid[idx] ? 1 : 0;
 	return 1;
 }
+
+/* ================================================================== */
+/* Public framebuffer pixel-drawing APIs for GUI                      */
+/* ================================================================== */
+
+int screen_fb_is_active(void)
+{
+	return (backend == SCREEN_BACKEND_FB && fb_base != (void *)0) ? 1 : 0;
+}
+
+unsigned int screen_fb_width(void)  { return fb_w; }
+unsigned int screen_fb_height(void) { return fb_h; }
+
+void screen_fb_plot_pixel(unsigned int x, unsigned int y, unsigned int rgb)
+{
+	fb_plot(x, y, rgb);
+}
+
+unsigned int screen_fb_read_pixel(unsigned int x, unsigned int y)
+{
+	volatile unsigned char *p;
+	if (fb_base == (void *)0 || x >= fb_w || y >= fb_h) return 0;
+	p = fb_base + y * fb_pitch;
+	if (fb_bpp == 32)
+		return ((volatile unsigned int *)p)[x];
+	else if (fb_bpp == 24)
+	{
+		p += x * 3;
+		return (unsigned int)p[0] | ((unsigned int)p[1] << 8) | ((unsigned int)p[2] << 16);
+	}
+	return 0;
+}
+
+void screen_fb_fill_rect(unsigned int x, unsigned int y, unsigned int w, unsigned int h, unsigned int rgb)
+{
+	fb_fill_rect(x, y, w, h, rgb);
+}
+
+void screen_fb_draw_char(unsigned int px, unsigned int py, char ch, unsigned int fg, unsigned int bg)
+{
+	unsigned long gy, gx;
+	unsigned char bits;
+	if (fb_base == (void *)0) return;
+	for (gy = 0; gy < fb_cell_h; gy++)
+	{
+		bits = fb_builtin_font_bits(ch, gy);
+		for (gx = 0; gx < FB_FONT_W; gx++)
+		{
+			unsigned int color = (bits & (0x80 >> gx)) ? fg : bg;
+			fb_plot(px + (unsigned int)gx, py + (unsigned int)gy, color);
+		}
+	}
+}
+
+void screen_fb_draw_string(unsigned int px, unsigned int py, const char *s, unsigned int fg, unsigned int bg)
+{
+	while (*s)
+	{
+		screen_fb_draw_char(px, py, *s, fg, bg);
+		px += FB_FONT_W;
+		s++;
+	}
+}
+
+unsigned int screen_fb_font_w(void) { return FB_FONT_W; }
+unsigned int screen_fb_cell_h(void) { return fb_cell_h; }
+
+void screen_fb_set_text_area(unsigned int ox, unsigned int oy, unsigned int cols, unsigned int rows)
+{
+	/* Offset the text-cell grid so terminal renders inside a window */
+	(void)ox; (void)oy; (void)cols; (void)rows;
+	/* This is handled by the GUI layer itself — placeholder for future use */
+}

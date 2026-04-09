@@ -43,10 +43,11 @@ static unsigned long align_up_value(unsigned long v, unsigned long align)
 	return (v + align - 1) & ~(align - 1);
 }
 
-static int seed_builtin_elf(const char *path, unsigned long base_vaddr, unsigned int p_flags,
+static int seed_builtin_elf_type(unsigned short elf_type, const char *path, unsigned long base_vaddr, unsigned int p_flags,
 	const unsigned char *code, unsigned long code_size, unsigned long seg_filesz, unsigned long seg_memsz)
 {
 	unsigned char buf[FS_MAX_FILE_SIZE];
+	const unsigned long payload_off = 0x100UL;
 	unsigned long image_size;
 	unsigned long i;
 
@@ -54,9 +55,9 @@ static int seed_builtin_elf(const char *path, unsigned long base_vaddr, unsigned
 	if (seg_filesz < code_size) seg_filesz = code_size;
 	if (seg_memsz < seg_filesz) seg_memsz = seg_filesz;
 	if (seg_filesz == 0 || seg_memsz == 0) return -1;
-	if (seg_filesz > (FS_MAX_FILE_SIZE - 0x100UL)) return -1;
+	if (seg_filesz > (FS_MAX_FILE_SIZE - payload_off)) return -1;
 
-	image_size = 0x100UL + seg_filesz;
+	image_size = payload_off + seg_filesz;
 	for (i = 0; i < image_size; i++) buf[i] = 0;
 
 	/* ELF64 header */
@@ -64,7 +65,7 @@ static int seed_builtin_elf(const char *path, unsigned long base_vaddr, unsigned
 	buf[4] = 2;    /* EI_CLASS: ELF64 */
 	buf[5] = 1;    /* EI_DATA: little-endian */
 	buf[6] = 1;    /* EI_VERSION */
-	wr16_le(&buf[16], 2);      /* ET_EXEC */
+	wr16_le(&buf[16], elf_type);
 	wr16_le(&buf[18], 62);     /* EM_X86_64 */
 	wr32_le(&buf[20], 1);      /* EV_CURRENT */
 	wr64_le(&buf[24], base_vaddr); /* e_entry */
@@ -76,25 +77,31 @@ static int seed_builtin_elf(const char *path, unsigned long base_vaddr, unsigned
 	/* One PT_LOAD program header at offset 0x40 */
 	wr32_le(&buf[0x40], 1);            /* PT_LOAD */
 	wr32_le(&buf[0x44], p_flags);      /* PF_R/PF_W/PF_X */
-	wr64_le(&buf[0x48], 0x100);        /* p_offset */
+	wr64_le(&buf[0x48], payload_off);  /* p_offset */
 	wr64_le(&buf[0x50], base_vaddr);   /* p_vaddr */
 	wr64_le(&buf[0x58], 0);            /* p_paddr (unused) */
 	wr64_le(&buf[0x60], seg_filesz);   /* p_filesz */
 	wr64_le(&buf[0x68], seg_memsz);    /* p_memsz */
-	wr64_le(&buf[0x70], 0x1000);       /* p_align */
+	wr64_le(&buf[0x70], 0x100);        /* p_align */
 
-	for (i = 0; i < code_size; i++) buf[0x100UL + i] = code[i];
+	for (i = 0; i < code_size; i++) buf[payload_off + i] = code[i];
 
 	return fs_write_file(path, buf, image_size);
 }
 
-static int seed_builtin_elf_with_symbols(const char *path, unsigned long base_vaddr, unsigned int p_flags,
+static int seed_builtin_elf(const char *path, unsigned long base_vaddr, unsigned int p_flags,
+	const unsigned char *code, unsigned long code_size, unsigned long seg_filesz, unsigned long seg_memsz)
+{
+	return seed_builtin_elf_type(2u, path, base_vaddr, p_flags, code, code_size, seg_filesz, seg_memsz);
+}
+
+static int seed_builtin_elf_with_symbols_type(unsigned short elf_type, const char *path, unsigned long base_vaddr, unsigned int p_flags,
 	const unsigned char *code, unsigned long code_size, unsigned long seg_filesz, unsigned long seg_memsz,
 	const char *symbol_name)
 {
 	unsigned char buf[FS_MAX_FILE_SIZE];
 	static const char shstrtab[] = "\0.shstrtab\0.text\0.strtab\0.symtab\0";
-	unsigned long payload_off = 0x100UL;
+	const unsigned long payload_off = 0x100UL;
 	unsigned long shstrtab_off;
 	unsigned long shstrtab_size = sizeof(shstrtab);
 	unsigned long strtab_off;
@@ -130,7 +137,7 @@ static int seed_builtin_elf_with_symbols(const char *path, unsigned long base_va
 	buf[4] = 2;
 	buf[5] = 1;
 	buf[6] = 1;
-	wr16_le(&buf[16], 2);
+	wr16_le(&buf[16], elf_type);
 	wr16_le(&buf[18], 62);
 	wr32_le(&buf[20], 1);
 	wr64_le(&buf[24], base_vaddr);
@@ -150,7 +157,7 @@ static int seed_builtin_elf_with_symbols(const char *path, unsigned long base_va
 	wr64_le(&buf[0x58], 0);
 	wr64_le(&buf[0x60], seg_filesz);
 	wr64_le(&buf[0x68], seg_memsz);
-	wr64_le(&buf[0x70], 0x1000);
+	wr64_le(&buf[0x70], 0x100);
 
 	for (i = 0; i < code_size; i++) buf[payload_off + i] = code[i];
 	for (i = 0; i < shstrtab_size; i++) buf[shstrtab_off + i] = (unsigned char)shstrtab[i];
@@ -199,6 +206,13 @@ static int seed_builtin_elf_with_symbols(const char *path, unsigned long base_va
 	wr64_le(&buf[shoff + 256UL + 56], 24);
 
 	return fs_write_file(path, buf, image_size);
+}
+
+static int seed_builtin_elf_with_symbols(const char *path, unsigned long base_vaddr, unsigned int p_flags,
+	const unsigned char *code, unsigned long code_size, unsigned long seg_filesz, unsigned long seg_memsz,
+	const char *symbol_name)
+{
+	return seed_builtin_elf_with_symbols_type(2u, path, base_vaddr, p_flags, code, code_size, seg_filesz, seg_memsz, symbol_name);
 }
 
 static unsigned long str_len(const char *s)
@@ -453,11 +467,125 @@ void fs_init(void)
 			0x48, 0x89, 0xE5,
 			0x0F, 0x0B
 		};
+		static const unsigned char bss_code[] = {
+			/* mov eax,[rip+16]; add eax,13; mov [rip+7],eax; mov eax,[rip+1]; ret */
+			0x8B,0x05,0x10,0x00,0x00,0x00,
+			0x83,0xC0,0x0D,
+			0x89,0x05,0x07,0x00,0x00,0x00,
+			0x8B,0x05,0x01,0x00,0x00,0x00,
+			0xC3
+		};
+		static const unsigned char pie_code[] = {
+			/* mov eax,123; ret */
+			0xB8, 0x7B, 0x00, 0x00, 0x00, 0xC3
+		};
+		static const unsigned char hello_code[] = {
+			/* write("hello\n", 6); exit(0); */
+			0xB8,0x01,0x00,0x00,0x00,
+			0x48,0x8D,0x3D,0x10,0x00,0x00,0x00,
+			0xBE,0x06,0x00,0x00,0x00,
+			0x0F,0x05,
+			0xB8,0x3C,0x00,0x00,0x00,
+			0x31,0xFF,
+			0x0F,0x05,
+			'h','e','l','l','o','\n'
+		};
+		static const unsigned char argc_code[] = {
+			/* argc in EDI -> clamp to 9 -> print one digit + newline -> exit(0) */
+			0x89,0xF8,
+			0x83,0xF8,0x09,
+			0x76,0x05,
+			0xB8,0x09,0x00,0x00,0x00,
+			0x83,0xC0,0x30,
+			0x88,0x05,0x21,0x00,0x00,0x00,
+			0xB8,0x01,0x00,0x00,0x00,
+			0xBF,0x01,0x00,0x00,0x00,
+			0x48,0x8D,0x35,0x10,0x00,0x00,0x00,
+			0xBA,0x02,0x00,0x00,0x00,
+			0x0F,0x05,
+			0xB8,0x3C,0x00,0x00,0x00,
+			0x31,0xFF,
+			0x0F,0x05,
+			'?', '\n'
+		};
+		static const unsigned char brk_code[] = {
+			/* brk(0x1800010000), verify return, then brk(0x1800000000), print OK */
+			0xB8,0x0C,0x00,0x00,0x00,
+			0x48,0xBF,0x00,0x00,0x01,0x00,0x18,0x00,0x00,0x00,
+			0x0F,0x05,
+			0x48,0xBB,0x00,0x00,0x01,0x00,0x18,0x00,0x00,0x00,
+			0x48,0x39,0xD8,
+			0x75,0x35,
+			0x48,0xBB,0x00,0x00,0x00,0x00,0x18,0x00,0x00,0x00,
+			0x48,0x89,0xDF,
+			0xB8,0x0C,0x00,0x00,0x00,
+			0x0F,0x05,
+			0xB8,0x01,0x00,0x00,0x00,
+			0xBF,0x01,0x00,0x00,0x00,
+			0x48,0x8D,0x35,0x34,0x00,0x00,0x00,
+			0xBA,0x03,0x00,0x00,0x00,
+			0x0F,0x05,
+			0xB8,0x3C,0x00,0x00,0x00,
+			0x31,0xFF,
+			0x0F,0x05,
+			/* fail: print "E\n" and exit(1) */
+			0xB8,0x01,0x00,0x00,0x00,
+			0xBF,0x01,0x00,0x00,0x00,
+			0x48,0x8D,0x35,0x16,0x00,0x00,0x00,
+			0xBA,0x02,0x00,0x00,0x00,
+			0x0F,0x05,
+			0xB8,0x3C,0x00,0x00,0x00,
+			0xBF,0x01,0x00,0x00,0x00,
+			0x0F,0x05,
+			'O','K','\n',
+			'E','\n'
+		};
 
 		(void)seed_builtin_elf_with_symbols("/app.elf",  0xFFFF900003000000UL, 0x5u, app_code,  sizeof(app_code),  sizeof(app_code),  sizeof(app_code), "_start");
 		(void)seed_builtin_elf("/appw.elf", 0xFFFF900003010000UL, 0x7u, appw_code, sizeof(appw_code), sizeof(appw_code), sizeof(appw_code));
 		(void)seed_builtin_elf("/app2p.elf",0xFFFF900003020000UL, 0x5u, app2p_code, sizeof(app2p_code), 0x1100UL, 0x1800UL);
 		(void)seed_builtin_elf_with_symbols("/panic.elf",0xFFFF900003030000UL, 0x5u, panic_code, sizeof(panic_code), sizeof(panic_code), sizeof(panic_code), "_crash");
+		(void)seed_builtin_elf_with_symbols("/bss.elf",  0xFFFF900003040000UL, 0x7u, bss_code, sizeof(bss_code), sizeof(bss_code), sizeof(bss_code) + 4UL, "_bsscheck");
+		(void)seed_builtin_elf_with_symbols_type(3u, "/pie.elf", 0x0000000000000000UL, 0x5u, pie_code, sizeof(pie_code), sizeof(pie_code), sizeof(pie_code), "_start");
+		(void)seed_builtin_elf_with_symbols("/hello.elf",0xFFFF900003060000UL, 0x5u, hello_code, sizeof(hello_code), sizeof(hello_code), sizeof(hello_code), "_start");
+		(void)seed_builtin_elf_with_symbols("/argc.elf", 0xFFFF900003070000UL, 0x7u, argc_code, sizeof(argc_code), sizeof(argc_code), sizeof(argc_code), "_start");
+		(void)seed_builtin_elf_with_symbols("/brk.elf",  0xFFFF900003080000UL, 0x7u, brk_code, sizeof(brk_code), sizeof(brk_code), sizeof(brk_code), "_start");
+		{
+			/* /argv.elf — print argv[1] (or nothing if argc < 2), then '\n', then exit */
+			static const unsigned char argv_code[] = {
+				/* if (argc < 2) jmp .exit */
+				0x83,0xFF,0x02,
+				0x7C,0x3A,               /* jl .exit (adjusted offset) */
+				/* RSI already contains argv[1] from kernel entry setup */
+				/* rcx = strlen(rsi) */
+				0x48,0x31,0xC9,
+				/* .loop: cmp byte [rsi+rcx], 0 */
+				0x80,0x3C,0x0E,0x00,
+				0x74,0x05,               /* je .done */
+				0x48,0xFF,0xC1,          /* inc rcx */
+				0xEB,0xF5,               /* jmp .loop */
+				/* .done: test rcx,rcx */
+				0x48,0x85,0xC9,
+				0x74,0x27,               /* jz .exit (offset to SYS_EXIT at +39) */
+				/* SYS_WRITE(1, argv[1], strlen) */
+				0xB8,0x01,0x00,0x00,0x00,
+				0xBF,0x01,0x00,0x00,0x00,
+				0x48,0x89,0xCA,
+				0x0F,0x05,
+				/* SYS_WRITE(1, "\n", 1) */
+				0xB8,0x01,0x00,0x00,0x00,
+				0xBF,0x01,0x00,0x00,0x00,
+				0x48,0x8D,0x35,0x10,0x00,0x00,0x00,
+				0xBA,0x01,0x00,0x00,0x00,
+				0x0F,0x05,
+				/* .exit: SYS_EXIT(0) */
+				0xB8,0x3C,0x00,0x00,0x00,
+				0x31,0xFF,
+				0x0F,0x05,
+				'\n'
+			};
+			(void)seed_builtin_elf_with_symbols("/argv.elf", 0x0000000100900000UL, 0x5u, argv_code, sizeof(argv_code), sizeof(argv_code), sizeof(argv_code), "_start");
+		}
 	}
 }
 

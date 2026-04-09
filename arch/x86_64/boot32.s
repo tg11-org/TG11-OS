@@ -54,7 +54,8 @@ map_pd_entries:
     # Enable long mode via EFER MSR
     mov ecx, 0xC0000080         # IA32_EFER
     rdmsr
-    or eax, 1 << 8              # LME
+    or eax, 1 << 8              # LME  — Long Mode Enable
+    or eax, 1 << 11             # NXE  — No-Execute Enable (makes PTE bit 63 valid)
     wrmsr
 
     # Enable paging + keep protected mode enabled

@@ -15,11 +15,14 @@
 #define ELF_ERR_NOSYM     -10   /* no usable symbol table present */
 #define ELF_ERR_OVERLAP   -11   /* PT_LOAD page windows overlap */
 #define ELF_ERR_ENTRY     -12   /* entry point not inside a loadable segment */
+#define ELF_ERR_INTERP    -13   /* PT_INTERP found: dynamic linking not supported */
 
 /* elf_exec_t –– describes a loaded image ready to call */
 typedef struct
 {
     unsigned long entry;        /* virtual entry point */
+    unsigned long load_base;    /* mapped PT_LOAD floor after bias */
+    unsigned long load_end;     /* mapped PT_LOAD ceiling after bias */
 } elf_exec_t;
 
 typedef struct

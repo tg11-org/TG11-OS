@@ -13,6 +13,7 @@
  */
 .global task_switch
 task_switch:
+    pushfq
     push rbx
     push rbp
     push r12
@@ -27,17 +28,22 @@ task_switch:
     pop  r12
     pop  rbp
     pop  rbx
+    popfq
     ret
 
 
 /*
  * void task_save_and_enter_user(unsigned long entry,
  *                               unsigned long user_rsp,
- *                               unsigned long *saved_rsp)
+ *                               unsigned long user_arg0,
+ *                               unsigned long *saved_rsp,
+ *                               unsigned long argv1_ptr)
  *
  * rdi = user RIP
  * rsi = user RSP
- * rdx = pointer where current kernel RSP is saved
+ * rdx = user arg0 (restored into user RDI) — typically argc
+ * rcx = pointer where current kernel RSP is saved
+ * r8 = argv[1] pointer (pre-computed in kernel from stack alias)
  *
  * Saves the current kernel stack pointer into *saved_rsp, builds an iretq
  * frame on the stack, and transitions to ring 3.  Never returns directly;
@@ -45,15 +51,23 @@ task_switch:
  */
 .global task_save_and_enter_user
 task_save_and_enter_user:
+    mov  r10, rdi            /* preserve user RIP */
+    mov  r11, rsi            /* preserve user RSP */
+
     /* Save kernel RSP (which currently points at the return address that the
        'call' instruction pushed, so task_restore_kernel / ret will go back
        to the instruction after the call in task_exec_user). */
-    mov  [rdx], rsp
+    mov  [rcx], rsp
+
+    /* Set initial user RDI from caller-provided arg0 (argc). */
+    mov  rdi, rdx
+    /* Set initial user RSI from pre-computed argv[1] (kernel-computed). */
+    mov  rsi, r8
 
     /* Build iretq frame: SS, RSP, RFLAGS, CS, RIP */
     mov  rax, 0x23           /* user SS selector (GDT[4], RPL=3) */
     push rax
-    push rsi                 /* user RSP */
+    push r11                 /* user RSP */
     pushfq
     pop  rax
     or   rax, 0x200          /* ensure Interrupt Enable is set */
@@ -61,7 +75,7 @@ task_save_and_enter_user:
     push rax                 /* user RFLAGS */
     mov  rax, 0x2B           /* user CS selector (GDT[5], RPL=3) */
     push rax
-    push rdi                 /* user RIP */
+    push r10                 /* user RIP */
 
     iretq                    /* transition to ring 3 — never returns here */
 

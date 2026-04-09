@@ -68,6 +68,12 @@ make run-disk-serial
 - `run [-x] <path>` (shell script runner)
 - `basic <path>` (Tiny BASIC text program runner)
 
+### User-mode ELF smoke tests
+- `exec /hello.elf` prints `hello`
+- `exec /argc.elf a b c` prints `4`
+- `exec /brk.elf` prints `OK` after growing and shrinking its heap with `SYS_BRK`
+- `elfselftest` covers loader-only fixtures; the syscall-driven ELFs above are still best validated through `exec`
+
 ### Editor keys
 - `Ctrl+S` save
 - `Ctrl+F` find (Enter for next match, Shift+Enter for previous, Esc to cancel)
@@ -93,6 +99,7 @@ make run-disk-serial
 - FAT currently expects 8.3-compatible path components.
 - FAT-mode `cp`/`mv` currently use an internal 4 KiB transfer buffer.
 - Base RAMFS includes example scripts under `/scripts`.
+- User-mode `exec` runs now get a fixed stack window plus a dynamic heap window. `SYS_BRK` (syscall `12`) returns the current break with argument `0`, and grows or shrinks the heap when passed a new break value inside that window.
 - Do not mount `TG11-DATA.vhd` in Windows while QEMU is running; attach it only after the guest is shut down to avoid host-side caching/coherency issues.
 
 ## Bundled Demo Scripts

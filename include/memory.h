@@ -20,11 +20,19 @@ void phys_free_pages(unsigned long phys_addr, unsigned long count);
 int paging_map_page(unsigned long virt_addr, unsigned long phys_addr, unsigned long flags);
 int paging_set_page_flags(unsigned long virt_addr, unsigned long flags);
 void paging_unmap_page(unsigned long virt_addr);
+int paging_split_huge_page(unsigned long virt_addr);
 unsigned long paging_get_phys(unsigned long virt_addr);
+int paging_get_walk(unsigned long virt_addr,
+	unsigned long *out_pml4e,
+	unsigned long *out_pdpte,
+	unsigned long *out_pde,
+	unsigned long *out_pte);
+void *virt_reserve_pages(unsigned long count);
 void *virt_alloc_pages(unsigned long count);
 void virt_free_pages(void *addr, unsigned long count);
 void *kmalloc(unsigned long size);
 void kfree(void *ptr);
+void memory_zero_phys_page(unsigned long phys_addr);
 unsigned long memory_total_pages(void);
 unsigned long memory_free_pages(void);
 unsigned long memory_virtual_base(void);

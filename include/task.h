@@ -1,13 +1,14 @@
 /**
  * Copyright (C) 2026 TG11
  *
- * Cooperative kernel task scheduler and user-mode execution.
+ * Preemptive kernel task scheduler and user-mode execution.
  *
- * Tasks are kernel threads sharing the kernel address space.  Switching is
- * cooperative only — a task must call task_yield() to give up the CPU.
- * User-mode (ring 3) ELF programs are launched by the current kernel task
- * via task_exec_user(); that call blocks until the user program calls
- * the SYS_EXIT syscall.
+ * Tasks are kernel threads sharing the kernel address space.  The timer
+ * IRQ fires task_preempt_tick() which round-robin yields the CPU when
+ * another task is ready.  Tasks may also call task_yield() to cooperatively
+ * give up the CPU.  User-mode (ring 3) ELF programs are launched by the
+ * current kernel task via task_exec_user(); that call blocks until the
+ * user program calls the SYS_EXIT syscall.
  */
 #ifndef TG11_TASK_H
 #define TG11_TASK_H
@@ -68,10 +69,23 @@ int   task_event_log_enabled(void);
 void  task_reap_zombies(void);
 void  task_preempt_tick(void);
 
+/* Enable or disable timer-driven preemptive scheduling.                     */
+void  task_set_preemption(int enabled);
+int   task_get_preemption(void);
+
 /* Run an already-loaded ELF user program in ring 3.  Blocks until the user
  * program exits via SYS_EXIT.  The ELF's pages must already be mapped with
- * PAGE_FLAG_USER before this is called.                                      */
-void  task_exec_user(unsigned long entry, unsigned long user_rsp);
+ * PAGE_FLAG_USER before this is called.  argv1_ptr: pre-computed argv[1]
+ * pointer from kernel-space stack alias (0 if argc < 2).                   */
+void  task_exec_user(unsigned long entry, unsigned long user_rsp, unsigned long user_arg0, unsigned long argv1_ptr);
+
+/* Configure/drive a transient user heap for the active ring-3 run.
+ * task_user_heap_brk(0) returns the current break.
+ * task_user_heap_brk(new_break) grows/shrinks heap pages and returns
+ * the updated break, or (unsigned long)-1 on error. */
+int   task_user_heap_config(unsigned long base, unsigned long limit);
+unsigned long task_user_heap_brk(unsigned long new_break);
+void  task_user_heap_reset(void);
 
 /* Called from the CPU exception handler when a ring-3 fault occurs.
  * Returns control to the blocked task_exec_user() call.                     */
@@ -80,7 +94,9 @@ void  task_user_fault_exit(void);
 /* ── Assembly helpers (not for direct C use) ── */
 void  task_switch(task_t *from, task_t *to);
 void  task_save_and_enter_user(unsigned long entry, unsigned long user_rsp,
-                                unsigned long *saved_rsp);
+                                unsigned long user_arg0,
+                                unsigned long *saved_rsp,
+                                unsigned long argv1_ptr);
 void  task_restore_kernel(unsigned long saved_rsp);
 
 #endif /* TG11_TASK_H */

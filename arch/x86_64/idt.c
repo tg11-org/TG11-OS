@@ -73,6 +73,7 @@ static unsigned long exception_stats[32] = {0};
 extern void exception_hang_stub(void);
 extern void isr_ignore_stub(void);
 extern void irq1_stub(void);
+extern void irq11_stub(void);
 extern void irq12_stub(void);
 extern void irq0_stub(void);
 
@@ -155,8 +156,8 @@ static void pic_unmask_irqs(void)
 {
 	/* Master: enable IRQ0 (timer), IRQ1 (keyboard), IRQ2 (cascade to slave) */
 	arch_outb(PIC1_DATA, 0xF8);
-	/* Slave: enable IRQ12 (mouse) */
-	arch_outb(PIC2_DATA, 0xEF);
+	/* Slave: enable IRQ3 (=IRQ11 NIC), IRQ4 (=IRQ12 mouse) */
+	arch_outb(PIC2_DATA, 0xE7);
 }
 
 static void pic_send_eoi(unsigned char irq)
@@ -319,6 +320,11 @@ static void write_symbolized_addr(const char *label, unsigned long addr)
 static void write_page_fault_detail(unsigned long error_code)
 {
 	unsigned long cr2 = arch_read_cr2();
+	unsigned long pml4e = 0;
+	unsigned long pdpte = 0;
+	unsigned long pde = 0;
+	unsigned long pte = 0;
+	int walk_rc;
 	int present = (error_code & 0x01UL) != 0;
 	int is_write = (error_code & 0x02UL) != 0;
 	int is_user = (error_code & 0x04UL) != 0;
@@ -364,6 +370,44 @@ static void write_page_fault_detail(unsigned long error_code)
 	terminal_write("  SGX:   ");
 	terminal_write((error_code & 0x8000UL) ? "yes" : "no");
 	terminal_write("\n");
+
+	walk_rc = paging_get_walk(cr2, &pml4e, &pdpte, &pde, &pte);
+	terminal_write("  Walk PML4E:");
+	write_hex_64(pml4e);
+	terminal_write("\n");
+	terminal_write("  Walk PDPTE:");
+	write_hex_64(pdpte);
+	terminal_write("\n");
+	terminal_write("  Walk PDE:  ");
+	write_hex_64(pde);
+	terminal_write("\n");
+	terminal_write("  Walk PTE:  ");
+	write_hex_64(pte);
+	terminal_write("\n");
+	terminal_write("  Walk RC:   ");
+	if (walk_rc == 0) terminal_write("pte");
+	else if (walk_rc > 0) terminal_write("huge");
+	else terminal_write("missing");
+	terminal_write("\n");
+
+	{
+		unsigned long entries[4];
+		const char *names[4];
+		int idx;
+		entries[0] = pml4e; entries[1] = pdpte; entries[2] = pde; entries[3] = pte;
+		names[0] = "PML4E"; names[1] = "PDPTE"; names[2] = "PDE"; names[3] = "PTE";
+		for (idx = 0; idx < 4; idx++)
+		{
+			unsigned long e = entries[idx];
+			terminal_write("  ");
+			terminal_write(names[idx]);
+			terminal_write(" flg: P="); terminal_write((e & 0x001UL) ? "1" : "0");
+			terminal_write(" W="); terminal_write((e & 0x002UL) ? "1" : "0");
+			terminal_write(" U="); terminal_write((e & 0x004UL) ? "1" : "0");
+			terminal_write(" NX="); terminal_write((e & (1UL << 63)) ? "1" : "0");
+			terminal_write("\n");
+		}
+	}
 }
 
 static int is_range_mapped(unsigned long addr, unsigned long size)
@@ -613,8 +657,7 @@ typedef struct
 
 static int pf_recovery_analyze(unsigned long cr2, unsigned long error_code, pf_recovery_t *rec)
 {
-	unsigned long canonical_high = 0x0000800000000000UL;
-	unsigned long kernel_low = 0xFFFF800000000000UL;
+	unsigned long user_space_limit = 0x0000800000000000UL;
 
 	rec->faulting_address = cr2;
 	rec->is_present = (error_code & 0x01UL) != 0;
@@ -625,43 +668,57 @@ static int pf_recovery_analyze(unsigned long cr2, unsigned long error_code, pf_r
 	rec->recoverable = 0;
 	rec->recovery_type = 0;
 
-	/* Only attempt recovery for unmapped pages in user-addressable space */
-	if (rec->is_present || rec->is_reserved)
-		return 0;  /* Present bit or reserved fault - unrecoverable */
+	/* Only recover faults from user mode accessing unmapped user-space pages.
+	 * Present-bit faults are protection violations (cannot fix by allocation).
+	 * Reserved-bit faults mean a PTE has a bad bit set (kernel bug). */
+	if (!rec->is_user) return 0;          /* kernel fault — never auto-recover */
+	if (rec->is_present) return 0;        /* protection violation, not missing page */
+	if (rec->is_reserved) return 0;       /* reserved PTE bit — kernel bug */
+	if (cr2 >= user_space_limit) return 0; /* kernel VA from user? bad */
 
-	if (cr2 < canonical_high || (cr2 >= kernel_low))
-	{
-		/* Address is canonically valid - could potentially allocate */
-		rec->recoverable = 1;
-		rec->recovery_type = 1;  /* type 1: allocate on demand */
-		return 1;
-	}
-
-	return 0;  /* Non-canonical address - unrecoverable */
+	rec->recoverable = 1;
+	rec->recovery_type = 1;  /* demand-allocate */
+	return 1;
 }
 
 static int pf_recovery_attempt(struct exception_frame *frame __attribute__((unused)), pf_recovery_t *rec)
 {
-	/* Currently no actual recovery is implemented */
-	/* This is a placeholder for future recovery attempts */
-	
-	/* Log to serial what would be needed for recovery */
-	if (rec->recoverable)
+	unsigned long page_virt;
+	unsigned long phys;
+	unsigned long map_flags;
+
+	if (!rec->recoverable || rec->recovery_type != 1) return 0;
+
+	page_virt = rec->faulting_address & ~(MEMORY_PAGE_SIZE - 1);
+
+	/* Don't map page 0 — NULL pointer dereference should always fault */
+	if (page_virt == 0) return 0;
+
+	phys = phys_alloc_page();
+	if (phys == 0)
 	{
-		serial_write("[INFO] #PF at 0x");
-		{
-			static const char hex[] = "0123456789ABCDEF";
-			int i;
-			for (i = 60; i >= 0; i -= 4)
-				serial_putchar(hex[(rec->faulting_address >> i) & 0xF]);
-		}
-		serial_write(" - would be recoverable (type ");
-		serial_putchar('0' + rec->recovery_type);
-		serial_write(")\n");
+		serial_write("[demand-paging] phys_alloc_page failed\r\n");
+		return 0;
 	}
 
-	/* Always return 0 (no recovery) for now */
-	return 0;
+	/* Map as user-accessible, writable, non-executable demand page */
+	map_flags = PAGE_FLAG_PRESENT | PAGE_FLAG_USER | PAGE_FLAG_WRITABLE | PAGE_FLAG_NO_EXECUTE;
+	if (paging_map_page(page_virt, phys, map_flags) != 0)
+	{
+		phys_free_page(phys);
+		serial_write("[demand-paging] paging_map_page failed\r\n");
+		return 0;
+	}
+
+	serial_write("[demand-paging] allocated page for 0x");
+	{
+		static const char hex[] = "0123456789ABCDEF";
+		int i;
+		for (i = 60; i >= 0; i -= 4)
+			serial_putchar(hex[(rec->faulting_address >> i) & 0xF]);
+	}
+	serial_write("\r\n");
+	return 1;
 }
 
 /* Defined in kernel/task.c */
@@ -671,6 +728,60 @@ void exception_handler(struct exception_frame *frame)
 {
 	unsigned char vec = (unsigned char)(frame->vector & 0xFF);
 	int is_user = (frame->cs & 3) == 3; /* 1 if fault came from ring 3 */
+
+	/* ── Demand-paging fast path ─────────────────────────────────────
+	 * For user-mode page faults on unmapped pages, silently allocate a
+	 * physical page, map it, and return.  The CPU retries the faulting
+	 * instruction (the asm stub does iretq when exception_handler returns
+	 * normally).  No screen output — transparent to the user program.    */
+	if (vec == 14 && is_user)
+	{
+		unsigned long cr2 = arch_read_cr2();
+		pf_recovery_t pf_rec;
+
+		/* Diagnostic: dump #PF details to serial before attempting recovery */
+		{
+			static const char hex[] = "0123456789ABCDEF";
+			int si;
+			unsigned long pml4e_v = 0, pdpte_v = 0, pde_v = 0, pte_v = 0;
+			serial_write("[#PF] cr2=0x");
+			for (si = 60; si >= 0; si -= 4) serial_putchar(hex[(cr2 >> si) & 0xF]);
+			serial_write(" err=0x");
+			for (si = 60; si >= 0; si -= 4) serial_putchar(hex[(frame->error_code >> si) & 0xF]);
+			serial_write(" rip=0x");
+			for (si = 60; si >= 0; si -= 4) serial_putchar(hex[(frame->rip >> si) & 0xF]);
+			serial_write("\r\n");
+			paging_get_walk(cr2, &pml4e_v, &pdpte_v, &pde_v, &pte_v);
+			serial_write("[#PF] PML4E=0x");
+			for (si = 60; si >= 0; si -= 4) serial_putchar(hex[(pml4e_v >> si) & 0xF]);
+			serial_write(" PDPTE=0x");
+			for (si = 60; si >= 0; si -= 4) serial_putchar(hex[(pdpte_v >> si) & 0xF]);
+			serial_write("\r\n");
+			serial_write("[#PF] PDE=0x");
+			for (si = 60; si >= 0; si -= 4) serial_putchar(hex[(pde_v >> si) & 0xF]);
+			serial_write(" PTE=0x");
+			for (si = 60; si >= 0; si -= 4) serial_putchar(hex[(pte_v >> si) & 0xF]);
+			serial_write("\r\n");
+			serial_write("[#PF] P=");
+			serial_putchar((frame->error_code & 1) ? '1' : '0');
+			serial_write(" W=");
+			serial_putchar((frame->error_code & 2) ? '1' : '0');
+			serial_write(" U=");
+			serial_putchar((frame->error_code & 4) ? '1' : '0');
+			serial_write(" RSVD=");
+			serial_putchar((frame->error_code & 8) ? '1' : '0');
+			serial_write(" I/D=");
+			serial_putchar((frame->error_code & 16) ? '1' : '0');
+			serial_write("\r\n");
+		}
+
+		if (pf_recovery_analyze(cr2, frame->error_code, &pf_rec) &&
+		    pf_recovery_attempt(frame, &pf_rec))
+		{
+			return;  /* recovered — asm stub will iretq and retry */
+		}
+		serial_write("[#PF] recovery FAILED, falling through to panic\r\n");
+	}
 
 	/* Track exception statistics */
 	if (vec < 32)
@@ -754,15 +865,46 @@ void exception_handler(struct exception_frame *frame)
 	write_reg("  R14: ", frame->r14);
 	write_reg("  R15: ", frame->r15);
 	terminal_write("------------------------------------\n");
-	write_stack_hints(frame->rsp);
-	write_backtrace(frame->rbp);
-	write_stack_scan(frame->rsp);
+	if (is_user)
+	{
+		terminal_write("Stack diagnostics skipped for user fault context.\n");
+	}
+	else
+	{
+		write_stack_hints(frame->rsp);
+		write_backtrace(frame->rbp);
+		write_stack_scan(frame->rsp);
+	}
 	terminal_write("====================================\n");
 	if (is_user) {
 		terminal_write("User program terminated by exception.\n");
+		terminal_write("Press F11 to reboot, F12 to power down, or Enter to return.\n");
 		terminal_write("====================================\n");
-		task_user_fault_exit();
-		/* task_user_fault_exit() does not return */
+		arch_disable_interrupts();
+		for (;;)
+		{
+			if ((arch_inb(0x64) & 0x01) != 0)
+			{
+				unsigned char sc = arch_inb(0x60);
+				if (sc == 0x57)
+				{
+					terminal_write("Rebooting...\n");
+					panic_reboot_now();
+				}
+				if (sc == 0x58)
+				{
+					terminal_write("Powering down...\n");
+					panic_poweroff_now();
+				}
+				if (sc == 0x1C || sc == 0x01) /* Enter or Esc */
+				{
+					arch_enable_interrupts();
+					task_user_fault_exit();
+					/* task_user_fault_exit() does not return */
+				}
+			}
+			arch_io_wait();
+		}
 	}
 
 	terminal_write("System halted.\n");
@@ -859,6 +1001,7 @@ void idt_init(void)
 
 	idt_set_gate(IRQ_TIMER_VECTOR, irq0_stub);
 	idt_set_gate(IRQ_KEYBOARD_VECTOR, irq1_stub);
+	idt_set_gate(0x20 + 11, irq11_stub);  /* E1000 NIC */
 	idt_set_gate(IRQ_MOUSE_VECTOR, irq12_stub);
 
 	idtr.limit = (unsigned short)(sizeof(idt) - 1);
